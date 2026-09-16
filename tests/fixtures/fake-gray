@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Stand-in for the external Gray process: record real argv/cwd/env effects."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+args = sys.argv[1:]
+assert args[0] == "-p" and len(args) == 2, args
+prompt = args[1]
+mode = os.environ.get("FAKE_MODE", "ok")
+if mode == "slow":
+    time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
+if mode == "descendant":
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    Path(os.environ["FAKE_LOG"]).write_text(str(child.pid))
+    time.sleep(60)
+if mode == "fail":
+    print("deliberate child failure", file=sys.stderr)
+    sys.exit(7)
+if mode == "flood":
+    while True:
+        sys.stdout.write("x" * 65536)
+        sys.stdout.flush()
+if mode == "empty":
+    sys.exit(0)
+print(json.dumps({"prompt": prompt, "cwd": os.getcwd(),
+                  "active": os.environ.get("GRAY_SUBAGENTS_ACTIVE")}))
