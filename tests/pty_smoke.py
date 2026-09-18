@@ -1,7 +1,7 @@
 """Manual local PTY smoke check (requires pyte and the isolated host build)."""
 import os,pathlib,tempfile,subprocess,json,pty,select,time,fcntl,termios,struct,pyte,codecs
-host='/home/vstaln/gray-subagents-host/target/debug/gray'
-plugin='/home/vstaln/gray-subagents/target/debug/gray-subagents'
+host='<gray-checkout-with-host-bridge>/target/debug/gray'
+plugin='~/grayplugins/gray-subagents/target/debug/gray-subagents'
 with tempfile.TemporaryDirectory(prefix='gray-widget-pty-') as tmp:
  env=dict(os.environ,GRAY_HOME=tmp,GRAY_PLUGIN_PATH=plugin,TERM='xterm-256color',GRAY_MODEL='test/model',GRAY_BASE_URL='http://127.0.0.1:9/v1',GRAY_CONTEXT_WINDOW='32000')
  out=subprocess.run([host,'install','plugin','subagents'],env=env,capture_output=True,text=True,timeout=10)

@@ -20,22 +20,22 @@ binary; this is **not yet an all-Rust runtime**.
 ## Build and install locally
 
 This feature needs the generic host bridge currently isolated in
-`/home/vstaln/gray-subagents-host` on branch `feat/subagents-plugin`. Your original
+`<gray-checkout-with-host-bridge>` on branch `feat/subagents-plugin`. Your original
 Gray checkout and installed Gray binary have not been replaced.
 
 ```sh
-cd /home/vstaln/gray-subagents
+cd ~/grayplugins/gray-subagents
 cargo build --release
 
-cd /home/vstaln/gray-subagents-host
+cd <gray-checkout-with-host-bridge>
 CARGO_BUILD_JOBS=4 cargo build -p gray --bin gray
 
 # Local plugin selection; no unpublished GitHub URL or registry entry assumed.
-GRAY_PLUGIN_PATH=/home/vstaln/gray-subagents/target/release/gray-subagents \
-  /home/vstaln/gray-subagents-host/target/debug/gray install plugin subagents
+GRAY_PLUGIN_PATH=~/grayplugins/gray-subagents/target/release/gray-subagents \
+  <gray-checkout-with-host-bridge>/target/debug/gray install plugin subagents
 
-/home/vstaln/gray-subagents-host/target/debug/gray subagents settings
-/home/vstaln/gray-subagents-host/target/debug/gray
+<gray-checkout-with-host-bridge>/target/debug/gray subagents settings
+<gray-checkout-with-host-bridge>/target/debug/gray
 ```
 
 Alternatively, place the built `gray-subagents` binary on PATH. The bridged host
@@ -97,7 +97,7 @@ linger. Metrics absent from the backend are omitted rather than estimated.
 For a deterministic snapshot using the actual Rust renderer:
 
 ```sh
-/home/vstaln/gray-subagents/target/debug/gray-subagents widget --demo
+~/grayplugins/gray-subagents/target/debug/gray-subagents widget --demo
 ```
 
 Demo values are fixtures, never presented as actual jobs. The host renderer uses
@@ -125,15 +125,15 @@ Gray's theme and existing `shimmer_spans`, refreshed by its normal TUI tick.
 ## Verification
 
 ```sh
-cd /home/vstaln/gray-subagents
+cd ~/grayplugins/gray-subagents
 cargo test
 cargo fmt --check
 python3 -m unittest discover -s tests -v
 
-cd /home/vstaln/gray-subagents-host
-GRAY_WIDGET_TEST_BIN=/home/vstaln/gray-subagents/target/debug/gray-subagents \
+cd <gray-checkout-with-host-bridge>
+GRAY_WIDGET_TEST_BIN=~/grayplugins/gray-subagents/target/debug/gray-subagents \
   CARGO_BUILD_JOBS=4 cargo test -p gray --lib
-./target/debug/gray plugin check /home/vstaln/gray-subagents/target/debug/gray-subagents
+./target/debug/gray plugin check ~/grayplugins/gray-subagents/target/debug/gray-subagents
 ```
 
 The host paint test launches the real plugin binary, parses its snapshot, and
