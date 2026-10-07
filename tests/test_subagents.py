@@ -173,6 +173,40 @@ class SidecarCase(unittest.TestCase):
         r = self.sc.call("subagents_stop", {"run_id": "abc"})
         self.assertTrue(r.get("is_error"))
 
+    def test_run_names_generated_and_resolvable(self):
+        r = self.sc.call("subagent", {"agent": "scout", "task": "named work"})
+        rid, name = r["run_id"], r["names"][0]
+        self.assertRegex(name, r"^[a-z]+-[a-z]+(-\d+)?$")
+        self.wait_status(rid, "completed")
+        st = self.sc.call("subagents_status", {"run_id": name})
+        self.assertEqual(st["run_id"], rid)
+        self.assertEqual(st["name"], name)
+        listing = self.sc.call("subagents_status", {})["content"]
+        self.assertIn(name, listing)
+        r = self.sc.call("subagents_steer", {"run_id": name, "message": "again by name"})
+        self.assertNotIn("is_error", r)
+        self.assertIn(name, r["content"])
+        self.wait_status(rid, "completed")
+
+    def test_custom_name_and_reserved_names(self):
+        r = self.sc.call("subagent", {"agent": "scout", "task": "t", "name": "bobby"})
+        rid = r["run_id"]
+        self.assertEqual(r["names"], ["bobby"])
+        self.wait_status(rid, "completed")
+        st = self.sc.call("subagents_status", {"run_id": "bobby"})
+        self.assertEqual(st["run_id"], rid)
+        for bad in ("last", "a" * 32, "has spaces", "", "-lead"):
+            r = self.sc.call("subagent", {"task": "x", "name": bad})
+            self.assertTrue(r.get("is_error"), bad)
+
+    def test_duplicate_name_resolves_to_newest(self):
+        a = self.sc.call("subagent", {"task": "one", "name": "dup"})["run_id"]
+        self.wait_status(a, "completed")
+        b = self.sc.call("subagent", {"task": "two", "name": "dup"})["run_id"]
+        self.wait_status(b, "completed")
+        st = self.sc.call("subagents_status", {"run_id": "dup"})
+        self.assertEqual(st["run_id"], b)
+
     def test_stop_unknown_run_id_is_error(self):
         r = self.sc.call("subagents_stop", {"run_id": "deadbeef"})
         self.assertTrue(r.get("is_error"))

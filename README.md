@@ -1,15 +1,11 @@
 # gray-subagents
 
-Separate Gray plugin repository. The CLI and Pi-style above-editor widget are
-Rust. The tested Linux process supervisor is currently Python 3, embedded in the
-binary; this is **not yet an all-Rust runtime**.
-
-Same interaction model as @gotgenes/pi-subagents — background agents, an
-above-editor tree, per-profile system prompts, steer, concurrency cap — but
-deliberately thinner: the parent drives plain `gray subagents …` Bash commands
-instead of dedicated model tools, profiles are plain Markdown (no YAML
-frontmatter), and children are detached `gray -p` OS processes rather than
-in-process agents.
+Subagents for Gray: background agent runs driven by plain Bash commands, with
+an above-editor tree widget. The CLI and widget are Rust; the tested Linux
+process supervisor is currently Python 3, embedded in the binary — **not yet
+an all-Rust runtime**. Runs are detached OS processes (`gray -p --json`
+children with their own supervisor): they keep going if the parent session or
+terminal exits, and any later session can inspect, steer, or stop them.
 
 ## What works
 
@@ -19,6 +15,8 @@ in-process agents.
   12-line overflow limit. No bordered cards or spinning glyphs.
 - Bash-only model interface: the installed plugin advertises **zero tools**.
 - CLI launch/status/stop/steer/list/settings; per-launch or default model selection.
+- Named runs: `--name` or an auto `adjective-noun` handle; `status`/`stop`/`steer`
+  accept a name, a unique hex prefix, or `last`.
 - Steering: queued follow-ups resume the same child session between phases.
 - Background child supervision, timeout, cancellation, and bounded output.
 - Live activity from the child's `--json` progress rows in status and widget.
@@ -56,17 +54,20 @@ gray subagents settings
 gray subagents settings --max-running 4
 gray subagents settings --model provider/model
 gray subagents run --agent scout "Find authentication entry points"
-gray subagents run --agent reviewer --model provider/other-model "Review the diff"
+gray subagents run --name fix-auth --agent reviewer "Review the diff"
 gray subagents run unquoted words also work   # task = joined args
 gray subagents status
-gray subagents status RUN_ID
-gray subagents steer RUN_ID "follow-up instructions"
+gray subagents status watcher        # or an id prefix, or `last`
+gray subagents steer watcher "follow-up instructions"
 gray subagents steer last "redirect the newest run"
-gray subagents stop RUN_ID
+gray subagents stop watcher
 ```
 
-Run IDs are returned immediately and shown short; any unique hex prefix
-(≥4 chars) or `last` resolves to a run. Multiple launches can run concurrently
+Every run gets a handle: `--name` when given, else an auto `adjective-noun`
+name (deterministic from the run id, deduplicated). `status`, `stop` and
+`steer` accept the name, a unique hex prefix (≥4 chars), or `last`; a reused
+name resolves to the newest run with it. Names `last` and anything looking
+like a full run id are reserved. Multiple launches can run concurrently
 under the shared-home cap. Model order: per-launch `--model`, saved plugin
 model, then the child Gray's inherited environment/saved config. Model
 configuration errors are not silently retried using a different model.
@@ -95,10 +96,11 @@ rows for the session id, live `activity` (last tool/detail — shown by
 setup: scout, worker, reviewer, oracle. Parent agents can change settings with
 the same commands and edit profile files through Bash.
 
-Inside Gray use `/subagent settings`, `/subagent settings --max-running 2`,
-`/subagent list`, `/subagent status`, `/subagent steer <id> words…`, or
-`/subagent run --agent scout words…`. Multi-word arguments join, so quoting is
-optional.
+Inside Gray there is one slash command: `/subagents` (bare = status).
+`/subagents run --name x --agent scout words…`, `/subagents steer <name>
+words…`, `/subagents status`, `/subagents stop <name>`, `/subagents list`,
+`/subagents settings [--max-running N] [--model provider/model]`. Multi-word
+arguments join, so quoting is optional. Output is plain text, not JSON.
 
 ## Appearance
 
@@ -175,6 +177,8 @@ was not changed for this feature. Do not claim a clean workspace-wide result.
 
 ## Attribution
 
-Pi widget layout/grouping adapted under MIT from @gotgenes/pi-subagents 19.3.5.
-See THIRD_PARTY_NOTICES.md and LICENSE. The Gray host reuses its own shimmer
+Widget tree layout/grouping adapted under MIT from @gotgenes/pi-subagents
+19.3.5 — credit where due; the implementation here is independent (detached
+Rust CLI + embedded Python supervisor, not in-process extension agents). See
+THIRD_PARTY_NOTICES.md and LICENSE. The Gray host reuses its own shimmer
 helper rather than maintaining another animation implementation.

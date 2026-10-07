@@ -34,6 +34,8 @@ enum Action {
         agent: String,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
     },
     Steer {
         run_id: String,
@@ -131,7 +133,7 @@ fn backend(action: &str, args: Value, model: Option<&str>) -> Result<Value> {
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 fn manifest() -> Value {
-    json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"completion":["settings","setup","run","status","stop","steer","list"],"commands":["/subagent","/subagents"],"hooks":["prompt/context"],"subcommands":["subagents"]})
+    json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"completion":["settings","setup","run","status","stop","steer","list"],"commands":["/subagents"],"hooks":["prompt/context"],"subcommands":["subagents"]})
 }
 fn widget(demo: bool) -> Result<Value> {
     let mut rows = Vec::new();
@@ -204,7 +206,11 @@ fn widget(demo: bool) -> Result<Value> {
                     },
                 };
                 rows.push(AgentRow {
-                    name: job["agent"].as_str().unwrap_or("agent").into(),
+                    name: job["name"]
+                        .as_str()
+                        .or_else(|| job["agent"].as_str())
+                        .unwrap_or("agent")
+                        .into(),
                     description: job["task"].as_str().unwrap_or("").into(),
                     stats: format!(
                         "{:.1}s",
@@ -225,14 +231,22 @@ fn widget(demo: bool) -> Result<Value> {
         .collect();
     Ok(json!({"version":1,"text":text,"shimmer_lines":shimmer}))
 }
-const USAGE: &str = "Subagents are managed through Bash: gray subagents run --agent scout 'task'; gray subagents status [RUN_ID]; gray subagents steer RUN_ID 'follow-up'; gray subagents stop RUN_ID; gray subagents settings --model PROVIDER/MODEL. RUN_ID accepts a unique hex prefix or 'last'. Do not invent subagent tools.";
+const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] 'task'; gray subagents status [ID]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL. Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, or 'last'. Runs are detached — they keep going if this session ends. Do not invent subagent tools.";
 
 fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
     match action {
         Action::Settings { model, max_running } => settings(model, max_running),
         Action::Setup => backend("setup", json!({}), None),
-        Action::Run { task, agent, model } => {
+        Action::Run {
+            task,
+            agent,
+            model,
+            name,
+        } => {
             let mut args = json!({"task":task.join(" "),"agent":agent});
+            if let Some(name) = name {
+                args["name"] = json!(name);
+            }
             if let Some(session) = session {
                 args["session"] = session.clone();
             }
@@ -250,6 +264,13 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
         Action::Manifest => Ok(manifest()),
     }
 }
+fn present(v: &Value) -> String {
+    if let Some(text) = v["content"].as_str() {
+        return text.to_string();
+    }
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
 fn sidecar() -> Result<()> {
     for line in io::stdin().lock().lines() {
         let Ok(req) = serde_json::from_str::<Value>(&line?) else {
@@ -288,7 +309,7 @@ fn sidecar() -> Result<()> {
                 Cli::try_parse_from(argv)
                     .map_err(anyhow::Error::from)
                     .and_then(|cli| execute(cli.command.unwrap(), session.as_ref()))
-                    .map(|v| json!({"text":serde_json::to_string_pretty(&v).unwrap()}))
+                    .map(|v| json!({"text":present(&v)}))
             }
             _ => Err(anyhow::anyhow!("unsupported sidecar method")),
         };

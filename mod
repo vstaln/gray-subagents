@@ -62,12 +62,12 @@ TOOLS = [
         "description": "List subagent runs (most recent first), or show one run when run_id is given.",
         "parameters": {
             "type": "object",
-            "properties": {"run_id": {"type": "string", "description": "Optional run to inspect."}},
+            "properties": {"run_id": {"type": "string", "description": "Optional run name, id prefix, or 'last' to inspect."}},
         },
     },
     {
         "name": "subagents_stop",
-        "description": "Stop a running subagent.",
+        "description": "Stop a running subagent (run_id accepts a name, id prefix, or 'last').",
         "parameters": {
             "type": "object",
             "properties": {"run_id": {"type": "string"}},
@@ -86,7 +86,7 @@ TOOLS = [
         "parameters": {
             "type": "object",
             "properties": {
-                "run_id": {"type": "string"},
+                "run_id": {"type": "string", "description": "Run name, id prefix, or 'last'."},
                 "message": {"type": "string", "description": "Follow-up instructions for the same child session."},
             },
             "required": ["run_id", "message"],
@@ -121,6 +121,28 @@ SUPERVISORS = []
 NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 
+ADJ = ("amber", "brisk", "calm", "delta", "ember", "faint", "grand", "hazy",
+       "ionic", "jade", "keen", "lunar", "misty", "nova", "opal", "prime",
+       "quiet", "rapid", "solar", "tidal", "ultra", "vivid", "warm", "xeno",
+       "young", "zenith")
+NOUN = ("atlas", "beacon", "cipher", "dune", "ember", "falcon", "glade",
+        "harbor", "iris", "jetty", "kelp", "lotus", "mesa", "nimbus",
+        "onyx", "pico", "quartz", "ridge", "summit", "tundra", "umbra",
+        "vortex", "willow", "xenon", "yucca", "zephyr")
+
+
+def gen_name(rid, taken):
+    """Readable handle derived from the run id; unique among current names."""
+    a, b = int(rid[:4], 16), int(rid[4:8], 16)
+    base = f"{ADJ[a % len(ADJ)]}-{NOUN[b % len(NOUN)]}"
+    if base not in taken:
+        return base
+    for i in range(2, 10):
+        cand = f"{base}-{i}"
+        if cand not in taken:
+            return cand
+    return f"{base}-{rid[:4]}"
+
 
 def home():
     return Path(os.environ.get("GRAY_HOME") or Path.home() / ".gray").expanduser().resolve()
@@ -153,22 +175,25 @@ def job_path(rid):
 
 
 def resolve_rid(rid):
-    """Accept a full 32-hex id, an unambiguous >=4-char prefix, or 'last'."""
+    """Accept a run name, 'last', a full 32-hex id, or a unique >=4-char prefix."""
     if not isinstance(rid, str):
         raise ValueError("unknown or invalid run_id")
     if RUN_ID.fullmatch(rid):
         return rid
+    jobs = all_jobs()  # newest first
     if rid == "last":
-        jobs = all_jobs()
         if not jobs:
             raise ValueError("no subagent runs yet")
         return jobs[0]["run_id"]
-    if not re.fullmatch(r"[0-9a-f]{4,31}", rid):
-        raise ValueError("unknown or invalid run_id")
-    hits = [p.stem for p in runs_dir().glob(f"{rid}*.json")]
-    if len(hits) != 1:
+    named = [j for j in jobs if j.get("name") == rid]
+    if named:
+        return named[0]["run_id"]
+    if re.fullmatch(r"[0-9a-f]{4,31}", rid):
+        hits = [j["run_id"] for j in jobs if j["run_id"].startswith(rid)]
+        if len(hits) == 1:
+            return hits[0]
         raise ValueError(f"run_id '{rid}' matches {len(hits)} runs; give more digits")
-    return hits[0]
+    raise ValueError(f"unknown run or name '{rid}'")
 
 
 def read_job(rid):
@@ -216,12 +241,32 @@ def kill_orphan(job):
             pass
 
 
+def spawn_supervisor(rid):
+    """Detached supervisor process + its /proc birth tick. The tick read can
+    race a fresh fork, so retry briefly; a None birth disables orphan checks
+    rather than risking killing a live supervisor."""
+    mod = str(Path(__file__).resolve())
+    proc = subprocess.Popen([sys.executable, mod, "--supervise", rid],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True,
+                            env=dict(os.environ, GRAY_HOME=str(home())))
+    birth = identity(proc.pid)
+    for _ in range(50):
+        if birth:
+            break
+        time.sleep(0.01)
+        birth = identity(proc.pid)
+    SUPERVISORS.append(proc)
+    return proc, birth
+
+
 def sweep():
     for proc in SUPERVISORS[:]:
         if proc.poll() is not None:
             SUPERVISORS.remove(proc)
     for job in all_jobs():
-        if job["status"] in ACTIVE and identity(job.get("supervisor_pid")) != job.get("supervisor_birth"):
+        if job["status"] in ACTIVE and job.get("supervisor_birth") \
+                and identity(job.get("supervisor_pid")) != job["supervisor_birth"]:
             kill_orphan(job)
             job.update(status="lost", error="supervisor exited before recording a result", finished=time.time())
             write_job(job)
@@ -277,15 +322,20 @@ def limited(text, limit=CONTENT_LIMIT):
     return raw[:limit].decode("utf-8", errors="ignore") + "\n[truncated; complete captured output is in the private run record]"
 
 
+def run_handle(job):
+    return job.get("name") or job["run_id"][:8]
+
+
 def job_view(job):
     view = {key: job.get(key, "") for key in ("run_id", "agent", "task", "status", "result", "error")}
+    view["name"] = job.get("name", "")
     view["activity"] = job.get("activity", "")
     view["child_session"] = job.get("child_session", "")
     view["steer_queue"] = len(job.get("steer_queue") or [])
     view["phases"] = len(job.get("phases") or [])
     queue = f" · {view['steer_queue']} steered" if view["steer_queue"] else ""
     activity = f"\n{job.get('activity', '')}" if job["status"] in ACTIVE and job.get("activity") else ""
-    view["content"] = limited(f"{job['run_id']} [{job['status']}{queue}] {job['agent']}{activity}\n{job.get('error', '')}\n{job.get('result', '')}")
+    view["content"] = limited(f"{run_handle(job)} [{job['status']}{queue}] {job['agent']} · run {job['run_id']}{activity}\n{job.get('error', '')}\n{job.get('result', '')}")
     return view
 
 
@@ -295,8 +345,8 @@ def status_job(rid=None):
         if rid is not None:
             return job_view(read_job(resolve_rid(rid)))
         jobs = all_jobs()
-    return {"content": limited("\n".join(f"{j['run_id'][:8]} [{j['status']}] {j['agent']}: {j['task'][:100]}" for j in jobs)) or "no subagent runs",
-            "jobs": [{k: j[k] for k in ("run_id", "agent", "status", "created")} for j in jobs]}
+    return {"content": limited("\n".join(f"{run_handle(j)} [{j['status']}] {j['agent']}: {j['task'][:100]}" for j in jobs)) or "no subagent runs",
+            "jobs": [{k: j.get(k, "") for k in ("run_id", "name", "agent", "status", "created")} for j in jobs]}
 
 
 def stop_job(rid):
@@ -344,6 +394,12 @@ def spawn_jobs(args, session):
         task, agent = item.get("task"), item.get("agent", "scout")
         if not isinstance(task, str) or not task.strip() or len(task) > 32000 or "\0" in task:
             raise ValueError("task must contain 1–32000 nonempty characters and no NUL")
+        name = item.get("name")
+        if name is not None:
+            if not isinstance(name, str) or not NAME.fullmatch(name):
+                raise ValueError("name must match [a-zA-Z0-9][a-zA-Z0-9_-]{0,63}")
+            if name == "last" or RUN_ID.fullmatch(name):
+                raise ValueError(f"name '{name}' is reserved")
         body = load_profile(agent)
         prompt = (f"You are the '{agent}' subagent of a parent Gray session.\n\n{body}\n\n"
                   f"# Task\n\n{task}\n\nWork only on this assignment. Do not spawn more agents. "
@@ -351,24 +407,25 @@ def spawn_jobs(args, session):
                   "Return findings, changed paths, and verification in your final answer.")
         if "\0" in prompt:
             raise ValueError("profile contains NUL")
-        prepared.append((agent, task, prompt))
+        prepared.append((agent, task, prompt, name))
     started = []
     with registry():
         sweep()
         running = sum(j["status"] in ACTIVE for j in all_jobs())
         if running + len(prepared) > cap:
             raise ValueError(f"{running} jobs running; batch would exceed running cap {cap}")
-        for agent, task, prompt in prepared:
-            job = dict(run_id=uuid.uuid4().hex, agent=agent, task=task, prompt=prompt,
+        taken = {j.get("name") for j in all_jobs()}
+        for agent, task, prompt, name in prepared:
+            rid = uuid.uuid4().hex
+            name = name or gen_name(rid, taken)
+            taken.add(name)
+            job = dict(run_id=rid, name=name, agent=agent, task=task, prompt=prompt,
                        cwd=cwd, session_id=session.get("id", ""), binary=str(Path(binary).resolve()),
                        timeout=ttl, created=time.time(), status="running", result="", error="",
                        noticed=False, activity="", child_session="", steer_queue=[], phases=[])
             try:
-                proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--supervise", job["run_id"]],
-                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                        start_new_session=True, env=dict(os.environ, GRAY_HOME=str(home())))
-                SUPERVISORS.append(proc)
-                job.update(supervisor_pid=proc.pid, supervisor_birth=identity(proc.pid))
+                proc, birth = spawn_supervisor(job["run_id"])
+                job.update(supervisor_pid=proc.pid, supervisor_birth=birth)
                 write_job(job)
             except OSError:
                 # Stop any accepted part of the batch rather than leave it unnoticed.
@@ -378,10 +435,13 @@ def spawn_jobs(args, session):
                     write_job(prior)
                 raise
             started.append(job["run_id"])
-    text = ("Started subagent runs: " + ", ".join(started) +
-            ". Results arrive at your next turn; status/stop are available, "
-            "and steer (gray subagents steer RUN_ID 'follow-up') redirects the same child session.")
-    return {"content": text, "run_ids": started, **({"run_id": started[0]} if "tasks" not in args else {})}
+    handles = ", ".join(f"{j['name']} [{j['run_id'][:8]}]" for j in
+                        (read_job(r) for r in started))
+    text = (f"Started subagent runs: {handles}. "
+            "Results arrive at your next turn; status/stop work on name or id, "
+            "and steer (gray subagents steer NAME 'follow-up') redirects the same child session.")
+    return {"content": text, "run_ids": started, "names": [read_job(r)["name"] for r in started],
+            **({"run_id": started[0]} if "tasks" not in args else {})}
 
 
 def completion_notices(cwd):
@@ -430,14 +490,9 @@ def steer_job(rid, message):
                 raise ValueError(f"run {rid} has no resumable child session")
             job.update(status="running", error="", finished=None,
                        created=time.time(), activity="")
-            mod = str(Path(__file__).resolve())
             try:
-                proc = subprocess.Popen([sys.executable, mod, "--supervise", rid],
-                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL, start_new_session=True,
-                                        env=dict(os.environ, GRAY_HOME=str(home())))
-                SUPERVISORS.append(proc)
-                job.update(supervisor_pid=proc.pid, supervisor_birth=identity(proc.pid))
+                proc, birth = spawn_supervisor(job["run_id"])
+                job.update(supervisor_pid=proc.pid, supervisor_birth=birth)
             except OSError:
                 job["steer_queue"].pop()
                 job["status"] = "failed"
@@ -445,7 +500,7 @@ def steer_job(rid, message):
                 raise
             write_job(job)
             where = "resuming the child session now"
-    return {"content": f"Steer for {job['run_id']}: {where}", "queued": len(queue)}
+    return {"content": f"Steer for {run_handle(job)}: {where}", "queued": len(queue)}
 
 
 def describe_row(row):
