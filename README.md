@@ -14,7 +14,14 @@ terminal exits, and any later session can inspect, steer, or stop them.
 - Finished entries, two-line running entries, tree connectors, queued summary,
   12-line overflow limit. No bordered cards or spinning glyphs.
 - Bash-only model interface: the installed plugin advertises **zero tools**.
-- CLI launch/status/stop/steer/list/settings; per-launch or default model selection.
+- CLI launch/status/stop/steer/list/settings.
+- Per-delegation model & effort: `run --model PROVIDER/MODEL --effort LEVEL`,
+  per-item `model`/`effort` in batch tasks, and `model:`/`effort:` frontmatter
+  defaults inside agent profiles. Precedence: task field → run flag → profile →
+  `settings --model/--effort` → inherited env. Model specs resolve against
+  `~/.gray/models.json` (exact → unique prefix → unique substring; unknown ids
+  fail fast with up to 4 candidate suggestions). Effort is one of
+  off/minimal/low/medium/high/xhigh/max.
 - Named runs: `--name` or an auto `adjective-noun` handle; `status`/`stop`/`steer`
   accept a name, a unique hex prefix, or `last`.
 - Steering: queued follow-ups resume the same child session between phases.
@@ -52,9 +59,10 @@ gray subagents setup
 gray subagents list
 gray subagents settings
 gray subagents settings --max-running 4
-gray subagents settings --model provider/model
+gray subagents settings --model provider/model [--effort LEVEL]
 gray subagents run --agent scout "Find authentication entry points"
 gray subagents run --name fix-auth --agent reviewer "Review the diff"
+gray subagents run --agent scout --model xai/grok-code-fast --effort low "Survey the API"
 gray subagents run unquoted words also work   # task = joined args
 gray subagents status
 gray subagents status watcher        # or an id prefix, or `last`
@@ -182,3 +190,25 @@ Widget tree layout/grouping adapted under MIT from @gotgenes/pi-subagents
 Rust CLI + embedded Python supervisor, not in-process extension agents). See
 THIRD_PARTY_NOTICES.md and LICENSE. The Gray host reuses its own shimmer
 helper rather than maintaining another animation implementation.
+
+## Agent profiles with model defaults
+
+Profiles live in `~/.gray/subagents/agents/<name>.md`. An optional `---`
+frontmatter block at the top pins a default model and/or effort for that
+profile — handy for routing cheap scouts and expensive workers:
+
+```markdown
+---
+model: deepseek/deepseek-v4
+effort: low
+---
+
+# Cheap Scout
+
+Inspect the codebase without editing files...
+```
+
+The block is stripped before the profile text reaches the child prompt. An
+explicit `--model`/`--effort` flag (or a per-task field) always beats the
+profile default. `gray subagents status` shows the resolved model per run and
+the widget stats line carries the model basename.

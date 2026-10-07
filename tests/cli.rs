@@ -110,6 +110,39 @@ fn bash_cli_runs_child_with_selected_model_and_returns_status() {
 }
 
 #[test]
+fn run_rejects_invalid_effort_and_unknown_model() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("models.json"),
+        r#"{"vendor/good-model": {}, "vendor/other": {}}"#,
+    )
+    .unwrap();
+    let bad_effort = bin()
+        .args(["run", "x", "--effort", "ludicrous"])
+        .env("GRAY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!bad_effort.status.success());
+    assert!(String::from_utf8_lossy(&bad_effort.stderr).contains("effort"));
+
+    let bad_model = bin()
+        .args(["run", "x", "--model", "nope-zzz"])
+        .env("GRAY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!bad_model.status.success());
+    assert!(String::from_utf8_lossy(&bad_model.stderr).contains("unknown model"));
+
+    let ambiguous = bin()
+        .args(["run", "x", "--model", "vendor"])
+        .env("GRAY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("vendor/good-model"));
+}
+
+#[test]
 fn run_joins_unquoted_task_words_and_keeps_flags() {
     let home = tempfile::tempdir().unwrap();
     let child = home.path().join("gray-child");

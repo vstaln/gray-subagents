@@ -38,6 +38,8 @@ if mode == "chatty":
 if mode == "empty":
     sys.exit(0)
 payload = {"prompt": prompt, "cwd": os.getcwd(), "resume": resume,
+           "model": os.environ.get("GRAY_MODEL"),
+           "effort": os.environ.get("GRAY_THINKING_EFFORT"),
            "active": os.environ.get("GRAY_SUBAGENTS_ACTIVE")}
 if json_mode:
     print(json.dumps({"protocol": 1, "session_id": SID, "type": "progress",

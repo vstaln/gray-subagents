@@ -393,5 +393,78 @@ class SidecarCase(unittest.TestCase):
         self.assertEqual(payload["resume"], "fake-child-session")
         self.assertIn("leg three", payload["prompt"])
 
+    # -- model / effort delegation -------------------------------------------
+    def test_per_run_model_and_effort_reach_child_env(self):
+        rid = self.sc.call("subagent", {"task": "work", "model": "vendor/model-x",
+                                        "effort": "low"})["run_id"]
+        st = self.wait_status(rid, "completed")
+        payload = json.loads(st["result"])
+        self.assertEqual(payload["model"], "vendor/model-x")
+        self.assertEqual(payload["effort"], "low")
+        self.assertEqual(st["model"], "vendor/model-x")
+        self.assertEqual(st["effort"], "low")
+
+    def test_batch_tasks_carry_individual_models(self):
+        r = self.sc.call("subagent", {"tasks": [
+            {"task": "a", "model": "vendor/a"},
+            {"task": "b", "model": "vendor/b", "effort": "high"}]})
+        self.assertNotIn("is_error", r)
+        got = {}
+        for rid in r["run_ids"]:
+            st = self.wait_status(rid, "completed")
+            got[json.loads(st["result"])["model"]] = json.loads(st["result"])["effort"]
+        self.assertEqual(got, {"vendor/a": None, "vendor/b": "high"})
+
+    def test_profile_frontmatter_sets_model_default(self):
+        agents = self.home / "subagents" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "cheap.md").write_text(
+            "---\nmodel: vendor/cheap-model\neffort: minimal\n---\n\n# Cheap\n\nDo it fast.\n")
+        rid = self.sc.call("subagent", {"agent": "cheap", "task": "go"})["run_id"]
+        st = self.wait_status(rid, "completed")
+        payload = json.loads(st["result"])
+        self.assertEqual(payload["model"], "vendor/cheap-model")
+        self.assertEqual(payload["effort"], "minimal")
+        self.assertNotIn("vendor/cheap-model", payload["prompt"])
+
+    def test_run_arg_model_beats_profile_default(self):
+        agents = self.home / "subagents" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "cheap.md").write_text("---\nmodel: vendor/cheap\n---\n# Cheap\n\nDo it.\n")
+        rid = self.sc.call("subagent", {"agent": "cheap", "task": "go",
+                                        "model": "vendor/strong"})["run_id"]
+        st = self.wait_status(rid, "completed")
+        self.assertEqual(json.loads(st["result"])["model"], "vendor/strong")
+
+    def test_invalid_model_and_effort_are_tool_errors(self):
+        for args in ({"task": "x", "model": ""}, {"task": "x", "effort": "ludicrous"},
+                     {"task": "x", "model": 42}, {"task": "x", "model": "a" * 300}):
+            with self.subTest(args=args):
+                self.assertTrue(self.sc.call("subagent", args)["is_error"])
+
+    def test_model_catalog_resolves_and_suggests(self):
+        self.home.mkdir(parents=True)
+        (self.home / "models.json").write_text(json.dumps(
+            {"vendor/good-model": {}, "vendor/other-model": {}, "acme/good-tool": {}}))
+        rid = self.sc.call("subagent", {"task": "go", "model": "good-model"})["run_id"]
+        st = self.wait_status(rid, "completed")
+        self.assertEqual(json.loads(st["result"])["model"], "vendor/good-model")
+        bad = self.sc.call("subagent", {"task": "go", "model": "good"})
+        self.assertTrue(bad["is_error"])
+        self.assertIn("vendor/good-model", bad["content"])
+        miss = self.sc.call("subagent", {"task": "go", "model": "nope-zzz"})
+        self.assertTrue(miss["is_error"])
+        self.assertIn("nope-zzz", miss["content"])
+
+    def test_steer_phase_keeps_job_model(self):
+        rid = self.sc.call("subagent", {"task": "leg one", "model": "vendor/leg",
+                                        "effort": "low"})["run_id"]
+        self.wait_status(rid, "completed")
+        self.sc.call("subagents_steer", {"run_id": rid, "message": "leg two"})
+        st = self.wait_status(rid, "completed")
+        payload = json.loads(st["result"])
+        self.assertEqual(payload["model"], "vendor/leg")
+        self.assertEqual(payload["effort"], "low")
+
 if __name__ == "__main__":
     unittest.main()

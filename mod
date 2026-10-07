@@ -11,7 +11,10 @@ supervisor records completion even after the sidecar exits. Steering queues a
 follow-up on the run; the supervisor delivers it as a `--session` resume turn
 in the same child session between phases. Linux is required.
 Env: GRAY_SUBAGENTS_BIN (default `gray`), GRAY_SUBAGENTS_TIMEOUT_SECS (600),
-GRAY_SUBAGENTS_MAX_RUNNING (4). GRAY_SUBAGENTS_ACTIVE=1 is the recursion
+GRAY_SUBAGENTS_MAX_RUNNING (4). Per-run `model`/`effort` overrides reach the
+child as GRAY_MODEL / GRAY_THINKING_EFFORT; agent profiles may carry a `---`
+frontmatter block with `model:`/`effort:` defaults. GRAY_SUBAGENTS_ACTIVE=1 is
+the recursion
 guard: sidecars inside child runs refuse to spawn further subagents.
 """
 import contextlib
@@ -36,6 +39,10 @@ BUILTIN_PROFILES = {
     "oracle": "# Oracle\n\nProvide a second opinion. Challenge assumptions, point out what might be missing, and argue the strongest counter-position. Do not edit files.",
 }
 
+MODEL_CATALOG_LIMIT = 4
+EFFORTS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh", "max"})
+_model_catalog = None  # None = unread, [] = unavailable
+
 TOOLS = [
     {
         "name": "subagent",
@@ -50,9 +57,11 @@ TOOLS = [
             "properties": {
                 "agent": {"type": "string", "description": "Profile name (see subagents_list). Default: scout."},
                 "task": {"type": "string", "description": "Complete, self-contained instructions for one subagent."},
+                "model": {"type": "string", "description": "Model override for this run (e.g. provider/model-id). Overrides profile and default settings."},
+                "effort": {"type": "string", "enum": sorted(EFFORTS), "description": "Thinking effort level for this run."},
                 "tasks": {"type": "array", "minItems": 1, "maxItems": 8,
-                          "description": "Parallel tasks; use instead of top-level task/agent.",
-                          "items": {"type": "object", "properties": {"agent": {"type": "string"}, "task": {"type": "string"}}, "required": ["task"]}},
+                          "description": "Parallel tasks; use instead of top-level task/agent. Each item accepts agent/task/model/effort.",
+                          "items": {"type": "object", "properties": {"agent": {"type": "string"}, "task": {"type": "string"}, "model": {"type": "string"}, "effort": {"type": "string"}}, "required": ["task"]}},
             },
             "oneOf": [{"required": ["task"]}, {"required": ["tasks"]}],
         },
@@ -279,6 +288,88 @@ def profile_list():
     return sorted(names)
 
 
+def parse_frontmatter(text):
+    """Optional `---` header on a profile: `model:` / `effort:` defaults.
+
+        ---
+        model: provider/model-id
+        effort: low
+        ---
+
+    Unknown keys are ignored; the block is stripped from the body."""
+    if not text.startswith("---\n"):
+        return text, {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        return text, {}
+    meta = {}
+    for line in text[4:end].splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            meta[key.strip().lower()] = value.strip()
+    return text[end + 4:].lstrip("\n"), meta
+
+
+def model_catalog():
+    """Model ids from $GRAY_HOME/models.json; [] when the catalog is absent."""
+    global _model_catalog
+    if _model_catalog is None:
+        try:
+            data = json.loads((home() / "models.json").read_text(encoding="utf-8"))
+            _model_catalog = sorted(k for k in data if isinstance(k, str)) if isinstance(data, dict) else []
+        except (OSError, ValueError):
+            _model_catalog = []
+    return _model_catalog
+
+
+def clean_model(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or not 1 <= len(value.strip()) <= 256 or "\0" in value:
+        raise ValueError("model must be a 1–256 character string")
+    return value.strip()
+
+
+def first_set(*values):
+    """First non-None override: explicit-but-invalid values must still error."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def resolve_model(value):
+    """Resolve a requested model against the catalog: exact (case-insensitive),
+    then unique prefix, then unique substring; otherwise error with up to
+    MODEL_CATALOG_LIMIT candidates. No catalog → pass through unchanged."""
+    spec = clean_model(value)
+    if spec is None:
+        return None
+    catalog = model_catalog()
+    if not catalog:
+        return spec
+    lowered = spec.lower()
+    for mid in catalog:
+        if mid.lower() == lowered:
+            return mid
+    prefixed = [m for m in catalog if m.lower().startswith(lowered)]
+    if len(prefixed) == 1:
+        return prefixed[0]
+    hits = prefixed or [m for m in catalog if lowered in m.lower()]
+    if len(hits) == 1:
+        return hits[0]
+    hint = f" — did you mean: {', '.join(hits[:MODEL_CATALOG_LIMIT])}" if hits else " (no catalog match)"
+    raise ValueError(f"unknown model '{spec}'{hint}")
+
+
+def clean_effort(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or value.strip().lower() not in EFFORTS:
+        raise ValueError("effort must be one of: off, minimal, low, medium, high, xhigh, max")
+    return value.strip().lower()
+
+
 def load_profile(name):
     if not isinstance(name, str) or not NAME.fullmatch(name):
         raise ValueError("invalid agent name")
@@ -292,7 +383,11 @@ def load_profile(name):
         text = BUILTIN_PROFILES[name]
     if not text.strip() or len(text) > 65536:
         raise ValueError(f"profile '{name}' must contain 1–65536 characters")
-    return text.strip()
+    body, meta = parse_frontmatter(text.strip())
+    if not body.strip():
+        raise ValueError(f"profile '{name}' has an empty body")
+    return {"body": body, "model": clean_model(meta.get("model")),
+            "effort": clean_effort(meta.get("effort"))}
 
 
 def setup_profiles():
@@ -311,7 +406,7 @@ def setup_profiles():
 def list_profiles():
     return {"content": "\n".join(
         f"{name} ({'user' if (agents_dir() / (name + '.md')).is_file() else 'bundled'}): "
-        + next((line.strip() for line in load_profile(name).splitlines() if line.strip() and not line.startswith('#')), name)
+        + next((line.strip() for line in load_profile(name)["body"].splitlines() if line.strip() and not line.startswith('#')), name)
         for name in profile_list())}
 
 
@@ -327,7 +422,7 @@ def run_handle(job):
 
 
 def job_view(job):
-    view = {key: job.get(key, "") for key in ("run_id", "agent", "task", "status", "result", "error")}
+    view = {key: job.get(key, "") for key in ("run_id", "agent", "task", "status", "result", "error", "model", "effort")}
     view["name"] = job.get("name", "")
     view["activity"] = job.get("activity", "")
     view["child_session"] = job.get("child_session", "")
@@ -345,8 +440,11 @@ def status_job(rid=None):
         if rid is not None:
             return job_view(read_job(resolve_rid(rid)))
         jobs = all_jobs()
-    return {"content": limited("\n".join(f"{run_handle(j)} [{j['status']}] {j['agent']}: {j['task'][:100]}" for j in jobs)) or "no subagent runs",
-            "jobs": [{k: j.get(k, "") for k in ("run_id", "name", "agent", "status", "created")} for j in jobs]}
+    line = lambda j: (f"{run_handle(j)} [{j['status']}] {j['agent']}"
+                      f"{f' <{j['model']}>' if j.get('model') else ''}: {j['task'][:100]}")
+    keys = ("run_id", "name", "agent", "status", "created", "model", "effort")
+    return {"content": limited("\n".join(line(j) for j in jobs)) or "no subagent runs",
+            "jobs": [{k: j.get(k, "") for k in keys} for j in jobs]}
 
 
 def stop_job(rid):
@@ -400,14 +498,16 @@ def spawn_jobs(args, session):
                 raise ValueError("name must match [a-zA-Z0-9][a-zA-Z0-9_-]{0,63}")
             if name == "last" or RUN_ID.fullmatch(name):
                 raise ValueError(f"name '{name}' is reserved")
-        body = load_profile(agent)
-        prompt = (f"You are the '{agent}' subagent of a parent Gray session.\n\n{body}\n\n"
+        prof = load_profile(agent)
+        model = resolve_model(first_set(item.get("model"), args.get("model"), prof["model"]))
+        effort = clean_effort(first_set(item.get("effort"), args.get("effort"), prof["effort"]))
+        prompt = (f"You are the '{agent}' subagent of a parent Gray session.\n\n{prof['body']}\n\n"
                   f"# Task\n\n{task}\n\nWork only on this assignment. Do not spawn more agents. "
                   "If blocked, report the blocker; do not guess unapproved decisions. "
                   "Return findings, changed paths, and verification in your final answer.")
         if "\0" in prompt:
             raise ValueError("profile contains NUL")
-        prepared.append((agent, task, prompt, name))
+        prepared.append((agent, task, prompt, name, model, effort))
     started = []
     with registry():
         sweep()
@@ -415,11 +515,12 @@ def spawn_jobs(args, session):
         if running + len(prepared) > cap:
             raise ValueError(f"{running} jobs running; batch would exceed running cap {cap}")
         taken = {j.get("name") for j in all_jobs()}
-        for agent, task, prompt, name in prepared:
+        for agent, task, prompt, name, model, effort in prepared:
             rid = uuid.uuid4().hex
             name = name or gen_name(rid, taken)
             taken.add(name)
             job = dict(run_id=rid, name=name, agent=agent, task=task, prompt=prompt,
+                       model=model or "", effort=effort or "",
                        cwd=cwd, session_id=session.get("id", ""), binary=str(Path(binary).resolve()),
                        timeout=ttl, created=time.time(), status="running", result="", error="",
                        noticed=False, activity="", child_session="", steer_queue=[], phases=[])
@@ -523,14 +624,20 @@ def describe_row(row):
     return text[:120]
 
 
-def run_phase(rid, prompt, resume_sid, binary, cwd, timeout):
+def run_phase(rid, prompt, resume_sid, job):
     """One child invocation: `gray [--session sid] -p <prompt> --json`.
 
     Protocol rows (protocol==1) yield the child session id, live activity and
     the final text; any other stdout is kept verbatim as the result fallback
     so older/plain children still work. Returns (status, error, result)."""
+    binary, cwd, timeout = job["binary"], job["cwd"], job["timeout"]
     env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", NO_COLOR="1",
                TERM="dumb", GRAY_SHOW_REASONING="0")
+    # Per-delegation overrides beat inherited env (run --model / settings / parent).
+    if job.get("model"):
+        env["GRAY_MODEL"] = job["model"]
+    if job.get("effort"):
+        env["GRAY_THINKING_EFFORT"] = job["effort"]
     argv = [binary] + (["--session", resume_sid] if resume_sid else []) + ["-p", prompt, "--json"]
     proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -661,7 +768,7 @@ def supervise(rid):
                                "result": "", "error": ""})
                 job["activity"] = ""
                 write_job(job)
-            pst, perr, ptext = run_phase(rid, prompt, resume_sid, job["binary"], job["cwd"], job["timeout"])
+            pst, perr, ptext = run_phase(rid, prompt, resume_sid, job)
             with registry():
                 job = read_job(rid)
                 phase = job["phases"][-1]

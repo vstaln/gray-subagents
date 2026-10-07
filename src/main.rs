@@ -24,6 +24,8 @@ enum Action {
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
+        effort: Option<String>,
+        #[arg(long)]
         max_running: Option<u32>,
     },
     Setup,
@@ -34,6 +36,8 @@ enum Action {
         agent: String,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
         #[arg(long)]
         name: Option<String>,
     },
@@ -61,7 +65,7 @@ fn home() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".gray")))
         .context("cannot resolve Gray home")
 }
-fn settings(model: Option<String>, cap: Option<u32>) -> Result<Value> {
+fn settings(model: Option<String>, cap: Option<u32>, effort: Option<String>) -> Result<Value> {
     let path = home()?.join("subagents/settings.json");
     let mut value: Value = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -69,10 +73,13 @@ fn settings(model: Option<String>, cap: Option<u32>) -> Result<Value> {
         Err(e) => return Err(e.into()),
     };
     anyhow::ensure!(value.is_object(), "settings must be an object");
-    let changed = model.is_some() || cap.is_some();
+    let changed = model.is_some() || cap.is_some() || effort.is_some();
     if let Some(model) = model {
-        anyhow::ensure!(!model.trim().is_empty(), "model cannot be empty");
+        let model = resolve_model(&model)?;
         value["model"] = json!(model);
+    }
+    if let Some(effort) = effort {
+        value["effort"] = json!(check_effort(&effort)?);
     }
     if let Some(cap) = cap {
         anyhow::ensure!((1..=32).contains(&cap), "max-running must be 1–32");
@@ -89,8 +96,8 @@ fn settings(model: Option<String>, cap: Option<u32>) -> Result<Value> {
 }
 // Retain the tested Python process supervisor while the UI/CLI is native Rust.
 // Embedded source makes the installed executable independent of the source tree.
-fn backend(action: &str, args: Value, model: Option<&str>) -> Result<Value> {
-    let cfg = settings(None, None)?;
+fn backend(action: &str, args: Value, model: Option<&str>, effort: Option<&str>) -> Result<Value> {
+    let cfg = settings(None, None, None)?;
     let script = concat!(
         "import sys,json\nns={'__name__':'gray_subagents_backend','__file__':sys.argv[3]}\nexec(sys.argv[1],ns)\nargs=json.loads(sys.argv[2])\naction=sys.argv[4]\n",
         "if action=='run': result=ns['spawn_jobs'](args,args.get('session') or {'cwd':__import__('os').getcwd()})\n",
@@ -118,6 +125,9 @@ fn backend(action: &str, args: Value, model: Option<&str>) -> Result<Value> {
     }
     if let Some(model) = model.or(cfg["model"].as_str()) {
         cmd.env("GRAY_MODEL", model);
+    }
+    if let Some(effort) = effort.or(cfg["effort"].as_str()) {
+        cmd.env("GRAY_THINKING_EFFORT", effort);
     }
     if let Some(bin) = std::env::var_os("GRAY_BIN") {
         cmd.env("GRAY_SUBAGENTS_BIN", bin);
@@ -213,10 +223,15 @@ fn widget(demo: bool) -> Result<Value> {
                         .into(),
                     description: job["task"].as_str().unwrap_or("").into(),
                     stats: format!(
-                        "{:.1}s",
+                        "{:.1}s{}",
                         (job["finished"].as_f64().unwrap_or(now)
                             - job["created"].as_f64().unwrap_or(now))
-                        .max(0.0)
+                        .max(0.0),
+                        job["model"]
+                            .as_str()
+                            .filter(|m| !m.is_empty())
+                            .map(|m| format!(" · {}", m.rsplit('/').next().unwrap_or(m)))
+                            .unwrap_or_default()
                     ),
                     state,
                 });
@@ -231,35 +246,99 @@ fn widget(demo: bool) -> Result<Value> {
         .collect();
     Ok(json!({"version":1,"text":text,"shimmer_lines":shimmer}))
 }
-const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] 'task'; gray subagents status [ID]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL. Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, or 'last'. Runs are detached — they keep going if this session ends. Do not invent subagent tools.";
+const EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+fn check_effort(effort: &str) -> Result<String> {
+    let value = effort.trim().to_lowercase();
+    anyhow::ensure!(
+        EFFORTS.contains(&value.as_str()),
+        "effort must be one of: {}",
+        EFFORTS.join(", ")
+    );
+    Ok(value)
+}
+
+/// Resolve a `--model` value against $GRAY_HOME/models.json: exact
+/// (case-insensitive) id, then unique prefix, then unique substring.
+/// Unknown specs fail with up to 4 catalog candidates. No catalog → pass
+/// through and let the child validate.
+fn resolve_model(spec: &str) -> Result<String> {
+    let spec = spec.trim();
+    anyhow::ensure!(!spec.is_empty() && spec.len() <= 256 && !spec.contains('\0'),
+        "model must be a 1-256 character string");
+    let Ok(raw) = std::fs::read(home()?.join("models.json")) else {
+        return Ok(spec.to_string());
+    };
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&raw) else {
+        return Ok(spec.to_string());
+    };
+    let low = spec.to_lowercase();
+    for id in map.keys() {
+        if id.to_lowercase() == low {
+            return Ok(id.clone());
+        }
+    }
+    let prefixed: Vec<&String> = map.keys().filter(|k| k.to_lowercase().starts_with(&low)).collect();
+    if prefixed.len() == 1 {
+        return Ok(prefixed[0].clone());
+    }
+    let mut hits: Vec<String> = if prefixed.is_empty() {
+        map.keys().filter(|k| k.to_lowercase().contains(&low)).cloned().collect()
+    } else {
+        prefixed.into_iter().cloned().collect()
+    };
+    if hits.len() == 1 {
+        return Ok(hits.remove(0));
+    }
+    hits.sort();
+    hits.truncate(4);
+    if hits.is_empty() {
+        anyhow::bail!("unknown model '{spec}' — no match in the model catalog");
+    }
+    anyhow::bail!("unknown model '{spec}' — did you mean: {}", hits.join(", "));
+}
+
+const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] 'task'; gray subagents status [ID]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL [--effort LEVEL]. Per-run --model/--effort override profile frontmatter and the global setting; profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:` defaults. Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, or 'last'. Runs are detached — they keep going if this session ends. Do not invent subagent tools.";
 
 fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
     match action {
-        Action::Settings { model, max_running } => settings(model, max_running),
-        Action::Setup => backend("setup", json!({}), None),
+        Action::Settings {
+            model,
+            effort,
+            max_running,
+        } => settings(model, max_running, effort),
+        Action::Setup => backend("setup", json!({}), None, None),
         Action::Run {
             task,
             agent,
             model,
+            effort,
             name,
         } => {
             let mut args = json!({"task":task.join(" "),"agent":agent});
+            if let Some(model) = model {
+                args["model"] = json!(resolve_model(&model)?);
+            }
+            if let Some(effort) = effort {
+                args["effort"] = json!(check_effort(&effort)?);
+            }
             if let Some(name) = name {
                 args["name"] = json!(name);
             }
             if let Some(session) = session {
                 args["session"] = session.clone();
             }
-            backend("run", args, model.as_deref())
+            backend("run", args, None, None)
         }
         Action::Steer { run_id, message } => backend(
             "steer",
             json!({"run_id":run_id,"message":message.join(" ")}),
             None,
+            None,
         ),
-        Action::Status { run_id } => backend("status", json!({"run_id":run_id}), None),
-        Action::Stop { run_id } => backend("stop", json!({"run_id":run_id}), None),
-        Action::List => backend("list", json!({}), None),
+        Action::Status { run_id } => backend("status", json!({"run_id":run_id}), None, None),
+        Action::Stop { run_id } => backend("stop", json!({"run_id":run_id}), None, None),
+        Action::List => backend("list", json!({}), None, None),
         Action::Widget { demo } => widget(demo),
         Action::Manifest => Ok(manifest()),
     }
@@ -289,7 +368,7 @@ fn sidecar() -> Result<()> {
                     Ok(json!({"text":""}))
                 } else {
                     let cwd = req["params"]["cwd"].as_str().unwrap_or("");
-                    let notices = backend("context", json!({"cwd":cwd}), None)
+                    let notices = backend("context", json!({"cwd":cwd}), None, None)
                         .ok()
                         .and_then(|v| v["text"].as_str().map(str::to_owned))
                         .unwrap_or_default();
