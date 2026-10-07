@@ -163,6 +163,16 @@ class SidecarCase(unittest.TestCase):
         r2 = self.sc.call("subagents_stop", {"run_id": rid})
         self.assertTrue(r2.get("is_error"))
 
+    def test_run_id_prefix_and_last_resolution(self):
+        rid = self.sc.call("subagent", {"agent": "scout", "task": "short me"})["run_id"]
+        self.wait_status(rid, "completed")
+        st = self.sc.call("subagents_status", {"run_id": rid[:8]})
+        self.assertEqual(st["run_id"], rid)
+        st = self.sc.call("subagents_status", {"run_id": "last"})
+        self.assertEqual(st["run_id"], rid)
+        r = self.sc.call("subagents_stop", {"run_id": "abc"})
+        self.assertTrue(r.get("is_error"))
+
     def test_stop_unknown_run_id_is_error(self):
         r = self.sc.call("subagents_stop", {"run_id": "deadbeef"})
         self.assertTrue(r.get("is_error"))
@@ -277,6 +287,77 @@ class SidecarCase(unittest.TestCase):
             time.sleep(.02)
         self.fail("descendant still running")
 
+    # -- steering -------------------------------------------------------------
+    def test_steer_after_completion_resumes_child_session(self):
+        rid = self.sc.call("subagent", {"agent": "scout", "task": "first"})["run_id"]
+        self.wait_status(rid, "completed")
+        r = self.sc.call("subagents_steer", {"run_id": rid, "message": "now do this"})
+        self.assertNotIn("is_error", r)
+        st = self.wait_status(rid, "completed")
+        payload = json.loads(st["result"])
+        self.assertEqual(payload["resume"], "fake-child-session")
+        self.assertIn("now do this", payload["prompt"])
+        self.assertEqual(st["phases"], 2)
+        self.assertEqual(st["child_session"], "fake-child-session")
+
+    def test_steer_while_running_queues_for_next_phase(self):
+        rid = self.spawn(task="slow first", env_extra={
+            "FAKE_MODE": "slow", "FAKE_SLEEP": "1"})["run_id"]
+        r = self.sc.call("subagents_steer", {"run_id": rid, "message": "queued follow-up"})
+        self.assertIn("queued", r["content"])
+        st = self.wait_status(rid, "completed")
+        self.assertEqual(st["phases"], 2)
+        self.assertEqual(json.loads(st["result"])["resume"], "fake-child-session")
+
+    def test_steer_rejects_unresumable_and_bad_input(self):
+        rid = self.spawn(env_extra={"FAKE_MODE": "fail"})["run_id"]
+        self.wait_status(rid, "failed")
+        r = self.sc.call("subagents_steer", {"run_id": rid, "message": "again"})
+        self.assertTrue(r.get("is_error"))
+        self.assertIn("session", r["content"])
+        for bad in ({"run_id": "deadbeef", "message": "x"},
+                    {"run_id": rid, "message": "   "}):
+            r = self.sc.call("subagents_steer", bad)
+            self.assertTrue(r.get("is_error"), bad)
+
+    def test_live_activity_is_recorded_while_running(self):
+        rid = self.spawn(task="watch me", env_extra={
+            "FAKE_MODE": "chatty", "FAKE_SLEEP": "1.5"})["run_id"]
+        try:
+            seen = ""
+            for _ in range(100):
+                st = self.sc.call("subagents_status", {"run_id": rid})
+                if st.get("activity"):
+                    seen = st["activity"]
+                    break
+                time.sleep(.05)
+            self.assertIn("Bash", seen)
+        finally:
+            self.wait_status(rid, "completed")
+
+    def test_steer_before_any_session_rejects(self):
+        rid = self.spawn(task="wander", env_extra={
+            "FAKE_MODE": "slow", "FAKE_SLEEP": "10"})["run_id"]
+        self.sc.call("subagents_stop", {"run_id": rid})
+        self.wait_status(rid, "stopped")
+        r = self.sc.call("subagents_steer", {"run_id": rid, "message": "redirect"})
+        self.assertTrue(r.get("is_error"))
+        self.assertIn("session", r["content"])
+
+    def test_stop_mid_steer_then_steer_redirects(self):
+        rid = self.spawn(task="leg one", env_extra={
+            "FAKE_MODE": "slow", "FAKE_SLEEP": "2"})["run_id"]
+        self.wait_status(rid, "completed")
+        self.sc.call("subagents_steer", {"run_id": rid, "message": "leg two"})
+        # phase 2 sleeps ~2s — stop lands inside it
+        self.sc.call("subagents_stop", {"run_id": rid})
+        self.wait_status(rid, "stopped")
+        r = self.sc.call("subagents_steer", {"run_id": rid, "message": "leg three"})
+        self.assertNotIn("is_error", r)
+        st = self.wait_status(rid, "completed")
+        payload = json.loads(st["result"])
+        self.assertEqual(payload["resume"], "fake-child-session")
+        self.assertIn("leg three", payload["prompt"])
 
 if __name__ == "__main__":
     unittest.main()

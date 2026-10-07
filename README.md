@@ -4,6 +4,13 @@ Separate Gray plugin repository. The CLI and Pi-style above-editor widget are
 Rust. The tested Linux process supervisor is currently Python 3, embedded in the
 binary; this is **not yet an all-Rust runtime**.
 
+Same interaction model as @gotgenes/pi-subagents — background agents, an
+above-editor tree, per-profile system prompts, steer, concurrency cap — but
+deliberately thinner: the parent drives plain `gray subagents …` Bash commands
+instead of dedicated model tools, profiles are plain Markdown (no YAML
+frontmatter), and children are detached `gray -p` OS processes rather than
+in-process agents.
+
 ## What works
 
 - Compact tree ported from your installed **@gotgenes/pi-subagents 19.3.5**.
@@ -11,37 +18,30 @@ binary; this is **not yet an all-Rust runtime**.
 - Finished entries, two-line running entries, tree connectors, queued summary,
   12-line overflow limit. No bordered cards or spinning glyphs.
 - Bash-only model interface: the installed plugin advertises **zero tools**.
-- CLI launch/status/stop/list/settings; per-launch or default model selection.
+- CLI launch/status/stop/steer/list/settings; per-launch or default model selection.
+- Steering: queued follow-ups resume the same child session between phases.
 - Background child supervision, timeout, cancellation, and bounded output.
+- Live activity from the child's `--json` progress rows in status and widget.
 - `/subagent settings` and `/subagents settings` command handling and completion
   with the host bridge. Settings currently prints JSON and accepts flags;
   it is not an interactive picker.
 
 ## Build and install locally
 
-This feature needs the generic host bridge currently isolated in
-`<gray-checkout-with-host-bridge>` on branch `feat/subagents-plugin`. Your original
-Gray checkout and installed Gray binary have not been replaced.
+The host pieces this needs (plugin `subcommands`, the generic widget slot,
+`prompt/context`) are merged in current gray — three commands set it up:
 
 ```sh
 cd ~/grayplugins/gray-subagents
 cargo build --release
-
-cd <gray-checkout-with-host-bridge>
-CARGO_BUILD_JOBS=4 cargo build -p gray --bin gray
-
-# Local plugin selection; no unpublished GitHub URL or registry entry assumed.
-GRAY_PLUGIN_PATH=~/grayplugins/gray-subagents/target/release/gray-subagents \
-  <gray-checkout-with-host-bridge>/target/debug/gray install plugin subagents
-
-<gray-checkout-with-host-bridge>/target/debug/gray subagents settings
-<gray-checkout-with-host-bridge>/target/debug/gray
+gray plugin install "$PWD/target/release/gray-subagents"
+gray subagents setup   # seed ~/.gray/subagents/agents/*.md
 ```
 
-Alternatively, place the built `gray-subagents` binary on PATH. The bridged host
-then accepts `gray install plugin subagents` without `GRAY_PLUGIN_PATH`.
-Registration references that binary: keep it at a stable path. This is **local
-registration**, not download-by-name. No remote release/index has been published.
+Registration references the built binary: keep it at a stable path. This is
+**local registration**, not download-by-name. No remote release/index has been
+published. To update after a rebuild, `cargo build --release` again — the
+registered path picks the new binary up directly.
 
 The host registers its command, zero-tool sidecar, and one generic above-editor
 widget slot under `$GRAY_HOME/plugins`. The plugin stays out of Gray's dependency
@@ -57,15 +57,38 @@ gray subagents settings --max-running 4
 gray subagents settings --model provider/model
 gray subagents run --agent scout "Find authentication entry points"
 gray subagents run --agent reviewer --model provider/other-model "Review the diff"
+gray subagents run unquoted words also work   # task = joined args
 gray subagents status
 gray subagents status RUN_ID
+gray subagents steer RUN_ID "follow-up instructions"
+gray subagents steer last "redirect the newest run"
 gray subagents stop RUN_ID
 ```
 
-Run IDs are returned immediately. Multiple launches can run concurrently under
-the shared-home cap. Model order: per-launch `--model`, saved plugin model,
-then the child Gray's inherited environment/saved config. Model configuration
-errors are not silently retried using a different model.
+Run IDs are returned immediately and shown short; any unique hex prefix
+(≥4 chars) or `last` resolves to a run. Multiple launches can run concurrently
+under the shared-home cap. Model order: per-launch `--model`, saved plugin
+model, then the child Gray's inherited environment/saved config. Model
+configuration errors are not silently retried using a different model.
+
+## Steering
+
+`steer` sends a follow-up into the same child session
+(`gray --session <child> -p`):
+
+- **Running** — the message queues (up to 16) and lands when the child's
+  current turn ends; the supervisor runs it as a new phase in the same session.
+- **Finished / stopped / lost** — the run revives: a new supervisor resumes
+  the recorded child session, so the agent keeps full memory of earlier work.
+  `stop` then `steer` is the redirect idiom for a runaway turn.
+- No true mid-turn injection exists anywhere in gray — a live session holds
+  an open lock, so queue-then-resume is the semantics, same effect a beat
+  later. Steering is per-phase: each phase gets the run's timeout fresh.
+
+Every phase is a `gray -p --json` child; the supervisor parses its NDJSON
+rows for the session id, live `activity` (last tool/detail — shown by
+`status` and the widget), and the final `result` text. Children with no
+`--json` support still work: unparsed stdout becomes the result.
 
 `setup` creates editable plain Markdown profiles in
 `$GRAY_HOME/subagents/agents` without overwriting edits. Builtins work before
@@ -73,8 +96,9 @@ setup: scout, worker, reviewer, oracle. Parent agents can change settings with
 the same commands and edit profile files through Bash.
 
 Inside Gray use `/subagent settings`, `/subagent settings --max-running 2`,
-`/subagent list`, or `/subagent status`. Use Bash CLI commands for quoted task
-arguments; the current generic slash fallback splits arguments on whitespace.
+`/subagent list`, `/subagent status`, `/subagent steer <id> words…`, or
+`/subagent run --agent scout words…`. Multi-word arguments join, so quoting is
+optional.
 
 ## Appearance
 
@@ -89,10 +113,12 @@ arguments; the current generic slash fallback splits arguments on whitespace.
  ❯ Your draft remains here
 ```
 
-The runtime widget currently shows **working…**, not invented tool activity.
-It polls atomic run records, scopes them to the current cwd, and retains completed
-runs for 30 seconds. That's a temporary time-based policy, not Pi's turn-count
-linger. Metrics absent from the backend are omitted rather than estimated.
+The widget shows real activity from the child's `--json` progress rows
+(`bash sleep 45`, `finishing`, …), not invented motion. It polls atomic run
+records, scopes them to the current cwd, and retains completed runs for 30
+seconds. That's a temporary time-based policy, not Pi's turn-count linger.
+Metrics absent from the backend (token counts, turn counters) are omitted
+rather than estimated.
 
 For a deterministic snapshot using the actual Rust renderer:
 
@@ -105,8 +131,11 @@ Gray's theme and existing `shimmer_spans`, refreshed by its normal TUI tick.
 
 ## Limits and unfinished work
 
-- **Steering and interactive child transcript views are not implemented yet.**
-  The one-shot `gray -p` supervisor needs a controllable child-session protocol.
+- **Interactive child transcript views are not implemented yet.** The child
+  session id is recorded (`status RUN_ID` → `child_session`); open it with
+  `gray resume <child_session>` yourself.
+- Steering lands between phases, never mid-token — interrupt with `stop`
+  first when the current turn must die.
 - No model picker, effort picker, automatic model policy, worktree management,
   enforced read-only permissions, or per-profile structured model configuration.
 - Child output is captured stdout/stderr, not structured live tool events.

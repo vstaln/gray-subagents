@@ -28,11 +28,17 @@ enum Action {
     },
     Setup,
     Run {
-        task: String,
+        #[arg(required = true, num_args = 1..)]
+        task: Vec<String>,
         #[arg(long, default_value = "scout")]
         agent: String,
         #[arg(long)]
         model: Option<String>,
+    },
+    Steer {
+        run_id: String,
+        #[arg(required = true, num_args = 1..)]
+        message: Vec<String>,
     },
     Status {
         run_id: Option<String>,
@@ -85,9 +91,11 @@ fn backend(action: &str, args: Value, model: Option<&str>) -> Result<Value> {
     let cfg = settings(None, None)?;
     let script = concat!(
         "import sys,json\nns={'__name__':'gray_subagents_backend','__file__':sys.argv[3]}\nexec(sys.argv[1],ns)\nargs=json.loads(sys.argv[2])\naction=sys.argv[4]\n",
-        "if action=='run': result=ns['spawn_jobs'](args,{'cwd':__import__('os').getcwd()})\n",
+        "if action=='run': result=ns['spawn_jobs'](args,args.get('session') or {'cwd':__import__('os').getcwd()})\n",
         "elif action=='status': result=ns['status_job'](args.get('run_id'))\n",
         "elif action=='stop': result=ns['stop_job'](args['run_id'])\n",
+        "elif action=='steer': result=ns['steer_job'](args['run_id'],args['message'])\n",
+        "elif action=='context': result={'text':ns['completion_notices'](args.get('cwd'))}\n",
         "elif action=='setup': result={'content':ns['setup_profiles']()}\n",
         "elif action=='list': result=ns['list_profiles']()\n",
         "print(json.dumps(result))\n"
@@ -123,7 +131,7 @@ fn backend(action: &str, args: Value, model: Option<&str>) -> Result<Value> {
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 fn manifest() -> Value {
-    json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"completion":["settings","setup","run","status","stop","list"],"commands":["/subagent","/subagents"],"hooks":["prompt/context"],"subcommands":["subagents"]})
+    json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"completion":["settings","setup","run","status","stop","steer","list"],"commands":["/subagent","/subagents"],"hooks":["prompt/context"],"subcommands":["subagents"]})
 }
 fn widget(demo: bool) -> Result<Value> {
     let mut rows = Vec::new();
@@ -179,11 +187,15 @@ fn widget(demo: bool) -> Result<Value> {
                 let state = match status {
                     "running" | "stopping" => AgentState::Running {
                         activity: if status == "stopping" {
-                            "stopping…"
+                            "stopping…".into()
                         } else {
-                            "working…"
-                        }
-                        .into(),
+                            let a = job["activity"].as_str().unwrap_or("");
+                            if a.is_empty() {
+                                "working…".into()
+                            } else {
+                                a.into()
+                            }
+                        },
                     },
                     "completed" => AgentState::Completed,
                     "stopped" => AgentState::Stopped,
@@ -213,13 +225,24 @@ fn widget(demo: bool) -> Result<Value> {
         .collect();
     Ok(json!({"version":1,"text":text,"shimmer_lines":shimmer}))
 }
-fn execute(action: Action) -> Result<Value> {
+const USAGE: &str = "Subagents are managed through Bash: gray subagents run --agent scout 'task'; gray subagents status [RUN_ID]; gray subagents steer RUN_ID 'follow-up'; gray subagents stop RUN_ID; gray subagents settings --model PROVIDER/MODEL. RUN_ID accepts a unique hex prefix or 'last'. Do not invent subagent tools.";
+
+fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
     match action {
         Action::Settings { model, max_running } => settings(model, max_running),
         Action::Setup => backend("setup", json!({}), None),
         Action::Run { task, agent, model } => {
-            backend("run", json!({"task":task,"agent":agent}), model.as_deref())
+            let mut args = json!({"task":task.join(" "),"agent":agent});
+            if let Some(session) = session {
+                args["session"] = session.clone();
+            }
+            backend("run", args, model.as_deref())
         }
+        Action::Steer { run_id, message } => backend(
+            "steer",
+            json!({"run_id":run_id,"message":message.join(" ")}),
+            None,
+        ),
         Action::Status { run_id } => backend("status", json!({"run_id":run_id}), None),
         Action::Stop { run_id } => backend("stop", json!({"run_id":run_id}), None),
         Action::List => backend("list", json!({}), None),
@@ -240,9 +263,18 @@ fn sidecar() -> Result<()> {
         }
         let result = match req["method"].as_str() {
             Some("plugin/manifest") => Ok(manifest()),
-            Some("prompt/context") => Ok(
-                json!({"text":"Subagents are managed through Bash: gray subagents run --agent scout 'task'; gray subagents status; gray subagents stop RUN_ID; gray subagents settings --model PROVIDER/MODEL. Do not invent subagent tools."}),
-            ),
+            Some("prompt/context") => {
+                if std::env::var_os("GRAY_SUBAGENTS_ACTIVE").is_some() {
+                    Ok(json!({"text":""}))
+                } else {
+                    let cwd = req["params"]["cwd"].as_str().unwrap_or("");
+                    let notices = backend("context", json!({"cwd":cwd}), None)
+                        .ok()
+                        .and_then(|v| v["text"].as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    Ok(json!({"text":format!("{USAGE}\n{notices}")}))
+                }
+            }
             Some("command/run") => {
                 let args = req["params"]["argv"]
                     .as_array()
@@ -252,9 +284,10 @@ fn sidecar() -> Result<()> {
                 if argv.len() == 1 {
                     argv.push("status".into());
                 }
+                let session = req["params"].get("session").cloned();
                 Cli::try_parse_from(argv)
                     .map_err(anyhow::Error::from)
-                    .and_then(|cli| execute(cli.command.unwrap()))
+                    .and_then(|cli| execute(cli.command.unwrap(), session.as_ref()))
                     .map(|v| json!({"text":serde_json::to_string_pretty(&v).unwrap()}))
             }
             _ => Err(anyhow::anyhow!("unsupported sidecar method")),
@@ -270,7 +303,7 @@ fn sidecar() -> Result<()> {
 }
 fn main() -> Result<()> {
     if let Some(action) = Cli::parse().command {
-        println!("{}", serde_json::to_string_pretty(&execute(action)?)?);
+        println!("{}", serde_json::to_string_pretty(&execute(action, None)?)?);
         Ok(())
     } else {
         sidecar()

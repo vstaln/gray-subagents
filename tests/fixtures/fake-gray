@@ -8,8 +8,14 @@ import sys
 import time
 
 args = sys.argv[1:]
-assert args[0] == "-p" and len(args) == 2, args
+resume = None
+if args[:1] == ["--session"]:
+    resume = args[1]
+    args = args[2:]
+assert args[0] == "-p", args
 prompt = args[1]
+json_mode = "--json" in args[2:]
+SID = "fake-child-session"
 mode = os.environ.get("FAKE_MODE", "ok")
 if mode == "slow":
     time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
@@ -24,7 +30,20 @@ if mode == "flood":
     while True:
         sys.stdout.write("x" * 65536)
         sys.stdout.flush()
+if mode == "chatty":
+    print(json.dumps({"protocol": 1, "session_id": SID, "type": "progress",
+                      "phase": "tool_ran", "tool": "bash", "label": "Bash",
+                      "detail": "early tool"}), flush=True)
+    time.sleep(float(os.environ.get("FAKE_SLEEP", "2")))
 if mode == "empty":
     sys.exit(0)
-print(json.dumps({"prompt": prompt, "cwd": os.getcwd(),
-                  "active": os.environ.get("GRAY_SUBAGENTS_ACTIVE")}))
+payload = {"prompt": prompt, "cwd": os.getcwd(), "resume": resume,
+           "active": os.environ.get("GRAY_SUBAGENTS_ACTIVE")}
+if json_mode:
+    print(json.dumps({"protocol": 1, "session_id": SID, "type": "progress",
+                      "phase": "tool_ran", "tool": "bash", "label": "Bash",
+                      "detail": "fake tool ran"}))
+    print(json.dumps({"protocol": 1, "session_id": SID, "type": "result",
+                      "text": json.dumps(payload)}))
+else:
+    print(json.dumps(payload))

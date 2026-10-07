@@ -7,7 +7,9 @@ returns a run_id immediately; finished runs are reported once via the
 `prompt/context` hook, and `subagents_status` / `subagents_stop` manage them.
 
 Job state lives in $GRAY_HOME/subagents/runs/<run_id>.json. A detached
-supervisor records completion even after the sidecar exits. Linux is required.
+supervisor records completion even after the sidecar exits. Steering queues a
+follow-up on the run; the supervisor delivers it as a `--session` resume turn
+in the same child session between phases. Linux is required.
 Env: GRAY_SUBAGENTS_BIN (default `gray`), GRAY_SUBAGENTS_TIMEOUT_SECS (600),
 GRAY_SUBAGENTS_MAX_RUNNING (4). GRAY_SUBAGENTS_ACTIVE=1 is the recursion
 guard: sidecars inside child runs refuse to spawn further subagents.
@@ -73,6 +75,24 @@ TOOLS = [
         },
     },
     {
+        "name": "subagents_steer",
+        "description": (
+            "Send a follow-up message to a subagent run, in its own session."
+            " While the run is active the message queues and lands when the"
+            " current turn ends; on a finished or stopped run it resumes the"
+            " child session immediately. Use subagents_stop first to redirect"
+            " a runaway turn."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "message": {"type": "string", "description": "Follow-up instructions for the same child session."},
+            },
+            "required": ["run_id", "message"],
+        },
+    },
+    {
         "name": "subagents_list",
         "description": "List available subagent profiles (name, source, description).",
         "parameters": {"type": "object", "properties": {}},
@@ -130,6 +150,25 @@ def job_path(rid):
     if not isinstance(rid, str) or not RUN_ID.fullmatch(rid):
         raise ValueError("unknown or invalid run_id")
     return runs_dir() / f"{rid}.json"
+
+
+def resolve_rid(rid):
+    """Accept a full 32-hex id, an unambiguous >=4-char prefix, or 'last'."""
+    if not isinstance(rid, str):
+        raise ValueError("unknown or invalid run_id")
+    if RUN_ID.fullmatch(rid):
+        return rid
+    if rid == "last":
+        jobs = all_jobs()
+        if not jobs:
+            raise ValueError("no subagent runs yet")
+        return jobs[0]["run_id"]
+    if not re.fullmatch(r"[0-9a-f]{4,31}", rid):
+        raise ValueError("unknown or invalid run_id")
+    hits = [p.stem for p in runs_dir().glob(f"{rid}*.json")]
+    if len(hits) != 1:
+        raise ValueError(f"run_id '{rid}' matches {len(hits)} runs; give more digits")
+    return hits[0]
 
 
 def read_job(rid):
@@ -240,7 +279,13 @@ def limited(text, limit=CONTENT_LIMIT):
 
 def job_view(job):
     view = {key: job.get(key, "") for key in ("run_id", "agent", "task", "status", "result", "error")}
-    view["content"] = limited(f"{job['run_id']} [{job['status']}] {job['agent']}\n{job.get('error', '')}\n{job.get('result', '')}")
+    view["activity"] = job.get("activity", "")
+    view["child_session"] = job.get("child_session", "")
+    view["steer_queue"] = len(job.get("steer_queue") or [])
+    view["phases"] = len(job.get("phases") or [])
+    queue = f" · {view['steer_queue']} steered" if view["steer_queue"] else ""
+    activity = f"\n{job.get('activity', '')}" if job["status"] in ACTIVE and job.get("activity") else ""
+    view["content"] = limited(f"{job['run_id']} [{job['status']}{queue}] {job['agent']}{activity}\n{job.get('error', '')}\n{job.get('result', '')}")
     return view
 
 
@@ -248,16 +293,16 @@ def status_job(rid=None):
     with registry():
         sweep()
         if rid is not None:
-            return job_view(read_job(rid))
+            return job_view(read_job(resolve_rid(rid)))
         jobs = all_jobs()
-    return {"content": limited("\n".join(f"{j['run_id']} [{j['status']}] {j['agent']}: {j['task'][:100]}" for j in jobs)) or "no subagent runs",
+    return {"content": limited("\n".join(f"{j['run_id'][:8]} [{j['status']}] {j['agent']}: {j['task'][:100]}" for j in jobs)) or "no subagent runs",
             "jobs": [{k: j[k] for k in ("run_id", "agent", "status", "created")} for j in jobs]}
 
 
 def stop_job(rid):
     with registry():
         sweep()
-        job = read_job(rid)
+        job = read_job(resolve_rid(rid))
         if job["status"] not in ACTIVE:
             raise ValueError(f"run {rid} already {job['status']}")
         job["status"] = "stopping"
@@ -316,7 +361,8 @@ def spawn_jobs(args, session):
         for agent, task, prompt in prepared:
             job = dict(run_id=uuid.uuid4().hex, agent=agent, task=task, prompt=prompt,
                        cwd=cwd, session_id=session.get("id", ""), binary=str(Path(binary).resolve()),
-                       timeout=ttl, created=time.time(), status="running", result="", error="", noticed=False)
+                       timeout=ttl, created=time.time(), status="running", result="", error="",
+                       noticed=False, activity="", child_session="", steer_queue=[], phases=[])
             try:
                 proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--supervise", job["run_id"]],
                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -332,7 +378,9 @@ def spawn_jobs(args, session):
                     write_job(prior)
                 raise
             started.append(job["run_id"])
-    text = "Started subagent runs: " + ", ".join(started) + ". Results arrive at your next turn; status/stop are available."
+    text = ("Started subagent runs: " + ", ".join(started) +
+            ". Results arrive at your next turn; status/stop are available, "
+            "and steer (gray subagents steer RUN_ID 'follow-up') redirects the same child session.")
     return {"content": text, "run_ids": started, **({"run_id": started[0]} if "tasks" not in args else {})}
 
 
@@ -356,45 +404,144 @@ def completion_notices(cwd):
     return "Subagent results (child output; verify before relying on it):\n" + "\n".join(lines) if lines else ""
 
 
-def supervise(rid):
-    """Survives plugin EOF/shutdown; owns exit status, timeout and bounded pipes."""
-    proc = None
-    output = bytearray()
-    status, error = "failed", "supervisor did not finish"
-    try:
-        with registry():
-            job = read_job(rid)
-            if job["status"] == "stopping":
-                status, error = "stopped", "stopped before launch"
-                return
-            env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", NO_COLOR="1", TERM="dumb", GRAY_SHOW_REASONING="0")
-            proc = subprocess.Popen([job["binary"], "-p", job["prompt"]], cwd=job["cwd"], env=env,
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    start_new_session=True)
-            job.update(child_pid=proc.pid, child_birth=identity(proc.pid))
+def steer_job(rid, message):
+    """Queue a follow-up into the child's own session. Running jobs pick the
+    message up between phases; finished jobs are revived by a new supervisor
+    that resumes the recorded child session."""
+    if os.environ.get("GRAY_SUBAGENTS_ACTIVE"):
+        raise ValueError("recursion guard: nested delegation is disabled")
+    if not isinstance(message, str) or not message.strip() or len(message) > 16000 or "\0" in message:
+        raise ValueError("message must contain 1-16000 nonempty characters and no NUL")
+    with registry():
+        sweep()
+        job = read_job(resolve_rid(rid))
+        if job["status"] == "stopping":
+            raise ValueError(f"run {rid} is stopping")
+        queue = job.setdefault("steer_queue", [])
+        if len(queue) >= 16:
+            raise ValueError("steer queue is full (16 pending)")
+        queue.append(message)
+        job["noticed"] = False
+        if job["status"] in ACTIVE:
             write_job(job)
-        deadline = time.monotonic() + job["timeout"]
+            where = "queued; lands when the current turn ends"
+        else:
+            if not job.get("child_session"):
+                raise ValueError(f"run {rid} has no resumable child session")
+            job.update(status="running", error="", finished=None,
+                       created=time.time(), activity="")
+            mod = str(Path(__file__).resolve())
+            try:
+                proc = subprocess.Popen([sys.executable, mod, "--supervise", rid],
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, start_new_session=True,
+                                        env=dict(os.environ, GRAY_HOME=str(home())))
+                SUPERVISORS.append(proc)
+                job.update(supervisor_pid=proc.pid, supervisor_birth=identity(proc.pid))
+            except OSError:
+                job["steer_queue"].pop()
+                job["status"] = "failed"
+                write_job(job)
+                raise
+            write_job(job)
+            where = "resuming the child session now"
+    return {"content": f"Steer for {job['run_id']}: {where}", "queued": len(queue)}
+
+
+def describe_row(row):
+    """One-line live activity from a `--json` progress row (widget/status)."""
+    phase, label, detail = row.get("phase"), row.get("label") or row.get("tool") or "", row.get("detail") or ""
+    if phase in ("tool_started", "tool_ran", "tool_finished"):
+        text = f"{label} {detail}".strip()
+    elif phase == "thinking":
+        text = "thinking"
+    elif phase == "provider_retry":
+        text = f"provider retry {detail}".strip()
+    elif phase == "compacted":
+        text = "compacting context"
+    elif phase == "text":
+        text = "replying"
+    elif phase == "persisting":
+        text = "finishing"
+    else:
+        text = phase or "working"
+    return text[:120]
+
+
+def run_phase(rid, prompt, resume_sid, binary, cwd, timeout):
+    """One child invocation: `gray [--session sid] -p <prompt> --json`.
+
+    Protocol rows (protocol==1) yield the child session id, live activity and
+    the final text; any other stdout is kept verbatim as the result fallback
+    so older/plain children still work. Returns (status, error, result)."""
+    env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", NO_COLOR="1",
+               TERM="dumb", GRAY_SHOW_REASONING="0")
+    argv = [binary] + (["--session", resume_sid] if resume_sid else []) + ["-p", prompt, "--json"]
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    with registry():
+        job = read_job(rid)
+        job.update(child_pid=proc.pid, child_birth=identity(proc.pid))
+        write_job(job)
+    raw, pending = bytearray(), b""
+    st = {"sid": "", "activity": "", "result": "", "error_row": "", "plain": bytearray()}
+    status, error = "failed", "supervisor did not finish"
+
+    def feed(line):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            row = None
+        if isinstance(row, dict) and row.get("protocol") == 1:
+            if row.get("session_id"):
+                st["sid"] = row["session_id"]
+            if row.get("type") == "progress":
+                st["activity"] = describe_row(row)
+            elif row.get("type") == "result":
+                st["result"] = row.get("text") or ""
+            elif row.get("type") == "error":
+                st["error_row"] = row.get("message") or str(row.get("code") or "error")
+        else:
+            st["plain"].extend(line + b"\n")
+
+    try:
+        deadline = time.monotonic() + timeout
         with selectors.DefaultSelector() as selector:
             selector.register(proc.stdout, selectors.EVENT_READ)
             while True:
                 with registry():
-                    stopping = read_job(rid)["status"] == "stopping"
+                    job = read_job(rid)
+                    stopping = job["status"] == "stopping"
+                    changed = False
+                    if st["sid"] and job.get("child_session") != st["sid"]:
+                        job["child_session"] = st["sid"]
+                        changed = True
+                    if st["activity"] and job.get("activity") != st["activity"]:
+                        job["activity"] = st["activity"]
+                        changed = True
+                    if changed:
+                        write_job(job)
                 if stopping:
                     status, error = "stopped", "stopped by request"
                     break
                 if time.monotonic() >= deadline:
-                    status, error = "timeout", f"timed out after {job['timeout']:g}s; side effects may already have occurred"
+                    status, error = "timeout", f"timed out after {timeout:g}s; side effects may already have occurred"
                     break
                 events = selector.select(.05)
                 if events:
                     chunk = os.read(proc.stdout.fileno(), 65536)
-                    room = OUTPUT_LIMIT - len(output)
-                    output.extend(chunk[:room])
+                    room = OUTPUT_LIMIT - len(raw)
+                    raw.extend(chunk[:room])
                     if len(chunk) > room:
                         status, error = "failed", "child exceeded output limit (256 KiB)"
                         break
                     if not chunk:
                         selector.unregister(proc.stdout)
+                    pending += chunk[:room]
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        feed(line)
                 code = proc.poll()
                 if code is not None:
                     # Don't let a surviving descendant keep stdout open forever.
@@ -403,25 +550,89 @@ def supervise(rid):
                     except ProcessLookupError:
                         pass
                     if not selector.get_map():
-                        status = "completed" if code == 0 and output.strip() else "failed"
-                        error = "" if status == "completed" else (f"child exited {code}" if code else "child returned empty output")
+                        if status == "failed" and error == "supervisor did not finish":
+                            status = "exited"
                         break
-    except Exception as exc:
-        error = f"supervisor failed: {type(exc).__name__}: {exc}"
+        if pending.strip():
+            feed(pending)
+        result = st["result"].strip() or re.sub(
+            r"\x1b\[[0-?]*[ -/]*[@-~]", "",
+            st["plain"].decode("utf-8", errors="replace")).strip()
+        if status == "exited":
+            if code == 0 and result:
+                status, error = "ok", ""
+            else:
+                status = "failed"
+                error = st["error_row"] or (f"child exited {code}" if code else "child returned empty output")
+        return status, error, result
     finally:
-        if proc is not None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
-            proc.stdout.close()
-        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output.decode("utf-8", errors="replace"))
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        proc.stdout.close()
+
+
+def supervise(rid):
+    """Survives plugin EOF/shutdown; owns exit status, timeout and bounded pipes.
+    Loops phases: the task turn, then each queued steer as a --session resume
+    turn in the same child session. A failed phase ends the run."""
+    final_status, final_error = "failed", "supervisor did not finish"
+    try:
+        while True:
+            with registry():
+                job = read_job(rid)
+                if job["status"] == "stopping":
+                    job["steer_queue"] = []
+                    write_job(job)
+                    return
+                phases = job.setdefault("phases", [])
+                if not phases:
+                    prompt, resume_sid, kind = job["prompt"], None, "task"
+                else:
+                    queue = job.setdefault("steer_queue", [])
+                    if not queue:
+                        final_status, final_error = "completed", ""
+                        return
+                    prompt = queue.pop(0)
+                    resume_sid = job.get("child_session")
+                    if not resume_sid:
+                        final_status, final_error = "failed", "child session unavailable for steering"
+                        return
+                    kind = "steer"
+                phases.append({"kind": kind, "prompt": prompt[:2000],
+                               "started": time.time(), "status": "running",
+                               "result": "", "error": ""})
+                job["activity"] = ""
+                write_job(job)
+            pst, perr, ptext = run_phase(rid, prompt, resume_sid, job["binary"], job["cwd"], job["timeout"])
+            with registry():
+                job = read_job(rid)
+                phase = job["phases"][-1]
+                phase.update(status=pst, error=perr, result=ptext, finished=time.time())
+                if ptext:
+                    job["result"] = ptext
+                if job["status"] == "stopping":
+                    job["steer_queue"] = []
+                    write_job(job)
+                    return
+                job["error"] = perr
+                write_job(job)
+            if pst == "stopped":
+                return
+            if pst != "ok":
+                final_status, final_error = pst, perr
+                return
+    except Exception as exc:
+        final_status, final_error = "failed", f"supervisor failed: {type(exc).__name__}: {exc}"
+    finally:
         with registry():
             job = read_job(rid)
             if job["status"] == "stopping":
-                status, error = "stopped", "stopped by request"
-            job.update(status=status, error=error, result=text.strip(), finished=time.time())
+                final_status, final_error = "stopped", "stopped by request"
+            job.update(status=final_status, error=final_error,
+                       finished=time.time(), noticed=False)
             write_job(job)
 
 
@@ -446,6 +657,8 @@ def dispatch(method, params):
             return status_job(args.get("run_id"))
         if name == "subagents_stop":
             return stop_job(args.get("run_id"))
+        if name == "subagents_steer":
+            return steer_job(args.get("run_id"), args.get("message"))
         if name == "subagents_list":
             return list_profiles()
         raise ValueError(f"unknown tool {name}")
@@ -459,7 +672,13 @@ def dispatch(method, params):
             return {"text": list_profiles()["content"]}
         if argv == ["status"]:
             return {"text": status_job()["content"]}
-        return {"text": "Usage: /subagents setup|list|status"}
+        if argv[:1] == ["status"] and len(argv) == 2:
+            return {"text": status_job(argv[1])["content"]}
+        if argv[:1] == ["stop"] and len(argv) == 2:
+            return {"text": stop_job(argv[1])["content"]}
+        if argv[:1] == ["steer"] and len(argv) >= 3:
+            return {"text": steer_job(argv[1], " ".join(argv[2:]))["content"]}
+        return {"text": "Usage: /subagents setup|list|status [RUN_ID]|stop RUN_ID|steer RUN_ID MESSAGE"}
     raise ValueError(f"unknown method {method}")
 
 
