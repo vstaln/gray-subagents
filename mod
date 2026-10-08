@@ -16,6 +16,8 @@ child as GRAY_MODEL / GRAY_THINKING_EFFORT; agent profiles may carry a `---`
 frontmatter block with `model:`/`effort:` defaults. GRAY_SUBAGENTS_ACTIVE=1 is
 the recursion
 guard: sidecars inside child runs refuse to spawn further subagents.
+GRAY_SESSION_ORIGIN=subagent marks child session files as auxiliary so they
+stay out of the parent's /resume picker while remaining steerable by id.
 """
 import contextlib
 import fcntl
@@ -631,8 +633,8 @@ def run_phase(rid, prompt, resume_sid, job):
     the final text; any other stdout is kept verbatim as the result fallback
     so older/plain children still work. Returns (status, error, result)."""
     binary, cwd, timeout = job["binary"], job["cwd"], job["timeout"]
-    env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", NO_COLOR="1",
-               TERM="dumb", GRAY_SHOW_REASONING="0")
+    env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", GRAY_SESSION_ORIGIN="subagent",
+               NO_COLOR="1", TERM="dumb", GRAY_SHOW_REASONING="0")
     # Per-delegation overrides beat inherited env (run --model / settings / parent).
     if job.get("model"):
         env["GRAY_MODEL"] = job["model"]

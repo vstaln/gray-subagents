@@ -167,6 +167,7 @@ fn widget(demo: bool) -> Result<Value> {
     } else {
         let cwd = std::env::current_dir()?;
         let dir = home()?.join("subagents/runs");
+        let mut managed_pids = std::collections::HashSet::new();
         if dir.is_dir() {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -178,9 +179,6 @@ fn widget(demo: bool) -> Result<Value> {
                     continue;
                 }
                 let job: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-                if job["cwd"].as_str().map(PathBuf::from).as_ref() != Some(&cwd) {
-                    continue;
-                }
                 jobs.push(job);
             }
             jobs.sort_by(|a, b| {
@@ -191,9 +189,27 @@ fn widget(demo: bool) -> Result<Value> {
             });
             for job in jobs {
                 let status = job["status"].as_str().unwrap_or("lost");
-                if !matches!(status, "running" | "stopping")
-                    && now - job["finished"].as_f64().unwrap_or(0.0) > 30.0
+                let active = matches!(status, "running" | "stopping");
+                if active
+                    && let Some(pid) = job["child_pid"].as_u64()
+                    && match job["child_birth"].as_str() {
+                        Some(birth) => {
+                            start_ticks(pid).map(|t| t.to_string()).as_deref() == Some(birth)
+                        }
+                        None => true,
+                    }
                 {
+                    managed_pids.insert(pid);
+                }
+                let same_cwd = job["cwd"].as_str().map(PathBuf::from).as_ref() == Some(&cwd);
+                let in_tree = active
+                    && job["child_pid"]
+                        .as_u64()
+                        .is_some_and(|pid| visible_in_session(pid));
+                if !same_cwd && !in_tree {
+                    continue;
+                }
+                if !active && now - job["finished"].as_f64().unwrap_or(0.0) > 30.0 {
                     continue;
                 }
                 let state = match status {
@@ -237,6 +253,7 @@ fn widget(demo: bool) -> Result<Value> {
                 });
             }
         }
+        rows.extend(foreign_workers(&managed_pids));
     }
     let text = render_widget(&rows);
     let shimmer: Vec<usize> = text
@@ -246,6 +263,205 @@ fn widget(demo: bool) -> Result<Value> {
         .collect();
     Ok(json!({"version":1,"text":text,"shimmer_lines":shimmer}))
 }
+
+/// /proc/<pid>/stat fields after the comm: index 1 is ppid, index 19 is the
+/// starttime clock tick (the birth check supervisors use).
+fn proc_stat(pid: u64) -> Option<Vec<String>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let tail = stat.rsplit_once(") ").map(|(_, t)| t)?;
+    let fields: Vec<String> = tail.split_whitespace().map(str::to_owned).collect();
+    (fields.first().map(String::as_str) != Some("Z")).then_some(fields)
+}
+
+fn ppid_of(pid: u64) -> Option<u64> {
+    proc_stat(pid)?.get(1)?.parse().ok()
+}
+
+fn start_ticks(pid: u64) -> Option<u64> {
+    proc_stat(pid)?.get(19)?.parse().ok()
+}
+
+fn proc_argv(pid: u64) -> Option<Vec<String>> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv: Vec<String> = cmdline
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    (!argv.is_empty()).then_some(argv)
+}
+
+fn exe_basename(argv: &[String]) -> &str {
+    argv.first()
+        .and_then(|e| std::path::Path::new(e).file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+}
+
+/// The task text of a `gray -p` invocation, or None when argv carries no
+/// prompt flag (interactive TUI, subcommands, plugin calls).
+fn gray_p_prompt(argv: &[String]) -> Option<String> {
+    if exe_basename(argv) != "gray" {
+        return None;
+    }
+    for (i, arg) in argv.iter().enumerate().skip(1) {
+        if arg == "-p" || arg == "--prompt" {
+            return Some(argv.get(i + 1).cloned().unwrap_or_default());
+        }
+        if let Some(v) = arg
+            .strip_prefix("--prompt=")
+            .or_else(|| arg.strip_prefix("-p="))
+        {
+            return Some(v.into());
+        }
+        if arg.len() > 2
+            && let Some(v) = arg.strip_prefix("-p")
+        {
+            return Some(v.into());
+        }
+    }
+    None
+}
+
+/// The session's interactive gray process: nearest ancestor that is `gray`
+/// without a prompt flag. The widget/command sidecars are spawned by it, so
+/// any process sharing it as an ancestor belongs to this session.
+fn session_root() -> Option<u64> {
+    let mut pid = std::process::id() as u64;
+    let mut hops = 0;
+    while let Some(ppid) = ppid_of(pid) {
+        if ppid <= 1 || hops > 64 {
+            return None;
+        }
+        if proc_argv(ppid)
+            .is_some_and(|argv| exe_basename(&argv) == "gray" && gray_p_prompt(&argv).is_none())
+        {
+            return Some(ppid);
+        }
+        pid = ppid;
+        hops += 1;
+    }
+    None
+}
+
+/// Worker processes belong to a session when the session's interactive gray
+/// is one of their ancestors — run-all.sh subshells and mcp sidecars both
+/// keep that lineage. No root (manual CLI invocation) means show everything.
+fn visible_in_session(pid: u64) -> bool {
+    let Some(root) = session_root() else {
+        return true;
+    };
+    let mut cur = pid;
+    let mut hops = 0;
+    while let Some(ppid) = ppid_of(cur) {
+        if ppid == root {
+            return true;
+        }
+        if ppid <= 1 || hops > 64 {
+            return false;
+        }
+        cur = ppid;
+        hops += 1;
+    }
+    false
+}
+
+/// `gray -p` workers no run record owns: mcp `gray_prompt` children and plain
+/// scripted fan-outs never register, so the widget adopts them by scanning
+/// /proc. Managed children are excluded by pid; workers from other sessions
+/// are excluded by lineage.
+fn foreign_workers(managed: &std::collections::HashSet<u64>) -> Vec<AgentRow> {
+    let mut rows = Vec::new();
+    let Some(uptime) = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+    else {
+        return rows;
+    };
+    let self_pid = std::process::id() as u64;
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return rows;
+    };
+    for entry in proc_dir.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if pid == self_pid || managed.contains(&pid) {
+            continue;
+        }
+        let Some(argv) = proc_argv(pid) else { continue };
+        let Some(prompt) = gray_p_prompt(&argv) else {
+            continue;
+        };
+        if !visible_in_session(pid) {
+            continue;
+        }
+        let desc: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let desc: String = desc.chars().take(60).collect();
+        let elapsed = start_ticks(pid)
+            .map(|t| (uptime - t as f64 / 100.0).max(0.0))
+            .unwrap_or(0.0);
+        let cwd_base = std::fs::read_link(entry.path().join("cwd"))
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "?".into());
+        rows.push(AgentRow {
+            name: "worker".into(),
+            description: if desc.is_empty() {
+                "gray -p".into()
+            } else {
+                desc
+            },
+            stats: format!("{elapsed:.0}s · {cwd_base} · pid {pid}"),
+            state: AgentState::Running {
+                activity: format!("unmanaged — `stop {pid}` kills it"),
+            },
+        });
+    }
+    rows.sort_by(|a, b| a.stats.cmp(&b.stats));
+    rows
+}
+
+/// `stop <pid>` for an adopted (unmanaged) worker: TERM, then KILL if it
+/// lingers. Only fires on pid-shaped args that resolve to a `gray -p` process
+/// in this session's tree — anything else falls through to the registry.
+fn foreign_stop(rid: &str) -> Option<Value> {
+    if !(rid.len() <= 7 && !rid.is_empty() && rid.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let pid: u64 = rid.parse().ok()?;
+    let argv = proc_argv(pid)?;
+    gray_p_prompt(&argv)?;
+    if !visible_in_session(pid) {
+        return None;
+    }
+    let kill = |sig: &str| {
+        Command::new("kill")
+            .args([sig, &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    kill("-TERM");
+    for _ in 0..20 {
+        if proc_stat(pid).is_none() {
+            return Some(json!({"content": format!("killed unmanaged worker {pid}")}));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    kill("-KILL");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    Some(json!({"content": if proc_stat(pid).is_none() {
+        format!("killed unmanaged worker {pid} (SIGKILL)")
+    } else {
+        format!("worker {pid} did not exit after SIGKILL")
+    }}))
+}
+
 const EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 fn check_effort(effort: &str) -> Result<String> {
@@ -264,8 +480,10 @@ fn check_effort(effort: &str) -> Result<String> {
 /// through and let the child validate.
 fn resolve_model(spec: &str) -> Result<String> {
     let spec = spec.trim();
-    anyhow::ensure!(!spec.is_empty() && spec.len() <= 256 && !spec.contains('\0'),
-        "model must be a 1-256 character string");
+    anyhow::ensure!(
+        !spec.is_empty() && spec.len() <= 256 && !spec.contains('\0'),
+        "model must be a 1-256 character string"
+    );
     let Ok(raw) = std::fs::read(home()?.join("models.json")) else {
         return Ok(spec.to_string());
     };
@@ -278,12 +496,18 @@ fn resolve_model(spec: &str) -> Result<String> {
             return Ok(id.clone());
         }
     }
-    let prefixed: Vec<&String> = map.keys().filter(|k| k.to_lowercase().starts_with(&low)).collect();
+    let prefixed: Vec<&String> = map
+        .keys()
+        .filter(|k| k.to_lowercase().starts_with(&low))
+        .collect();
     if prefixed.len() == 1 {
         return Ok(prefixed[0].clone());
     }
     let mut hits: Vec<String> = if prefixed.is_empty() {
-        map.keys().filter(|k| k.to_lowercase().contains(&low)).cloned().collect()
+        map.keys()
+            .filter(|k| k.to_lowercase().contains(&low))
+            .cloned()
+            .collect()
     } else {
         prefixed.into_iter().cloned().collect()
     };
@@ -337,7 +561,10 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             None,
         ),
         Action::Status { run_id } => backend("status", json!({"run_id":run_id}), None, None),
-        Action::Stop { run_id } => backend("stop", json!({"run_id":run_id}), None, None),
+        Action::Stop { run_id } => match foreign_stop(&run_id) {
+            Some(v) => Ok(v),
+            None => backend("stop", json!({"run_id":run_id}), None, None),
+        },
         Action::List => backend("list", json!({}), None, None),
         Action::Widget { demo } => widget(demo),
         Action::Manifest => Ok(manifest()),

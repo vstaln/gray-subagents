@@ -44,7 +44,7 @@ fn manifest_exposes_no_model_tools() {
         manifest["commands"]
             .as_array()
             .unwrap()
-            .contains(&serde_json::json!("/subagent"))
+            .contains(&serde_json::json!("/subagents"))
     );
 }
 

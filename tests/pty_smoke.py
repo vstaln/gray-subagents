@@ -31,10 +31,10 @@ with tempfile.TemporaryDirectory(prefix='gray-widget-pty-') as tmp:
   assert 'draft stays here' in text
   assert text.index('⬢ Agents')<text.index('draft stays here')
   print('PASS real PTY: plugin widget is above the editable draft')
-  os.write(master,b'\x15/subagent settings\r');drain(2)
+  os.write(master,b'\x15/subagents settings\r');drain(2)
   text='\n'.join(screen.display)
   assert 'max_running' in text,'slash settings did not render'
-  print('PASS /subagent settings renders without a model call')
+  print('PASS /subagents settings renders without a model call')
  finally:
   p.terminate()
   try:p.wait(timeout=5)
