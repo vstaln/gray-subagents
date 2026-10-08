@@ -1,15 +1,24 @@
-# gray-subagents
+<p align="center">
+  <img src="assets/gray-logo.svg" alt="gray" width="96">
+</p>
+<h1 align="center">gray-subagents</h1>
+<p align="center">Detached background agent runs with a live tree widget — steerable and resumable.</p>
+<p align="center">
+  <a href="https://github.com/vstaln/gray-subagents/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
+  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+</p>
 
-Subagents for Gray: background agent runs driven by plain Bash commands, with
+Subagents for gray: background agent runs driven by plain Bash commands, with
 an above-editor tree widget. The CLI and widget are Rust; the tested Linux
-process supervisor is currently Python 3, embedded in the binary — **not yet
-an all-Rust runtime**. Runs are detached OS processes (`gray -p --json`
-children with their own supervisor): they keep going if the parent session or
-terminal exits, and any later session can inspect, steer, or stop them.
+process supervisor is currently Python 3, embedded in the binary. Runs are
+detached OS processes (`gray -p --json` children with their own supervisor):
+they keep going if the parent session or terminal exits, and any later session
+can inspect, steer, or stop them.
 
 ## What works
 
-- Compact tree ported from your installed **@gotgenes/pi-subagents 19.3.5**.
+- Compact tree rendered in the above-editor widget slot.
 - `⬢ Agents` heading; `⬡` running markers with Gray's existing shimmer animation.
 - Finished entries, two-line running entries, tree connectors, queued summary,
   12-line overflow limit. No bordered cards or spinning glyphs.
@@ -126,7 +135,7 @@ arguments join, so quoting is optional. Output is plain text, not JSON.
 The widget shows real activity from the child's `--json` progress rows
 (`bash sleep 45`, `finishing`, …), not invented motion. It polls atomic run
 records, scopes them to the current cwd, and retains completed runs for 30
-seconds. That's a temporary time-based policy, not Pi's turn-count linger.
+seconds. That's a temporary time-based retention policy.
 Metrics absent from the backend (token counts, turn counters) are omitted
 rather than estimated.
 
@@ -185,11 +194,8 @@ was not changed for this feature. Do not claim a clean workspace-wide result.
 
 ## Attribution
 
-Widget tree layout/grouping adapted under MIT from @gotgenes/pi-subagents
-19.3.5 — credit where due; the implementation here is independent (detached
-Rust CLI + embedded Python supervisor, not in-process extension agents). See
-THIRD_PARTY_NOTICES.md and LICENSE. The Gray host reuses its own shimmer
-helper rather than maintaining another animation implementation.
+The widget tree layout and grouping logic are adapted under MIT from
+@gotgenes/pi-subagents — see THIRD_PARTY_NOTICES.md and LICENSE.
 
 ## Agent profiles with model defaults
 
@@ -212,3 +218,7 @@ The block is stripped before the profile text reaches the child prompt. An
 explicit `--model`/`--effort` flag (or a per-task field) always beats the
 profile default. `gray subagents status` shows the resolved model per run and
 the widget stats line carries the model basename.
+
+---
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
+the open-source AI agent harness. <https://gray.alignment.id>
