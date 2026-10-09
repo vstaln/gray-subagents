@@ -517,6 +517,12 @@ fn resolve_model(spec: &str) -> Result<String> {
     hits.sort();
     hits.truncate(4);
     if hits.is_empty() {
+        // Provider-qualified specs (plugin providers e.g.
+        // `devin-subscription/swe-2`) are absent from the API-model
+        // catalog: pass through and let the child validate the provider.
+        if spec.contains('/') {
+            return Ok(spec.to_string());
+        }
         anyhow::bail!("unknown model '{spec}' — no match in the model catalog");
     }
     anyhow::bail!("unknown model '{spec}' — did you mean: {}", hits.join(", "));

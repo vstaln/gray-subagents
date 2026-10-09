@@ -242,14 +242,56 @@ def identity(pid):
         return None
 
 
+def descendants(root_pid):
+    """Live descendants of root_pid via /proc ppid links (Linux)."""
+    children = {}
+    try:
+        for ent in Path("/proc").iterdir():
+            if not ent.name.isdigit():
+                continue
+            try:
+                stat = (ent / "stat").read_text()
+            except OSError:
+                continue
+            try:
+                ppid = int(stat.rsplit(")", 1)[1].split()[1])
+            except (IndexError, ValueError):
+                continue
+            children.setdefault(ppid, []).append(int(ent.name))
+    except OSError:
+        return []
+    out, stack = [], list(children.get(root_pid, ()))
+    while stack:
+        pid = stack.pop()
+        out.append(pid)
+        stack.extend(children.get(pid, ()))
+    return out
+
+
+def kill_tree(pid):
+    """SIGKILL a child's process group, then every descendant's group.
+
+    Grandchildren that setsid into their own group (job-control shells)
+    escape a plain killpg and would otherwise outlive the stopped child —
+    the e2e showed a cancelled `sleep && write file` still landing the
+    file ~80s after stop reported success. Descendants are scanned BEFORE
+    killing the child so ppid links are still intact."""
+    kids = descendants(pid)
+    for target in [pid, *kids]:
+        try:
+            os.killpg(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(target, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
 def kill_orphan(job):
     pid = job.get("child_pid")
     birth = job.get("child_birth")
     if pid and birth and identity(pid) == birth:
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_tree(pid)
 
 
 def spawn_supervisor(rid):
@@ -360,6 +402,11 @@ def resolve_model(value):
     hits = prefixed or [m for m in catalog if lowered in m.lower()]
     if len(hits) == 1:
         return hits[0]
+    if not hits and '/' in spec:
+        # Provider-qualified spec (plugin providers e.g.
+        # devin-subscription/swe-2) absent from the API-model catalog:
+        # pass through; the child validates the provider.
+        return spec
     hint = f" — did you mean: {', '.join(hits[:MODEL_CATALOG_LIMIT])}" if hits else " (no catalog match)"
     raise ValueError(f"unknown model '{spec}'{hint}")
 
@@ -709,10 +756,7 @@ def run_phase(rid, prompt, resume_sid, job):
                 code = proc.poll()
                 if code is not None:
                     # Don't let a surviving descendant keep stdout open forever.
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    kill_tree(proc.pid)
                     if not selector.get_map():
                         if status == "failed" and error == "supervisor did not finish":
                             status = "exited"
@@ -730,10 +774,7 @@ def run_phase(rid, prompt, resume_sid, job):
                 error = st["error_row"] or (f"child exited {code}" if code else "child returned empty output")
         return status, error, result
     finally:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_tree(proc.pid)
         proc.wait()
         proc.stdout.close()
 
