@@ -2,6 +2,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gray_subagents::widget::{AgentRow, AgentState, render_menu, render_widget, state_icon};
 use serde_json::{Value, json};
+
+#[path = "mods/narrow_lib.rs"]
+pub mod narrow_lib;
+#[path = "mods/narrow.rs"]
+mod narrow;
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
@@ -172,6 +177,13 @@ fn backend(action: &str, args: Value, model: Option<&str>, effort: Option<&str>)
     file.write_all(include_bytes!("../mod"))?;
     file.persist(&runtime)?;
     let mut cmd = Command::new("python3");
+    // gray-narrow is folded into this binary: default GRAY_NARROW_BIN to
+    // ourselves so `run --tools` works without a separate install.
+    if std::env::var_os("GRAY_NARROW_BIN").is_none() {
+        if let Ok(me) = std::env::current_exe() {
+            cmd.env("GRAY_NARROW_BIN", me);
+        }
+    }
     cmd.args(["-c", &script, include_str!("../mod"), &args.to_string()])
         .arg(runtime)
         .arg(action);
@@ -198,7 +210,14 @@ fn backend(action: &str, args: Value, model: Option<&str>, effort: Option<&str>)
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 fn manifest() -> Value {
-    json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":false,"tools":[],"completion":["settings","setup","run","status","view","stop","steer","list","open","chat"],"commands":["/subagents"],"hooks":["prompt/context"],"subcommands":["subagents"]})
+    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override"],"completion":["settings","setup","run","status","view","stop","steer","list","open","chat","narrow"],"commands":["/subagents","/narrow"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow"]});
+    // gray-narrow is folded in: its tool surface (narrow_delegate) and
+    // CLI verbs ride this manifest too.
+    let n = narrow::manifest_narrow();
+    if let Some(t) = n.get("tools").and_then(Value::as_array) {
+        m["tools"] = json!(t);
+    }
+    m
 }
 fn widget(demo: bool) -> Result<Value> {
     let mut rows = Vec::new();
@@ -1257,6 +1276,19 @@ fn sidecar() -> Result<()> {
         if req.get("id").is_none() {
             continue;
         }
+        // Folded-in gray-narrow surface: its hooks/tools/commands go straight
+        // to the narrow module's own dispatcher (it emits a full reply).
+        if matches!(req["method"].as_str(), Some("tool/before") | Some("tool/call"))
+            || (req["method"].as_str() == Some("command/run")
+                && matches!(req["params"]["name"].as_str(), Some("/narrow") | Some("narrow")))
+        {
+            let (reply, _) = narrow::handle_narrow(&req);
+            if let Some(reply) = reply {
+                println!("{reply}");
+                io::stdout().flush()?;
+            }
+            continue;
+        }
         let result = match req["method"].as_str() {
             Some("plugin/manifest") => Ok(manifest()),
             Some("prompt/context") => {
@@ -1270,7 +1302,14 @@ fn sidecar() -> Result<()> {
                             .ok()
                             .and_then(|v| v["text"].as_str().map(str::to_owned))
                             .unwrap_or_default();
-                    Ok(json!({"text":format!("{USAGE}\n{notices}")}))
+                    let mut text = format!("{USAGE}\n{notices}");
+                    let nreq = json!({"id":0,"method":"prompt/context","params":req["params"]});
+                    if let (Some(r), _) = narrow::handle_narrow(&nreq) {
+                        if let Some(t) = r.pointer("/result/text").and_then(Value::as_str) {
+                            if !t.is_empty() { text.push_str("\n"); text.push_str(t); }
+                        }
+                    }
+                    Ok(json!({"text":text}))
                 }
             }
             Some("command/run") => {
@@ -1325,6 +1364,21 @@ fn preprocess(mut argv: Vec<String>) -> Vec<String> {
 
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
+    // Folded-in gray-narrow argv surface:
+    //   `bin narrow …`  — direct narrow CLI (`gray narrow run`, lock cli_argv)
+    //   `bin plan …`    — the supervisor's GRAY_NARROW_BIN self-call
+    //   `bin sidecar`   — narrow-style spawn argv (sidecar_args)
+    if argv.len() > 1 && argv[1] == "sidecar" {
+        return sidecar();
+    }
+    if argv.len() > 1 && (argv[1] == "narrow" || argv[1] == "plan") {
+        let args = if argv[1] == "narrow" { argv[2..].to_vec() } else { argv[1..].to_vec() };
+        return match narrow::narrow_cli(args) {
+            Ok(s) => { println!("{s}"); Ok(()) }
+            Err(e) if e == "__sidecar" => sidecar(),
+            Err(e) => { eprintln!("{e}"); std::process::exit(2); }
+        };
+    }
     let cli = match Cli::try_parse_from(preprocess(argv)) {
         Ok(cli) => cli,
         // `gray subagents view` from the composer runs this argv path: a

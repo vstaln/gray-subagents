@@ -16,6 +16,13 @@ binary. Runs are detached OS processes (`gray -p --json` children with their
 own supervisor): they keep going if the parent session or terminal exits, and
 any later session can inspect, steer, or stop them.
 
+> **v0.5.0 — `gray-narrow` is folded in.** Capability narrowing ships inside
+> this plugin: `narrow_delegate` tool, `tool/before` grant enforcement,
+> `/narrow` command, and `gray subagents narrow …` (or `gray narrow …` when
+> the old lock entry remains) all work with no separate install. If you have
+> standalone `gray-narrow` installed, uninstall it — running both registers
+> `narrow_delegate` twice.
+
 ## What works
 
 - Compact `Agents` picker inside Gray's native modal UI.
