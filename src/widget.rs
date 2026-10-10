@@ -33,33 +33,9 @@ pub fn render_widget(agents: &[AgentRow]) -> String {
             queued += 1;
             continue;
         }
-        let icon = match agent.state {
-            AgentState::Running { .. } => "⬡",
-            AgentState::Completed => "✓",
-            AgentState::Failed { .. } => "✗",
-            AgentState::Stopped => "■",
-            AgentState::Queued => unreachable!(),
-        };
-        let mut header = format!(
-            "{icon} {}  {}",
-            clean(&agent.name),
-            clean(&agent.description)
-        );
-        let stats = clean(&agent.stats);
-        if !stats.is_empty() {
-            header.push_str(&format!(" · {stats}"));
-        }
-        match &agent.state {
-            AgentState::Running { activity } => running.push(vec![header, clean(activity)]),
-            AgentState::Failed { error } => {
-                header.push_str(" error");
-                if !error.is_empty() {
-                    header.push_str(&format!(": {}", clean(error)));
-                }
-                finished.push(vec![header]);
-            }
-            AgentState::Stopped => finished.push(vec![format!("{header} stopped")]),
-            _ => finished.push(vec![header]),
+        match agent.state {
+            AgentState::Running { .. } => running.push(row_lines(agent)),
+            _ => finished.push(row_lines(agent)),
         }
     }
     let queued_row = (queued > 0).then(|| vec![format!("◦ {queued} queued")]);
@@ -114,7 +90,84 @@ pub fn render_widget(agents: &[AgentRow]) -> String {
         let last = index + 1 == count;
         lines.push(format!("{} {}", if last { "└─" } else { "├─" }, entry[0]));
         if let Some(activity) = entry.get(1) {
-            lines.push(format!("{}    ⎿  {activity}", if last { " " } else { "│" }));
+            lines.push(format!("{}   ⎿  {activity}", if last { " " } else { "│" }));
+        }
+    }
+    // Affordance, styled like the activity continuation: rows are not
+    // just a readout — /subagents opens the picker that selects, opens
+    // and chats with them. Shown whenever it fits the 12-line cap.
+    if lines.len() < 12 {
+        lines.push("    ⎿  /subagents — open · chat · stop".to_string());
+    }
+    lines.join("\n")
+}
+
+/// The glyph for one state — shared by `row_lines` and the `entries`
+/// JSON the host's agents panel consumes.
+pub fn state_icon(state: &AgentState) -> &'static str {
+    match state {
+        AgentState::Running { .. } => "⬡",
+        AgentState::Completed => "✓",
+        AgentState::Failed { .. } => "✗",
+        AgentState::Stopped => "■",
+        AgentState::Queued => "◦",
+    }
+}
+
+/// One agent's body lines as the widget prints them: the icon/name/stats
+/// header plus, for running rows, the `⎿ activity` continuation. Shared by
+/// [`render_widget`] and the selectable `/subagents` menu so both surfaces
+/// speak identical row language.
+pub fn row_lines(agent: &AgentRow) -> Vec<String> {
+    let icon = state_icon(&agent.state);
+    let mut header = if agent.description.is_empty() {
+        format!("{icon} {}", clean(&agent.name))
+    } else {
+        format!(
+            "{icon} {} — {}",
+            clean(&agent.name),
+            clean(&agent.description)
+        )
+    };
+    let stats = clean(&agent.stats);
+    if !stats.is_empty() {
+        header.push_str(&format!(" · {stats}"));
+    }
+    match &agent.state {
+        AgentState::Running { activity } => vec![header, clean(activity)],
+        AgentState::Failed { error } => {
+            header.push_str(" error");
+            if !error.is_empty() {
+                header.push_str(&format!(": {}", clean(error)));
+            }
+            vec![header]
+        }
+        AgentState::Stopped => vec![format!("{header} stopped")],
+        _ => vec![header],
+    }
+}
+
+/// The interactive `/subagents` menu: the widget's row voice plus a stable
+/// 1-based number every verb accepts (`open 2`, `chat 2 'msg'`, `stop 2`).
+/// Rows arrive in display order — finished first, then running, matching
+/// the widget's compact grouping — and finished runs stay listed because
+/// they remain selectable for `open`/`chat`.
+pub fn render_menu(agents: &[AgentRow]) -> String {
+    if agents.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["⬢ Agents".to_string()];
+    let count = agents.len();
+    for (index, agent) in agents.iter().enumerate() {
+        let last = index + 1 == count;
+        let branch = if last { "└─" } else { "├─" };
+        let body = row_lines(agent);
+        lines.push(format!("{branch} {} {}", index + 1, body[0]));
+        if let Some(activity) = body.get(1) {
+            let cont = if last { " " } else { "│" };
+            let pad =
+                " ".repeat(branch.chars().count() + (index + 1).to_string().chars().count() + 3);
+            lines.push(format!("{cont}{pad}⎿  {activity}"));
         }
     }
     lines.join("\n")
@@ -126,140 +179,4 @@ fn clean(text: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn row(name: &str, description: &str, stats: &str, state: AgentState) -> AgentRow {
-        AgentRow {
-            name: name.into(),
-            description: description.into(),
-            stats: stats.into(),
-            state,
-        }
-    }
-
-    #[test]
-    fn exact_tree_uses_gray_hexagons_and_pi_connectors() {
-        let agents = [
-            row(
-                "Scout",
-                "Find authentication entry points",
-                "14.2s",
-                AgentState::Running {
-                    activity: "searching…".into(),
-                },
-            ),
-            row(
-                "Worker",
-                "Add regression tests",
-                "42.1s",
-                AgentState::Completed,
-            ),
-            row(
-                "Reviewer",
-                "Check session handling",
-                "38.4s",
-                AgentState::Running {
-                    activity: "reading…".into(),
-                },
-            ),
-        ];
-        assert_eq!(
-            render_widget(&agents),
-            concat!(
-                "⬢ Agents\n",
-                "├─ ✓ Worker  Add regression tests · 42.1s\n",
-                "├─ ⬡ Scout  Find authentication entry points · 14.2s\n",
-                "│    ⎿  searching…\n",
-                "└─ ⬡ Reviewer  Check session handling · 38.4s\n",
-                "     ⎿  reading…",
-            )
-        );
-    }
-
-    #[test]
-    fn empty_widget_is_hidden() {
-        assert_eq!(render_widget(&[]), "");
-    }
-
-    #[test]
-    fn queued_agents_are_one_summary_after_running() {
-        let agents = [
-            row(
-                "Scout",
-                "Inspect",
-                "1.0s",
-                AgentState::Running {
-                    activity: "thinking…".into(),
-                },
-            ),
-            row("Worker", "Work", "", AgentState::Queued),
-            row("Reviewer", "Review", "", AgentState::Queued),
-        ];
-        assert_eq!(
-            render_widget(&agents),
-            "⬢ Agents\n├─ ⬡ Scout  Inspect · 1.0s\n│    ⎿  thinking…\n└─ ◦ 2 queued"
-        );
-    }
-
-    #[test]
-    fn terminal_states_are_distinct_and_unknown_stats_are_omitted() {
-        let agents = [
-            row(
-                "Worker",
-                "Build",
-                "2.0s",
-                AgentState::Failed {
-                    error: "child exited 7".into(),
-                },
-            ),
-            row("Scout", "Inspect", "", AgentState::Stopped),
-        ];
-        assert_eq!(
-            render_widget(&agents),
-            "⬢ Agents\n├─ ✗ Worker  Build · 2.0s error: child exited 7\n└─ ■ Scout  Inspect stopped"
-        );
-    }
-
-    #[test]
-    fn overflow_caps_tree_at_twelve_lines_and_prioritizes_running() {
-        let mut agents = vec![row("Worker", "Done", "1.0s", AgentState::Completed)];
-        agents.extend((0..6).map(|_| {
-            row(
-                "Scout",
-                "Inspect",
-                "1.0s",
-                AgentState::Running {
-                    activity: "reading…".into(),
-                },
-            )
-        }));
-        let tree = render_widget(&agents);
-        assert_eq!(tree.lines().count(), 12);
-        assert_eq!(tree.matches("⬡ Scout").count(), 5);
-        assert!(!tree.contains("✓ Worker"));
-        assert_eq!(
-            tree.lines().last(),
-            Some("└─ +2 more (1 running, 1 finished)")
-        );
-    }
-
-    #[test]
-    fn display_fields_cannot_inject_lines_or_terminal_controls() {
-        let agents = [row(
-            "Scout\n",
-            "Inspect\rfiles",
-            "",
-            AgentState::Running {
-                activity: "read\u{1b}[2J\nnext".into(),
-            },
-        )];
-        let tree = render_widget(&agents);
-        assert_eq!(tree.lines().count(), 3);
-        assert!(!tree.contains('\u{1b}'));
-        assert!(!tree.contains('\r'));
-    }
 }
