@@ -2,7 +2,7 @@
   <img src="assets/gray-logo.svg" alt="gray" width="96">
 </p>
 <h1 align="center">gray-subagents</h1>
-<p align="center">Detached background agent runs with a live tree widget — steerable and resumable.</p>
+<p align="center">Detached background agent runs with an interactive Agents view — steerable and resumable.</p>
 <p align="center">
   <a href="https://github.com/vstaln/gray-subagents/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
@@ -10,18 +10,18 @@
 </p>
 
 Subagents for gray: background agent runs driven by plain Bash commands, with
-an above-editor tree widget. The CLI and widget are Rust; the tested Linux
-process supervisor is currently Python 3, embedded in the binary. Runs are
-detached OS processes (`gray -p --json` children with their own supervisor):
-they keep going if the parent session or terminal exits, and any later session
-can inspect, steer, or stop them.
+an interactive `/subagents` Agents view. The CLI and row renderer are Rust;
+the tested Linux process supervisor is currently Python 3, embedded in the
+binary. Runs are detached OS processes (`gray -p --json` children with their
+own supervisor): they keep going if the parent session or terminal exits, and
+any later session can inspect, steer, or stop them.
 
 ## What works
 
-- Compact tree rendered in the above-editor widget slot.
-- `⬢ Agents` heading; `⬡` running markers with Gray's existing shimmer animation.
-- Finished entries, two-line running entries, tree connectors, queued summary,
-  12-line overflow limit. No bordered cards or spinning glyphs.
+- Compact `Agents` picker inside Gray's native modal UI.
+- Running markers, finished entries, two-line activity rows, tree connectors,
+  and bounded overflow. No persistent above-editor block.
+- Read-only status and transcript views can run while Gray is mid-turn.
 - Bash-only model interface: the installed plugin advertises **zero tools**.
 - CLI launch/status/stop/steer/list/settings.
 - Per-delegation model & effort: `run --model PROVIDER/MODEL --effort LEVEL`,
@@ -34,15 +34,25 @@ can inspect, steer, or stop them.
 - Named runs: `--name` or an auto `adjective-noun` handle; `status`/`stop`/`steer`
   accept a name, a unique hex prefix, or `last`.
 - Steering: queued follow-ups resume the same child session between phases.
+- `run --isolation worktree` gives the child its own git worktree — required
+  when parallel runs edit the same repo. Clean worktrees are removed with
+  their branch; dirty ones stay and report a "worktree kept" note.
+- A timed-out run reports marked partial output and stays steerable —
+  `steer NAME 'continue'` resumes where it stopped. `isolation:` frontmatter
+  works too.
+- `view [NAME]` prints a run's transcript tail; bare `view` shows the latest run.
+- Reports arrive framed as untrusted output: indented lines, an explicit
+  not-the-user authority notice, and an instruction-shaped-content flag.
+- Run stats (elapsed, tool calls) ride the status line of every report.
 - Background child supervision, timeout, cancellation, and bounded output.
-- Live activity from the child's `--json` progress rows in status and widget.
+- Live activity from the child's `--json` progress rows in status and the picker.
 - `/subagent settings` and `/subagents settings` command handling and completion
   with the host bridge. Settings currently prints JSON and accepts flags;
   it is not an interactive picker.
 
 ## Build and install locally
 
-The host pieces this needs (plugin `subcommands`, the generic widget slot,
+The host pieces this needs (plugin `subcommands`, the native Agents picker,
 `prompt/context`) are merged in current gray — three commands set it up:
 
 ```sh
@@ -57,9 +67,10 @@ Registration references the built binary: keep it at a stable path. This is
 published. To update after a rebuild, `cargo build --release` again — the
 registered path picks the new binary up directly.
 
-The host registers its command, zero-tool sidecar, and one generic above-editor
-widget slot under `$GRAY_HOME/plugins`. The plugin stays out of Gray's dependency
-graph and owns the tree layout. Currently only one widget slot is supported.
+The host registers its command and zero-tool sidecar under
+`$GRAY_HOME/plugins`. The plugin stays out of Gray's dependency graph and owns
+the row layout used by the picker and status views. It does not register a
+persistent widget.
 
 ## Commands (callable by the parent through Bash)
 
@@ -73,8 +84,13 @@ gray subagents run --agent scout "Find authentication entry points"
 gray subagents run --name fix-auth --agent reviewer "Review the diff"
 gray subagents run --agent scout --model xai/grok-code-fast --effort low "Survey the API"
 gray subagents run unquoted words also work   # task = joined args
-gray subagents status
-gray subagents status watcher        # or an id prefix, or `last`
+gray subagents                       # the selectable Agents menu (numbered rows)
+gray subagents status                # same menu; `status --all` for every session's runs
+gray subagents status watcher        # or an id prefix, `last`, or a menu number
+gray subagents 2                     # select row 2 → its open card
+gray subagents open watcher          # finished runs: prints `/resume <child-session>`
+gray subagents chat watcher "follow-up instructions"   # alias for steer
+gray subagents view watcher --lines 40   # transcript tail: task, tool calls, replies
 gray subagents steer watcher "follow-up instructions"
 gray subagents steer last "redirect the newest run"
 gray subagents stop watcher
@@ -84,10 +100,48 @@ Every run gets a handle: `--name` when given, else an auto `adjective-noun`
 name (deterministic from the run id, deduplicated). `status`, `stop` and
 `steer` accept the name, a unique hex prefix (≥4 chars), or `last`; a reused
 name resolves to the newest run with it. Names `last` and anything looking
-like a full run id are reserved. Multiple launches can run concurrently
+like a full run id are reserved. The menu numbers its rows — finished first,
+then running, matching the picker — and every verb accepts a row number too.
+
+## Opening a run
+
+Every run owns a real Gray session — the same model as opencode's child
+sessions and Claude Code's job sessions, not a transcript you can only
+watch. `open NAME` (or `/subagents NAME`, or its menu number) prints the
+run's open card: finished runs hand over `/resume <session>` — typing it
+swaps you into the child session and your next prompt continues that
+agent's work, with its own history and model. Running runs keep their
+session lock-held, so the card points at `chat`/`view`/`stop` instead
+(`/resume` refuses a live session). Multiple launches can run concurrently
 under the shared-home cap. Model order: per-launch `--model`, saved plugin
 model, then the child Gray's inherited environment/saved config. Model
 configuration errors are not silently retried using a different model.
+
+## Agents picker
+
+`/subagents` in the TUI opens the host's native picker (the plugin emits an
+`agent_picker` outcome; bare `gray subagents` still prints the numbered menu).
+Rows use the compact row language — state icon, `name — task · duration`,
+the running activity `⎿` line — and each row carries a live transcript
+preview on the right. Keys: `↑↓`/`jk` move, `⏎` opens a finished run's
+session in place (running rows explain why not), `c` seeds
+`/subagents chat "name" ` in the composer — finished runs resume their child
+session with your message, running runs queue it as a follow-up — `v` prints
+the transcript tail, `x` stops the run, `a` toggles all-sessions vs this cwd,
+`r` refreshes, `Esc`/`q` closes.
+
+## Adopted workers
+
+`gray -p` processes spawned outside the run registry — mcp `gray_prompt`
+children, scripted fan-outs — are adopted into the same Agents view by scanning
+/proc (managed children excluded by pid, other sessions by lineage). A
+worker's display name is `GRAY_AGENT_NAME` from its environment when the
+spawner sets it (the `gray_prompt` mcp tool accepts `name`, plus `model`
+and `effort` which land as `GRAY_MODEL`/`GRAY_THINKING_EFFORT`), else its
+session slug (`<id>.open` is flock-held for the session's life), else
+`worker-<pid>`. The activity line comes from the worker's own session
+transcript — the last tool call or reply — and `view`/`stop` resolve a
+worker's name, session slug, or pid all the same.
 
 ## Steering
 
@@ -105,7 +159,7 @@ configuration errors are not silently retried using a different model.
 
 Every phase is a `gray -p --json` child; the supervisor parses its NDJSON
 rows for the session id, live `activity` (last tool/detail — shown by
-`status` and the widget), and the final `result` text. Children with no
+`status` and the picker), and the final `result` text. Children with no
 `--json` support still work: unparsed stdout becomes the result.
 
 `setup` creates editable plain Markdown profiles in
@@ -115,11 +169,12 @@ the same commands and edit profile files through Bash.
 
 Inside Gray there is one slash command: `/subagents` (bare = status).
 `/subagents run --name x --agent scout words…`, `/subagents steer <name>
-words…`, `/subagents status`, `/subagents stop <name>`, `/subagents list`,
+words…`, `/subagents status`, `/subagents view <name> [--lines N]`,
+`/subagents stop <name>`, `/subagents list`,
 `/subagents settings [--max-running N] [--model provider/model]`. Multi-word
 arguments join, so quoting is optional. Output is plain text, not JSON.
 
-## Appearance
+## Row language
 
 ```text
 ⬢ Agents
@@ -128,14 +183,11 @@ arguments join, so quoting is optional. Output is plain text, not JSON.
 │    ⎿  working…
 └─ ⬡ Reviewer  Check session handling · 38.4s
      ⎿  working…
-
- ❯ Your draft remains here
 ```
 
-The widget shows real activity from the child's `--json` progress rows
+The Agents picker shows real activity from the child's `--json` progress rows
 (`bash sleep 45`, `finishing`, …), not invented motion. It polls atomic run
-records, scopes them to the current cwd, and retains completed runs for 30
-seconds. That's a temporary time-based retention policy.
+records and scopes them to the current cwd.
 Metrics absent from the backend (token counts, turn counters) are omitted
 rather than estimated.
 
@@ -145,8 +197,9 @@ For a deterministic snapshot using the actual Rust renderer:
 ~/grayplugins/gray-subagents/target/debug/gray-subagents widget --demo
 ```
 
-Demo values are fixtures, never presented as actual jobs. The host renderer uses
-Gray's theme and existing `shimmer_spans`, refreshed by its normal TUI tick.
+Demo values are fixtures, never presented as actual jobs; the standalone
+`widget --demo` command exercises the shared row renderer without registering
+a host widget.
 
 ## Limits and unfinished work
 
@@ -194,7 +247,7 @@ was not changed for this feature. Do not claim a clean workspace-wide result.
 
 ## Attribution
 
-The widget tree layout and grouping logic are adapted under MIT from
+The tree layout and grouping logic are adapted under MIT from
 @gotgenes/pi-subagents — see THIRD_PARTY_NOTICES.md and LICENSE.
 
 ## Agent profiles with model defaults
@@ -207,6 +260,8 @@ profile — handy for routing cheap scouts and expensive workers:
 ---
 model: deepseek/deepseek-v4
 effort: low
+tools: read,grep,bash:*
+isolation: worktree
 ---
 
 # Cheap Scout
@@ -215,9 +270,9 @@ Inspect the codebase without editing files...
 ```
 
 The block is stripped before the profile text reaches the child prompt. An
-explicit `--model`/`--effort` flag (or a per-task field) always beats the
-profile default. `gray subagents status` shows the resolved model per run and
-the widget stats line carries the model basename.
+explicit `--model`/`--effort`/`--isolation` flag (or a
+per-task field) always beats the profile default. `gray subagents status` shows the resolved model per run and
+the row stats carry the model basename.
 
 ---
 Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —

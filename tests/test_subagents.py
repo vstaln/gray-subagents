@@ -222,7 +222,8 @@ class SidecarCase(unittest.TestCase):
 
     def test_prompt_context_quiet_when_no_jobs(self):
         r = self.sc.rpc("prompt/context", {"cwd": os.getcwd()}, rid=5)["result"]
-        self.assertEqual(r["text"], "")
+        self.assertNotIn("Subagent results", r["text"])
+        self.assertIn("Profiles:", r["text"])
 
     # -- crash recovery -------------------------------------------------------
     def test_orphaned_run_is_marked_lost_on_next_status(self):
