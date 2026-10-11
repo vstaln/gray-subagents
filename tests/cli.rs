@@ -30,7 +30,10 @@ fn cli_settings_preserve_fields_and_widget_is_empty_without_jobs() {
 }
 
 #[test]
-fn manifest_exposes_no_model_tools() {
+fn manifest_exposes_folded_tool_surface() {
+    // gray-narrow and gray-rlm are folded in: the manifest carries their
+    // model-facing tools (narrow_delegate + the rlm_* supervisor surface)
+    // plus the Agents-view widget override and both plugin commands.
     let home = tempfile::tempdir().unwrap();
     let out = bin()
         .arg("manifest")
@@ -39,14 +42,30 @@ fn manifest_exposes_no_model_tools() {
         .unwrap();
     assert!(out.status.success());
     let manifest: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(manifest["tools"], serde_json::json!([]));
-    assert_eq!(manifest["widget"], serde_json::json!(false));
-    assert!(
-        manifest["commands"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("/subagents"))
-    );
+    let tools: Vec<&str> = manifest["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for name in [
+        "narrow_delegate",
+        "rlm_spawn",
+        "rlm_collect",
+        "rlm_send",
+        "rlm_delete",
+        "rlm_progress_note",
+    ] {
+        assert!(tools.contains(&name), "missing tool {name}");
+    }
+    assert_eq!(manifest["widget"], serde_json::json!(true));
+    let commands = manifest["commands"].as_array().unwrap();
+    for cmd in ["/subagents", "/narrow", "/rlm"] {
+        assert!(commands.contains(&serde_json::json!(cmd)), "missing {cmd}");
+    }
+    let caps = manifest["capabilities"].as_array().unwrap();
+    assert!(caps.contains(&serde_json::json!("widget.override")));
+    assert!(caps.contains(&serde_json::json!("host.say")));
 }
 
 #[test]
@@ -55,9 +74,10 @@ fn widget_demo_uses_real_rust_renderer() {
     assert!(out.status.success());
     let panel: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let text = panel["text"].as_str().unwrap();
-    assert!(text.starts_with("⬢ Agents\n"));
-    assert!(text.contains("⬡ auth-scout"));
-    assert!(text.contains("⎿"));
+    assert!(!text.contains("Agents\n"));
+    assert!(text.contains("\n   /subagents — open · chat · stop\n"));
+    assert!(text.contains("● auth-scout"));
+    assert!(text.contains("searching"), "{text}");
 }
 
 #[test]
@@ -258,11 +278,8 @@ fn menu_numbers_rows_and_open_selects_them() {
     };
 
     let menu = content(run(&["menu"]));
-    assert!(menu.starts_with("\u{2b22} Agents"), "{menu}");
-    assert!(
-        menu.contains("\u{251c}\u{2500} 1 \u{2717} bad-que"),
-        "{menu}"
-    );
+    assert!(menu.starts_with("1 \u{2717} bad-que"), "{menu}");
+    assert!(!menu.contains("\u{2b22} Agents"), "{menu}");
     assert!(menu.contains("2 \u{2713} done-scout"), "{menu}");
     assert!(menu.contains("N|NAME selects"), "{menu}");
 
@@ -295,7 +312,7 @@ fn bare_status_is_the_menu_and_all_is_the_table() {
             .unwrap()
     };
     let bare = content(run(&["status"]));
-    assert!(bare.starts_with("\u{2b22} Agents"), "{bare}");
+    assert!(bare.starts_with("1 \u{2713} menu-run"), "{bare}");
     assert!(bare.contains("1 \u{2713} menu-run"), "{bare}");
     let all = content(run(&["status", "--all"]));
     assert!(all.contains("menu-run"), "{all}");

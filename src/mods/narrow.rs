@@ -19,9 +19,9 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
-use clap::{Parser, Subcommand};
 use crate::narrow_lib::*;
-use serde_json::{json, Value};
+use clap::{Parser, Subcommand};
+use serde_json::{Value, json};
 
 const USAGE: &str = "\
 gray-narrow — capability narrowing for delegated children.
@@ -55,7 +55,7 @@ pub fn manifest_narrow() -> Value {
                     "task": {"type": "string", "description": "the child's assignment"},
                     "tools": {"type": "string", "description": "comma-separated capability allowlist, e.g. 'read,grep,bash:git*'; omit to inherit"},
                     "agent": {"type": "string", "description": "agent profile name from ~/.gray/subagents/agents/<name>.md"},
-                    "name": {"type": "string", "description": "short run label [a-zA-Z0-9][a-zA-Z0-9_-]*"},
+                    "name": {"type": "string", "description": "short descriptive run label like 'auth-scout' or 'fix-flaky-test' [a-zA-Z0-9][a-zA-Z0-9_-]* — shown in the Agents panel; always pass a meaningful name so runs are identifiable (a task-derived slug is used when omitted)"},
                     "approve": {"type": "string", "description": "comma-separated gated capabilities to approve, e.g. 'tool:bash'"}
                 },
                 "required": ["task"]
@@ -76,7 +76,12 @@ fn tool_before_narrow(params: &Value) -> Value {
         None | Some(true) => json!({"decision": "allow"}),
         Some(false) => {
             let grant = current_grant().unwrap_or_default();
-            let _ = append_ledger(&deny_event(session, name, &primary_arg(name, &args), &grant));
+            let _ = append_ledger(&deny_event(
+                session,
+                name,
+                &primary_arg(name, &args),
+                &grant,
+            ));
             json!({
                 "decision": "deny",
                 "reason": format!("{name} is outside this session's narrowed grant ({}) — logged in the narrowing ledger; finish without it or report the blocker", grant.join(","))
@@ -121,7 +126,14 @@ struct Planned {
 /// ledger event. Err(msg) when the delegation is refused (denied entries,
 /// gated without approval, empty result, depth cap, bad ids) — callers
 /// propagate the message to the user and do NOT spawn.
-fn plan(request_csv: Option<&str>, agent: Option<&str>, approve_csv: Option<&str>, via: &str, cwd: &str, run_id: Option<String>) -> Result<Planned, String> {
+fn plan(
+    request_csv: Option<&str>,
+    agent: Option<&str>,
+    approve_csv: Option<&str>,
+    via: &str,
+    cwd: &str,
+    run_id: Option<String>,
+) -> Result<Planned, String> {
     let (depth, max_depth, malformed) = depth_config();
     if !malformed.is_empty() {
         return Err(format!(
@@ -130,7 +142,9 @@ fn plan(request_csv: Option<&str>, agent: Option<&str>, approve_csv: Option<&str
         ));
     }
     if depth >= max_depth {
-        return Err(format!("refusing to delegate: depth {depth} is at the narrowing bound {max_depth}"));
+        return Err(format!(
+            "refusing to delegate: depth {depth} is at the narrowing bound {max_depth}"
+        ));
     }
     let parent = current_grant().unwrap_or_else(|| vec![WILDCARD.to_string()]);
     let requested = match request_csv {
@@ -156,13 +170,29 @@ fn plan(request_csv: Option<&str>, agent: Option<&str>, approve_csv: Option<&str
         approved,
     };
     let out = resolve(&input);
-    let run_id = run_id.unwrap_or_else(|| format!("{:x}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default()));
+    let run_id = run_id.unwrap_or_else(|| {
+        format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        )
+    });
 
     if !out.denied.is_empty() {
-        let ev = grant_event(via, &run_id, agent, cwd, depth + 1, max_depth, &input, &out, "refused", "requested capabilities not held by parent");
+        let ev = grant_event(
+            via,
+            &run_id,
+            agent,
+            cwd,
+            depth + 1,
+            max_depth,
+            &input,
+            &out,
+            "refused",
+            "requested capabilities not held by parent",
+        );
         let _ = append_ledger(&ev);
         return Err(format!(
             "refused — not held by this session's grant: {}",
@@ -170,7 +200,18 @@ fn plan(request_csv: Option<&str>, agent: Option<&str>, approve_csv: Option<&str
         ));
     }
     if !out.gated_blocked.is_empty() {
-        let ev = grant_event(via, &run_id, agent, cwd, depth + 1, max_depth, &input, &out, "refused", "gated capabilities not approved");
+        let ev = grant_event(
+            via,
+            &run_id,
+            agent,
+            cwd,
+            depth + 1,
+            max_depth,
+            &input,
+            &out,
+            "refused",
+            "gated capabilities not approved",
+        );
         let _ = append_ledger(&ev);
         return Err(format!(
             "refused — gated capabilities need explicit approval: {} (pass --approve '{}')",
@@ -179,9 +220,22 @@ fn plan(request_csv: Option<&str>, agent: Option<&str>, approve_csv: Option<&str
         ));
     }
     if out.effective.is_empty() {
-        let ev = grant_event(via, &run_id, agent, cwd, depth + 1, max_depth, &input, &out, "refused", "empty effective grant");
+        let ev = grant_event(
+            via,
+            &run_id,
+            agent,
+            cwd,
+            depth + 1,
+            max_depth,
+            &input,
+            &out,
+            "refused",
+            "empty effective grant",
+        );
         let _ = append_ledger(&ev);
-        return Err("refused — the resolved grant is empty (a no-tool child cannot work)".to_string());
+        return Err(
+            "refused — the resolved grant is empty (a no-tool child cannot work)".to_string(),
+        );
     }
     let grant_value = grant_env_value(&out.effective)?;
     let env = vec![
@@ -190,7 +244,14 @@ fn plan(request_csv: Option<&str>, agent: Option<&str>, approve_csv: Option<&str
         (ENV_MAX_DEPTH.to_string(), max_depth.to_string()),
         (ENV_RUN.to_string(), run_id.clone()),
     ];
-    Ok(Planned { run_id, env, input, out, depth, max_depth })
+    Ok(Planned {
+        run_id,
+        env,
+        input,
+        out,
+        depth,
+        max_depth,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -198,13 +259,20 @@ fn plan(request_csv: Option<&str>, agent: Option<&str>, approve_csv: Option<&str
 // ---------------------------------------------------------------------------
 
 fn load_profile(name: &str) -> Result<(String, Value), String> {
-    if !name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         || name.len() > 64
     {
         return Err(format!("invalid agent name '{name}'"));
     }
-    let path = crate::narrow_lib::gray_home().join("subagents/agents").join(format!("{name}.md"));
+    let path = crate::narrow_lib::gray_home()
+        .join("subagents/agents")
+        .join(format!("{name}.md"));
     let text = std::fs::read_to_string(&path)
         .map_err(|_| format!("unknown agent '{name}' (no {})", path.display()))?;
     // Same `---` frontmatter convention as gray-subagents: model/effort/tools.
@@ -253,13 +321,24 @@ fn child_prompt(agent: Option<&str>, task: &str, grant_csv: &str) -> String {
     )
 }
 
-fn spawn_child(prompt: &str, env: &[(String, String)], cwd: &str, run_id: &str, name: &str, model: Option<&str>, effort: Option<&str>) -> Result<u32, String> {
+fn spawn_child(
+    prompt: &str,
+    env: &[(String, String)],
+    cwd: &str,
+    run_id: &str,
+    name: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<u32, String> {
     let dir = runs_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let log = std::fs::File::create(dir.join(format!("{run_id}.log"))).map_err(|e| e.to_string())?;
+    let log =
+        std::fs::File::create(dir.join(format!("{run_id}.log"))).map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(gray_binary());
-    cmd.arg("-p").arg(prompt).arg("--json")
+    cmd.arg("-p")
+        .arg(prompt)
+        .arg("--json")
         .arg("--max-requests")
         .arg(std::env::var("GRAY_SUBAGENTS_MAX_REQUESTS").unwrap_or_else(|_| "256".into()))
         .current_dir(cwd)
@@ -290,10 +369,20 @@ fn spawn_child(prompt: &str, env: &[(String, String)], cwd: &str, run_id: &str, 
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    cmd.spawn().map(|c| c.id()).map_err(|e| format!("could not spawn {}: {e}", gray_binary()))
+    cmd.spawn()
+        .map(|c| c.id())
+        .map_err(|e| format!("could not spawn {}: {e}", gray_binary()))
 }
 
-fn run_record(run_id: &str, name: &str, agent: Option<&str>, task: &str, cwd: &str, grant: &[String], pid: u32) {
+fn run_record(
+    run_id: &str,
+    name: &str,
+    agent: Option<&str>,
+    task: &str,
+    cwd: &str,
+    grant: &[String],
+    pid: u32,
+) {
     let rec = json!({
         "run_id": run_id, "name": name, "agent": agent.unwrap_or(""),
         "task": task, "cwd": cwd, "pid": pid,
@@ -306,23 +395,94 @@ fn run_record(run_id: &str, name: &str, agent: Option<&str>, task: &str, cwd: &s
 }
 
 #[allow(clippy::too_many_arguments)]
-fn do_run_narrow(task: &str, tools: Option<&str>, agent: Option<&str>, name: Option<&str>,
-          approve: Option<&str>, model: Option<&str>, effort: Option<&str>,
-          cwd: &str, via: &str) -> Result<String, String> {
+
+/// Fallback run label: first words of the task slugified, suffixed with a
+/// short run-id for uniqueness — "e2e-smoke-7f3a" beats "run-7f3a1b2c".
+fn name_from_task(task: &str, run_id: &str) -> String {
+    let mut slug = String::new();
+    for w in task.split_whitespace() {
+        let w: String = w
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let w = w.trim_matches('-');
+        if w.is_empty() {
+            continue;
+        }
+        let would = slug.len() + usize::from(!slug.is_empty()) + w.len();
+        if would > 24 && !slug.is_empty() {
+            break;
+        }
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        slug.push_str(&w[..w.len().min(24)]);
+    }
+    if slug.is_empty() {
+        slug = "run".to_string()
+    }
+    format!("{slug}-{}", &run_id[..4])
+}
+
+fn do_run_narrow(
+    task: &str,
+    tools: Option<&str>,
+    agent: Option<&str>,
+    name: Option<&str>,
+    approve: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    cwd: &str,
+    via: &str,
+    session: &str,
+) -> Result<String, String> {
     let planned = plan(tools, agent, approve, via, cwd, None)?;
     let grant_csv = grant_env_value(&planned.out.effective)?;
     let prompt = child_prompt(agent, task, &grant_csv);
     let name = name
         .map(str::to_string)
-        .unwrap_or_else(|| format!("run-{}", &planned.run_id[..8]));
-    let pid = spawn_child(&prompt, &planned.env, cwd, &planned.run_id, &name, model, effort)?;
-    let ev = grant_event(via, &planned.run_id, agent, cwd, planned.depth + 1, planned.max_depth,
-                         &planned.input, &planned.out, "granted", "");
+        .unwrap_or_else(|| name_from_task(task, &planned.run_id));
+    // Forward the owning-session marker: the child's own descendants
+    // (and foreign_scan adoption) scope back to this session's tree.
+    let mut env = planned.env.clone();
+    if !session.is_empty() {
+        env.push(("GRAY_SESSION_ID".into(), session.into()));
+    }
+    let pid = spawn_child(&prompt, &env, cwd, &planned.run_id, &name, model, effort)?;
+    let ev = grant_event(
+        via,
+        &planned.run_id,
+        agent,
+        cwd,
+        planned.depth + 1,
+        planned.max_depth,
+        &planned.input,
+        &planned.out,
+        "granted",
+        "",
+    );
     let _ = append_ledger(&ev);
-    run_record(&planned.run_id, &name, agent, task, cwd, &planned.out.effective, pid);
+    run_record(
+        &planned.run_id,
+        &name,
+        agent,
+        task,
+        cwd,
+        &planned.out.effective,
+        pid,
+    );
     let mut note = String::new();
     if !planned.out.subsumed_by.is_empty() {
-        note = format!(" (subsumed by parent grant: {})", planned.out.subsumed_by.join(", "));
+        note = format!(
+            " (subsumed by parent grant: {})",
+            planned.out.subsumed_by.join(", ")
+        );
     }
     Ok(format!(
         "Started narrowed run {name} [{}] pid {pid} — grant: {grant_csv}{note}. \
@@ -338,7 +498,12 @@ fn do_run_narrow(task: &str, tools: Option<&str>, agent: Option<&str>, name: Opt
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "gray-narrow", version, about = "capability narrowing for delegated gray children", disable_help_subcommand = true)]
+#[command(
+    name = "gray-narrow",
+    version,
+    about = "capability narrowing for delegated gray children",
+    disable_help_subcommand = true
+)]
 struct NarrowCli {
     #[command(subcommand)]
     command: Option<NarrowCmd>,
@@ -407,10 +572,26 @@ fn do_plan_narrow(args: NarrowPlanArgs) -> Result<Value, String> {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let planned = plan(args.request.as_deref(), args.agent.as_deref(), args.approve.as_deref(), &args.via, &cwd, args.run_id)?;
-    let ev = grant_event(&args.via, &planned.run_id, args.agent.as_deref(), &cwd,
-                         planned.depth + 1, planned.max_depth, &planned.input, &planned.out,
-                         "granted", "");
+    let planned = plan(
+        args.request.as_deref(),
+        args.agent.as_deref(),
+        args.approve.as_deref(),
+        &args.via,
+        &cwd,
+        args.run_id,
+    )?;
+    let ev = grant_event(
+        &args.via,
+        &planned.run_id,
+        args.agent.as_deref(),
+        &cwd,
+        planned.depth + 1,
+        planned.max_depth,
+        &planned.input,
+        &planned.out,
+        "granted",
+        "",
+    );
     let _ = append_ledger(&ev);
     let env: serde_json::Map<String, Value> = planned
         .env
@@ -442,11 +623,23 @@ struct NarrowPlanArgs {
 fn do_grants_narrow() -> String {
     let (depth, max, malformed) = depth_config();
     let grant = current_grant()
-        .map(|g| if g.is_empty() { "(empty — denies everything)".into() } else { g.join(", ") })
+        .map(|g| {
+            if g.is_empty() {
+                "(empty — denies everything)".into()
+            } else {
+                g.join(", ")
+            }
+        })
         .unwrap_or_else(|| "(ungoverned — no GRAY_NARROW_GRANT; all tools allowed)".into());
-    let mut s = format!("grant: {grant}\ndepth: {depth}/{max}\nledger: {}", ledger_path().display());
+    let mut s = format!(
+        "grant: {grant}\ndepth: {depth}/{max}\nledger: {}",
+        ledger_path().display()
+    );
     if !malformed.is_empty() {
-        s.push_str(&format!("\nWARNING: malformed depth env(s): {} — delegation is refused", malformed.join(", ")));
+        s.push_str(&format!(
+            "\nWARNING: malformed depth env(s): {} — delegation is refused",
+            malformed.join(", ")
+        ));
     }
     s
 }
@@ -457,19 +650,34 @@ fn do_status_narrow() -> String {
     if let Ok(rd) = std::fs::read_dir(runs_dir()) {
         let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
         entries.sort();
-        for p in entries.into_iter().filter(|p| p.extension().is_some_and(|e| e == "json")) {
-            let Ok(text) = std::fs::read_to_string(&p) else { continue };
-            let Ok(rec) = serde_json::from_str::<Value>(&text) else { continue };
+        for p in entries
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        {
+            let Ok(text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let Ok(rec) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
             found = true;
             let pid = rec["pid"].as_u64().unwrap_or(0);
             let alive = pid > 0 && PathBuf::from(format!("/proc/{pid}")).exists();
             rows.push(format!(
                 "{:<10} {:<20} {:<8} {:<5} {}",
-                &rec["run_id"].as_str().unwrap_or("")[..8.min(rec["run_id"].as_str().unwrap_or("").len())],
+                &rec["run_id"].as_str().unwrap_or("")
+                    [..8.min(rec["run_id"].as_str().unwrap_or("").len())],
                 rec["name"].as_str().unwrap_or(""),
                 pid,
                 if alive { "yes" } else { "no" },
-                rec["grant"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default()
+                rec["grant"]
+                    .as_array()
+                    .map(|a| a
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default()
             ));
         }
     }
@@ -505,19 +713,49 @@ fn run_command_narrow(argv: &[&str]) -> String {
                 .collect();
             match NarrowCli::try_parse_from(&full) {
                 Ok(cli) => match cli.command.unwrap_or(NarrowCmd::Help) {
-                    NarrowCmd::Run { task, tools, agent, name, approve, model, effort, cwd } => {
+                    NarrowCmd::Run {
+                        task,
+                        tools,
+                        agent,
+                        name,
+                        approve,
+                        model,
+                        effort,
+                        cwd,
+                    } => {
                         let cwd = cwd.unwrap_or_else(|| {
                             std::env::current_dir()
                                 .map(|p| p.to_string_lossy().into_owned())
                                 .unwrap_or_else(|_| ".".into())
                         });
-                        do_run_narrow(&task.join(" "), tools.as_deref(), agent.as_deref(),
-                               name.as_deref(), approve.as_deref(), model.as_deref(),
-                               effort.as_deref(), &cwd, "command")
-                            .unwrap_or_else(|e| format!("refused: {e}"))
+                        do_run_narrow(
+                            &task.join(" "),
+                            tools.as_deref(),
+                            agent.as_deref(),
+                            name.as_deref(),
+                            approve.as_deref(),
+                            model.as_deref(),
+                            effort.as_deref(),
+                            &cwd,
+                            "command",
+                            &std::env::var("GRAY_SESSION_ID").unwrap_or_default(),
+                        )
+                        .unwrap_or_else(|e| format!("refused: {e}"))
                     }
-                    NarrowCmd::Plan { request, agent, approve, via, run_id } => {
-                        match do_plan_narrow(NarrowPlanArgs { request, agent, approve, via, run_id }) {
+                    NarrowCmd::Plan {
+                        request,
+                        agent,
+                        approve,
+                        via,
+                        run_id,
+                    } => {
+                        match do_plan_narrow(NarrowPlanArgs {
+                            request,
+                            agent,
+                            approve,
+                            via,
+                            run_id,
+                        }) {
                             Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_default(),
                             Err(e) => format!("refused: {e}"),
                         }
@@ -541,7 +779,11 @@ fn tool_call_narrow(params: &Value) -> Value {
     let cwd = params["session"]["cwd"]
         .as_str()
         .map(str::to_string)
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| ".".into());
     match do_run_narrow(
         task,
@@ -553,6 +795,7 @@ fn tool_call_narrow(params: &Value) -> Value {
         None,
         &cwd,
         "delegate-tool",
+        params["session"]["id"].as_str().unwrap_or(""),
     ) {
         Ok(text) => json!({"content": text}),
         Err(e) => json!({"content": format!("narrow_delegate refused: {e}"), "is_error": true}),
@@ -593,7 +836,9 @@ fn sidecar_narrow() -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
         let line = line?;
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let (reply, exit) = handle_narrow(&req);
         if let Some(reply) = reply {
             writeln!(stdout, "{reply}")?;
@@ -619,7 +864,16 @@ pub fn narrow_cli(args: Vec<String>) -> Result<String, String> {
     let out: Result<String, String> = match cli.command.unwrap_or(NarrowCmd::Sidecar) {
         NarrowCmd::Manifest => Ok(manifest_narrow().to_string()),
         NarrowCmd::Sidecar => return Err("__sidecar".into()),
-        NarrowCmd::Run { task, tools, agent, name, approve, model, effort, cwd } => do_run_narrow(
+        NarrowCmd::Run {
+            task,
+            tools,
+            agent,
+            name,
+            approve,
+            model,
+            effort,
+            cwd,
+        } => do_run_narrow(
             &task.join(" "),
             tools.as_deref(),
             agent.as_deref(),
@@ -629,9 +883,20 @@ pub fn narrow_cli(args: Vec<String>) -> Result<String, String> {
             effort.as_deref(),
             &cwd.unwrap_or_else(default_cwd),
             "narrow-run",
+            &std::env::var("GRAY_SESSION_ID").unwrap_or_default(),
         ),
-        NarrowCmd::Plan { request, agent, approve, via, run_id } => do_plan_narrow(NarrowPlanArgs {
-            request, agent, approve, via, run_id,
+        NarrowCmd::Plan {
+            request,
+            agent,
+            approve,
+            via,
+            run_id,
+        } => do_plan_narrow(NarrowPlanArgs {
+            request,
+            agent,
+            approve,
+            via,
+            run_id,
         })
         .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default()),
         NarrowCmd::Grants => Ok(do_grants_narrow()),

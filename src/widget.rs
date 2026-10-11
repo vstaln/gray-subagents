@@ -16,97 +16,187 @@ pub struct AgentRow {
     pub name: String,
     pub description: String,
     pub stats: String,
+    /// Display name (`Haiku 5.5`), already passed through [`pretty_model`].
+    pub model: String,
+    /// The child's final answer; finished rows show it instead of the task.
+    pub result: String,
     pub state: AgentState,
 }
 
-/// Plain-text tree, without ANSI styling or a trailing newline.
-/// The host will apply its shimmer to the empty hexagon; no rotating glyphs.
-pub fn render_widget(agents: &[AgentRow]) -> String {
-    if agents.is_empty() {
-        return String::new();
-    }
-    let mut finished = Vec::new();
-    let mut running = Vec::new();
-    let mut queued = 0;
-    for agent in agents {
-        if matches!(agent.state, AgentState::Queued) {
-            queued += 1;
+/// A model id as people say it: `claude-haiku-5-5` → `Haiku 5.5`,
+/// `swe-2-max` → `SWE-2 Max`, `vendor/gemini-3.8-flash` → `Gemini 3.8 Flash`.
+pub fn pretty_model(id: &str) -> String {
+    let base = id.trim().rsplit('/').next().unwrap_or("");
+    let (base, tag) = match base.split_once('[') {
+        Some((b, t)) => (b, t.trim_end_matches(']').to_uppercase()),
+        None => (base, String::new()),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let (mut prev_num, mut prev_acronym) = (false, false);
+    for (i, part) in base.split('-').filter(|p| !p.is_empty()).enumerate() {
+        if i == 0 && part.eq_ignore_ascii_case("claude") && base.contains('-') {
             continue;
         }
-        match agent.state {
-            AgentState::Running { .. } => running.push(row_lines(agent)),
-            _ => finished.push(row_lines(agent)),
-        }
-    }
-    let queued_row = (queued > 0).then(|| vec![format!("◦ {queued} queued")]);
-    let body_len = finished.len() + running.len() * 2 + usize::from(queued > 0);
-    let mut entries = Vec::new();
-    if body_len <= 11 {
-        entries.extend(finished);
-        entries.extend(running);
-        entries.extend(queued_row);
-    } else {
-        let mut budget = 10; // Heading and overflow indicator reserve two rows.
-        let mut hidden_running = 0;
-        let mut hidden_finished = 0;
-        for pair in running {
-            if budget >= 2 {
-                entries.push(pair);
-                budget -= 2;
-            } else {
-                hidden_running += 1;
+        let numeric = part.chars().all(|c| c.is_ascii_digit() || c == '.');
+        match out.last_mut() {
+            Some(last) if numeric && prev_num => last.push_str(&format!(".{part}")),
+            Some(last) if numeric && prev_acronym => last.push_str(&format!("-{part}")),
+            _ => {
+                let lower = part.to_ascii_lowercase();
+                let word = match lower.as_str() {
+                    "swe" | "gpt" | "glm" => lower.to_uppercase(),
+                    "deepseek" => "DeepSeek".into(),
+                    "minimax" => "MiniMax".into(),
+                    w if w.starts_with('v') && w[1..].starts_with(|c: char| c.is_ascii_digit()) => {
+                        w.to_uppercase()
+                    }
+                    _ => {
+                        let mut c = part.chars();
+                        c.next()
+                            .map(|f| f.to_uppercase().chain(c).collect())
+                            .unwrap_or_default()
+                    }
+                };
+                prev_acronym = matches!(lower.as_str(), "swe" | "gpt" | "glm");
+                out.push(word);
             }
         }
-        if let Some(row) = queued_row {
-            if budget > 0 {
-                entries.push(row);
-                budget -= 1;
-            }
-        }
-        for row in finished {
-            if budget > 0 {
-                entries.push(row);
-                budget -= 1;
-            } else {
-                hidden_finished += 1;
-            }
-        }
-        let mut parts = Vec::new();
-        if hidden_running > 0 {
-            parts.push(format!("{hidden_running} running"));
-        }
-        if hidden_finished > 0 {
-            parts.push(format!("{hidden_finished} finished"));
-        }
-        entries.push(vec![format!(
-            "+{} more ({})",
-            hidden_running + hidden_finished,
-            parts.join(", ")
-        )]);
+        prev_num = numeric;
     }
-    let mut lines = vec!["⬢ Agents".to_string()];
-    let count = entries.len();
-    for (index, entry) in entries.into_iter().enumerate() {
-        let last = index + 1 == count;
-        lines.push(format!("{} {}", if last { "└─" } else { "├─" }, entry[0]));
-        if let Some(activity) = entry.get(1) {
-            lines.push(format!("{}   ⎿  {activity}", if last { " " } else { "│" }));
+    if !tag.is_empty() {
+        out.push(tag);
+    }
+    out.join(" ")
+}
+
+/// Plain-text tree, without ANSI styling or a trailing newline.
+pub fn render_widget(agents: &[AgentRow]) -> String {
+    render_widget_spans(agents).0
+}
+
+/// [`render_widget`] plus the `(line, start, end)` char ranges the host
+/// shimmers: the running rows' icon and name only, never the whole row, so
+/// the sweep never reads as random bold words in the task text.
+pub fn render_widget_spans(agents: &[AgentRow]) -> (String, Vec<(usize, usize, usize)>) {
+    if agents.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let is_running = |a: &AgentRow| matches!(a.state, AgentState::Running { .. });
+    let queued = agents
+        .iter()
+        .filter(|a| matches!(a.state, AgentState::Queued))
+        .count();
+    // Running rows lead, indented under a plain count header, so the panel
+    // so the panel reads as this turn's children, not as host tool rows.
+    let ordered: Vec<&AgentRow> = agents
+        .iter()
+        .filter(|a| is_running(a))
+        .chain(
+            agents
+                .iter()
+                .filter(|a| !is_running(a) && !matches!(a.state, AgentState::Queued)),
+        )
+        .collect();
+    let running = ordered.iter().filter(|a| is_running(a)).count();
+    let finished = ordered.len() - running;
+    let budget = 10; // body lines; header, overflow and affordance reserve the rest.
+    let mut shown = Vec::new();
+    let mut used = 0;
+    for a in &ordered {
+        let h = 1 + usize::from(activity_of(a).is_some());
+        if used + h > budget {
+            break;
+        }
+        used += h;
+        shown.push(*a);
+    }
+    let hidden = ordered.len() - shown.len();
+    let name_w = shown
+        .iter()
+        .map(|a| clean(&a.name).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(24);
+    let model_w = shown
+        .iter()
+        .map(|a| a.model.chars().count())
+        .max()
+        .unwrap_or(0);
+    let stats_w = shown
+        .iter()
+        .map(|a| clean(&a.stats).chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines = vec![String::new()];
+    let mut spans = Vec::new();
+    let mut counts = Vec::new();
+    for (n, label) in [(running, "running"), (queued, "queued"), (finished, "done")] {
+        if n > 0 {
+            counts.push(format!("{n} {label}"));
         }
     }
-    // Affordance, styled like the activity continuation: rows are not
-    // just a readout — /subagents opens the picker that selects, opens
-    // and chats with them. Shown whenever it fits the 12-line cap.
-    if lines.len() < 12 {
-        lines.push("    ⎿  /subagents — open · chat · stop".to_string());
+    let total = ordered.len() + queued;
+    lines.push(format!(
+        "{total} subagent{} \u{b7} {}",
+        if total == 1 { "" } else { "s" },
+        counts.join(" \u{b7} ")
+    ));
+    for (i, a) in shown.iter().enumerate() {
+        let name: String = clean(&a.name).chars().take(name_w).collect();
+        let mut line = format!("  {} {name:<name_w$}", state_icon(&a.state));
+        if model_w > 0 {
+            line.push_str(&format!("  {:<model_w$}", a.model));
+        }
+        if stats_w > 0 {
+            line.push_str(&format!("  {:>stats_w$}", clean(&a.stats)));
+        }
+        let tail = tail_of(a);
+        if !tail.is_empty() {
+            line.push_str(&format!("  {tail}"));
+        }
+        if is_running(a) {
+            spans.push((lines.len(), 2, 4 + name.chars().count()));
+        }
+        lines.push(line.trim_end().to_string());
+        if let Some(activity) = activity_of(a) {
+            lines.push(format!("      {activity}"));
+        }
     }
-    lines.join("\n")
+    if hidden > 0 {
+        lines.push(format!("  +{hidden} more"));
+    }
+    lines.push(String::new());
+    lines.push("   /subagents \u{2014} open \u{b7} chat \u{b7} stop".to_string());
+    lines.push(String::new());
+    (lines.join("\n"), spans)
+}
+
+fn activity_of(a: &AgentRow) -> Option<String> {
+    match &a.state {
+        AgentState::Running { activity } => Some(clean(activity)).filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
+/// The row's trailing text: the answer once finished, the failure or stop
+/// reason, otherwise the task.
+fn tail_of(a: &AgentRow) -> String {
+    let first = |s: &str| clean(s.lines().find(|l| !l.trim().is_empty()).unwrap_or(""));
+    match &a.state {
+        AgentState::Completed if !a.result.trim().is_empty() => first(&a.result),
+        AgentState::Failed { error } if !error.is_empty() => format!("error: {}", first(error)),
+        AgentState::Failed { .. } => "error".into(),
+        AgentState::Stopped => "stopped".into(),
+        _ => clean(&a.description),
+    }
 }
 
 /// The glyph for one state — shared by `row_lines` and the `entries`
 /// JSON the host's agents panel consumes.
 pub fn state_icon(state: &AgentState) -> &'static str {
     match state {
-        AgentState::Running { .. } => "⬡",
+        AgentState::Running { .. } => "●",
         AgentState::Completed => "✓",
         AgentState::Failed { .. } => "✗",
         AgentState::Stopped => "■",
@@ -114,10 +204,8 @@ pub fn state_icon(state: &AgentState) -> &'static str {
     }
 }
 
-/// One agent's body lines as the widget prints them: the icon/name/stats
-/// header plus, for running rows, the `⎿ activity` continuation. Shared by
-/// [`render_widget`] and the selectable `/subagents` menu so both surfaces
-/// speak identical row language.
+/// One agent's body lines as the `/subagents` menu prints them: the
+/// icon/name/stats header plus, for running rows, the activity continuation.
 pub fn row_lines(agent: &AgentRow) -> Vec<String> {
     let icon = state_icon(&agent.state);
     let mut header = if agent.description.is_empty() {
@@ -129,9 +217,10 @@ pub fn row_lines(agent: &AgentRow) -> Vec<String> {
             clean(&agent.description)
         )
     };
-    let stats = clean(&agent.stats);
-    if !stats.is_empty() {
-        header.push_str(&format!(" · {stats}"));
+    for part in [clean(&agent.stats), clean(&agent.model)] {
+        if !part.is_empty() {
+            header.push_str(&format!(" · {part}"));
+        }
     }
     match &agent.state {
         AgentState::Running { activity } => vec![header, clean(activity)],
@@ -147,7 +236,7 @@ pub fn row_lines(agent: &AgentRow) -> Vec<String> {
     }
 }
 
-/// The interactive `/subagents` menu: the widget's row voice plus a stable
+/// The interactive `/subagents` menu: the widget's flat row voice plus a stable
 /// 1-based number every verb accepts (`open 2`, `chat 2 'msg'`, `stop 2`).
 /// Rows arrive in display order — finished first, then running, matching
 /// the widget's compact grouping — and finished runs stay listed because
@@ -156,18 +245,12 @@ pub fn render_menu(agents: &[AgentRow]) -> String {
     if agents.is_empty() {
         return String::new();
     }
-    let mut lines = vec!["⬢ Agents".to_string()];
-    let count = agents.len();
+    let mut lines = Vec::new();
     for (index, agent) in agents.iter().enumerate() {
-        let last = index + 1 == count;
-        let branch = if last { "└─" } else { "├─" };
         let body = row_lines(agent);
-        lines.push(format!("{branch} {} {}", index + 1, body[0]));
+        lines.push(format!("{} {}", index + 1, body[0]));
         if let Some(activity) = body.get(1) {
-            let cont = if last { " " } else { "│" };
-            let pad =
-                " ".repeat(branch.chars().count() + (index + 1).to_string().chars().count() + 3);
-            lines.push(format!("{cont}{pad}⎿  {activity}"));
+            lines.push(format!("  {activity}"));
         }
     }
     lines.join("\n")
@@ -179,4 +262,65 @@ fn clean(text: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_ids_read_like_names() {
+        assert_eq!(pretty_model("claude-haiku-5-5"), "Haiku 5.5");
+        assert_eq!(pretty_model("claude-opus-5-5[1m]"), "Opus 5.5 1M");
+        assert_eq!(pretty_model("swe-2-max"), "SWE-2 Max");
+        assert_eq!(pretty_model("gpt-6.1-sol"), "GPT-6.1 Sol");
+        assert_eq!(
+            pretty_model("deepseek/deepseek-v4.1-flash"),
+            "DeepSeek V4.1 Flash"
+        );
+        assert_eq!(
+            pretty_model("gemini-3.8-flash-high"),
+            "Gemini 3.8 Flash High"
+        );
+        assert_eq!(pretty_model(""), "");
+    }
+
+    fn row(name: &str, state: AgentState) -> AgentRow {
+        AgentRow {
+            name: name.into(),
+            description: "What is 17*23?".into(),
+            stats: "28s".into(),
+            model: "Haiku 5.5".into(),
+            result: "391\nmore".into(),
+            state,
+        }
+    }
+
+    #[test]
+    fn tree_columns_answer_and_name_only_shimmer() {
+        let rows = [
+            row("fan-math", AgentState::Completed),
+            row(
+                "fan-count",
+                AgentState::Running {
+                    activity: "$ ls src".into(),
+                },
+            ),
+        ];
+        let (text, spans) = render_widget_spans(&rows);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "");
+        assert_eq!(lines[1], "2 subagents \u{b7} 1 running \u{b7} 1 done");
+        assert_eq!(
+            lines[2],
+            "  \u{25cf} fan-count  Haiku 5.5  28s  What is 17*23?"
+        );
+        assert_eq!(lines[3], "      $ ls src");
+        assert_eq!(lines[4], "  \u{2713} fan-math   Haiku 5.5  28s  391");
+        assert_eq!(lines[5], "");
+        assert!(lines[6].contains("/subagents \u{2014} open"));
+        assert_eq!(spans, vec![(2, 2, 13)]);
+        let shimmered: String = lines[2].chars().skip(2).take(11).collect();
+        assert_eq!(shimmered, "\u{25cf} fan-count");
+    }
 }

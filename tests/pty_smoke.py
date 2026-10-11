@@ -27,9 +27,9 @@ with tempfile.TemporaryDirectory(prefix='gray-widget-pty-') as tmp:
   pathlib.Path('/tmp/gray-subagents-terminal.txt').write_text(text+'\n')
   pathlib.Path('/tmp/gray-subagents-terminal.ansi').write_bytes(raw)
   print(text)
-  assert 'Scout' in text and 'Reviewer' in text and '⬢ Agents' in text
+  assert 'Scout' in text and 'Reviewer' in text and '/subagents — open' in text
   assert 'draft stays here' in text
-  assert text.index('⬢ Agents')<text.index('draft stays here')
+  assert text.index('Scout')<text.index('draft stays here')
   print('PASS real PTY: plugin widget is above the editable draft')
   os.write(master,b'\x15/subagents settings\r');drain(2)
   text='\n'.join(screen.display)

@@ -1,0 +1,480 @@
+//! Folded-in gray-rlm surface: prime-agent-style RLM tools over the
+//! subagent supervisor (mechanics port — no prime code). The supervisor
+//! itself enforces depth-1 (`GRAY_SUBAGENTS_ACTIVE`) and the running cap
+//! (`max_running` setting); this layer adds the model-facing tool surface
+//! prime's `spawn/collect/send/delete/progress_note` map to, plus the
+//! per-session spawn budget and session notes. No duplicate registry —
+//! the supervisor's own runs/ records (session_id-scoped) are the truth.
+
+use anyhow::Result;
+use serde_json::{Value, json};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use gray_subagents::widget::AgentState;
+
+use crate::{
+    Entry, backend, chat, collect_entries, foreign_stop, home, menu_order, menu_target,
+    resolve_entry, session_of_pid, session_root,
+};
+
+const MAX_SPAWNS: usize = 32;
+const COLLECT_MAX_WAIT_MS: u64 = 120_000;
+const DEPTH_MSG: &str = "rlm_spawn is unavailable inside a subagent run — children cannot spawn children (depth-1 only)";
+
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Session scope from the wire params, else the exported env marker,
+/// else the process-tree-derived root.
+fn session_id(params: &Value) -> String {
+    params
+        .pointer("/session/id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("GRAY_SESSION_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| session_root().and_then(session_of_pid))
+        .unwrap_or_else(|| "default".into())
+}
+
+fn notes_file(sid: &str) -> Result<PathBuf> {
+    Ok(home()?
+        .join("subagents")
+        .join("notes")
+        .join(format!("{}.md", sanitize(sid))))
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Runs this session spawned — the supervisor records owner `session_id`
+/// on every job, so the registry doubles as the rlm spawn ledger.
+fn owned_runs(sid: &str) -> Vec<Value> {
+    let dir = match home() {
+        Ok(h) => h.join("subagents").join("runs"),
+        Err(_) => return Vec::new(),
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut jobs = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(j) = serde_json::from_slice::<Value>(&std::fs::read(&p).unwrap_or_default()) else {
+            continue;
+        };
+        if j["session_id"].as_str() == Some(sid) {
+            jobs.push(j);
+        }
+    }
+    jobs.sort_by(|a, b| {
+        b["created"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&a["created"].as_f64().unwrap_or(0.0))
+    });
+    jobs
+}
+
+// ---------- tools ----------
+
+/// `rlm_spawn` — admit a supervised child, return a handle immediately.
+/// `prompt` (or `task`) is required; `tasks: [...]` fans out 1–8 in one
+/// admission (prime's batch spawn), each item taking name/agent/model/etc.
+fn rlm_spawn(params: &Value, args: &Value) -> Result<String, String> {
+    if std::env::var_os("GRAY_SUBAGENTS_ACTIVE").is_some() {
+        return Err(DEPTH_MSG.into());
+    }
+    let sid = session_id(params);
+    let batch = args["tasks"].as_array();
+    if batch.is_none() && args["prompt"].as_str().or(args["task"].as_str()).is_none() {
+        return Err("rlm_spawn requires prompt".into());
+    }
+    let owned = owned_runs(&sid);
+    if owned.len() >= MAX_SPAWNS {
+        return Err(format!(
+            "spawn budget exhausted — {MAX_SPAWNS} spawns per session (this session has {})",
+            owned.len()
+        ));
+    }
+    let mut run = json!({});
+    if let Some(tasks) = batch {
+        if tasks.is_empty() || tasks.len() > 8 {
+            return Err("tasks must contain 1–8 items".into());
+        }
+        run["tasks"] = args["tasks"].clone();
+    } else {
+        run["task"] = args["prompt"].as_str().or(args["task"].as_str()).into();
+        for (k, t) in [
+            ("agent", "agent"),
+            ("name", "name"),
+            ("tools", "tools"),
+            ("approve", "approve"),
+        ] {
+            if let Some(v) = args[t].as_str().filter(|s| !s.is_empty()) {
+                run[k] = json!(v);
+            }
+        }
+        if run["agent"].is_null() {
+            run["agent"] = json!("scout");
+        }
+        if let Some(m) = args["model"].as_str().filter(|s| !s.is_empty()) {
+            run["model"] = json!(crate::resolve_model(m).map_err(|e| e.to_string())?);
+        }
+        if let Some(e) = args["effort"].as_str().filter(|s| !s.is_empty()) {
+            run["effort"] = json!(crate::check_effort(e).map_err(|e| e.to_string())?);
+        }
+        if let Some(i) = args["isolation"].as_str().filter(|s| !s.is_empty()) {
+            if i != "worktree" {
+                return Err("isolation must be 'worktree'".into());
+            }
+            run["isolation"] = json!(i);
+        }
+    }
+    run["session"] = params
+        .get("session")
+        .cloned()
+        .filter(|s| s.is_object())
+        .unwrap_or_else(|| json!({"id": sid}));
+    let v = backend("run", run, None, None).map_err(|e| e.to_string())?;
+    let rids = v["run_ids"].as_array().cloned().unwrap_or_default();
+    let names = v["names"].as_array().cloned().unwrap_or_default();
+    let handles: Vec<Value> = rids
+        .iter()
+        .enumerate()
+        .map(|(i, r)| json!({"id": r, "name": names.get(i).cloned().unwrap_or(Value::Null)}))
+        .collect();
+    Ok(json!({
+        "handles": handles,
+        "handle": handles.first().cloned().unwrap_or(Value::Null),
+        "status": "admitted",
+        "note": "admission returns handles, never the child's answer — results arrive via rlm_collect, completion notices, or agent messages",
+        "cli": v["content"].as_str().unwrap_or("").lines().next().unwrap_or("").to_string(),
+    })
+    .to_string())
+}
+
+fn snapshot(e: &Entry, preview_lines: usize) -> Value {
+    let (running, settled, activity, status) = match &e.row.state {
+        AgentState::Running { activity } => (true, false, activity.clone(), "running".to_string()),
+        AgentState::Queued => (false, false, String::new(), "queued".to_string()),
+        AgentState::Completed => (false, true, String::new(), "completed".to_string()),
+        AgentState::Failed { error } => (false, true, String::new(), format!("failed: {error}")),
+        AgentState::Stopped => (false, true, String::new(), "stopped".to_string()),
+    };
+    let preview = backend(
+        "view",
+        json!({"run_id": e.target, "lines": preview_lines}),
+        None,
+        None,
+    )
+    .ok()
+    .and_then(|v| v["content"].as_str().map(str::to_string))
+    .unwrap_or_else(|| "(view unavailable)".into());
+    json!({
+        "name": e.row.name,
+        "target": e.target,
+        "status": if status.is_empty() { e.status.clone() } else { status },
+        "running": running,
+        "settled": settled,
+        "activity": activity,
+        "session": e.session,
+        "preview": preview.chars().take(1200).collect::<String>(),
+    })
+}
+
+/// `rlm_collect` — non-steering typed snapshots; `wait_ms` polls until
+/// every target settles (cap ~120s). Default targets: this session's runs.
+fn rlm_collect(params: &Value, args: &Value) -> Result<String, String> {
+    let sid = session_id(params);
+    let targets: Vec<String> = args["targets"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .or_else(|| args["targets"].as_str().map(|s| vec![s.to_string()]))
+        .unwrap_or_else(|| {
+            owned_runs(&sid)
+                .iter()
+                .filter_map(|j| j["name"].as_str().map(str::to_string))
+                .collect()
+        });
+    if targets.is_empty() {
+        return Ok("[]".into());
+    }
+    let wait_ms = args["wait_ms"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(COLLECT_MAX_WAIT_MS);
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    loop {
+        let entries = menu_order(collect_entries(true, true).map_err(|e| e.to_string())?);
+        let mut snaps = Vec::new();
+        for name in &targets {
+            match resolve_entry(&entries, name) {
+                Some(e) => snaps.push(snapshot(e, 5)),
+                None => snaps.push(json!({
+                    "name": name, "status": "unknown",
+                    "settled": true, "error": "no such child",
+                })),
+            }
+        }
+        let all_settled = snaps
+            .iter()
+            .all(|s| s["settled"].as_bool().unwrap_or(false));
+        if all_settled || Instant::now() >= deadline {
+            return Ok(serde_json::to_string_pretty(&snaps).unwrap_or_default());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// `rlm_send` — steer a running child; a finished one's `chat` resumes its
+/// session (prime's agent_message.send analogue).
+fn rlm_send(args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().ok_or("rlm_send requires name")?;
+    let message = args["message"]
+        .as_str()
+        .ok_or("rlm_send requires message")?;
+    let v = chat(&menu_target(name), vec![message.to_string()]).map_err(|e| e.to_string())?;
+    Ok(v["content"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string_pretty(&v).unwrap_or_default()))
+}
+
+/// `rlm_delete` — stop a child by name/id (foreign workers included).
+fn rlm_delete(params: &Value, args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().ok_or("rlm_delete requires name")?;
+    let target = menu_target(name);
+    if let Some(v) = foreign_stop(&target) {
+        return Ok(v["content"].as_str().unwrap_or("stopped").to_string());
+    }
+    let sid = session_id(params);
+    let v = backend(
+        "stop",
+        json!({"run_id": target, "session": {"id": sid}}),
+        None,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(v["content"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string_pretty(&v).unwrap_or_default()))
+}
+
+/// `rlm_progress_note` — report upward without steering: append to the
+/// session notes file and (when host.say is granted) emit a say frame.
+fn rlm_progress_note(params: &Value, args: &Value) -> Result<String, String> {
+    let sid = session_id(params);
+    let msg = args["message"]
+        .as_str()
+        .ok_or("rlm_progress_note requires message")?
+        .chars()
+        .take(512)
+        .collect::<String>();
+    let path = notes_file(&sid).map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("cannot append note file: {e}"))?;
+    writeln!(f, "- [{}] {}", now(), msg).map_err(|e| e.to_string())?;
+    Ok(format!("noted → {}", path.display()))
+}
+
+// ---------- wire surface ----------
+
+pub fn is_rlm_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "rlm_spawn" | "rlm_collect" | "rlm_send" | "rlm_delete" | "rlm_progress_note"
+    )
+}
+
+/// One tool call → (tool-result value, extra outbound frames to print
+/// first — currently just the optional host/say delivery).
+pub fn handle_tool(params: &Value) -> (Value, Vec<Value>) {
+    let name = params["name"].as_str().unwrap_or("");
+    let args = &params["args"];
+    let res: Result<String, String> = match name {
+        "rlm_spawn" => rlm_spawn(params, args),
+        "rlm_collect" => rlm_collect(params, args),
+        "rlm_send" => rlm_send(args),
+        "rlm_delete" => rlm_delete(params, args),
+        "rlm_progress_note" => rlm_progress_note(params, args),
+        other => {
+            return (
+                json!({"content": format!("unknown tool {other}"), "is_error": true}),
+                Vec::new(),
+            );
+        }
+    };
+    let mut frames = Vec::new();
+    if name == "rlm_progress_note" && res.is_ok() {
+        let msg = args["message"].as_str().unwrap_or("");
+        frames.push(json!({"id": "rlm-say", "method": "host/say",
+            "params": {"text": format!("rlm progress: {}", msg.chars().take(200).collect::<String>())}}));
+    }
+    match res {
+        Ok(c) => (json!({"content": c}), frames),
+        Err(e) => (json!({"content": e, "is_error": true}), frames),
+    }
+}
+
+/// `/rlm …` — status/collect/stop/notes over this session's children.
+pub fn command(params: &Value) -> String {
+    let argv: Vec<String> = params["argv"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let sid = session_id(params);
+    match argv.first().map(String::as_str) {
+        Some("stop") => argv
+            .get(1)
+            .map(|n| rlm_delete(params, &json!({"name": n})).unwrap_or_else(|e| e))
+            .unwrap_or_else(|| "usage: /rlm stop <name>".into()),
+        Some("collect") => rlm_collect(params, &json!({})).unwrap_or_else(|e| e),
+        Some("notes") => notes_file(&sid)
+            .and_then(|p| std::fs::read_to_string(p).map_err(|e| e.into()))
+            .unwrap_or_else(|_: anyhow::Error| "(no notes yet)".into()),
+        _ => {
+            let owned = owned_runs(&sid);
+            if owned.is_empty() {
+                return "no rlm children this session — spawn via the rlm_spawn tool".into();
+            }
+            let entries = menu_order(collect_entries(true, true).unwrap_or_default());
+            let mut lines = vec![format!("rlm children ({})", owned.len())];
+            for j in &owned {
+                let name = j["name"].as_str().unwrap_or("?");
+                let status = resolve_entry(&entries, name)
+                    .map(|e| match &e.row.state {
+                        AgentState::Running { activity } => {
+                            format!("running · {activity}")
+                        }
+                        _ => e.status.clone(),
+                    })
+                    .unwrap_or_else(|| j["status"].as_str().unwrap_or("?").to_string());
+                lines.push(format!("  {name} — {status}"));
+            }
+            lines.join("\n")
+        }
+    }
+}
+
+/// `gray rlm <verb>` argv surface — read verbs work without a host.
+pub fn cli(argv: &[String]) -> String {
+    let params = json!({"session": {"id": "cli"}});
+    match argv.first().map(String::as_str) {
+        Some("collect") => rlm_collect(&params, &json!({})).unwrap_or_else(|e| e),
+        Some("stop") => argv
+            .get(1)
+            .map(|n| rlm_delete(&params, &json!({"name": n})).unwrap_or_else(|e| e))
+            .unwrap_or_else(|| "usage: gray rlm stop <name>".into()),
+        Some("notes") => command(&json!({"argv": ["notes"], "session": {"id": "cli"}})),
+        _ => command(&params),
+    }
+}
+
+pub fn manifest_tools() -> Value {
+    json!([
+        {"name": "rlm_spawn",
+         "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 4) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
+         "parameters": {"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "the child's task prompt"},
+            "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, agent?, name?, model?, effort?}"},
+            "name": {"type": "string"}, "model": {"type": "string"},
+            "effort": {"type": "string"}, "agent": {"type": "string", "description": "profile (scout|worker|oracle|reviewer)"},
+            "tools": {"type": "string"}, "approve": {"type": "string"},
+            "isolation": {"type": "string", "description": "e.g. worktree"}}}},
+        {"name": "rlm_collect",
+         "description": "Non-steering typed snapshots of children: name, status, settled, activity, transcript-tail preview. wait_ms polls until all settle (max ~120s). Default targets: this session's runs.",
+         "parameters": {"type": "object", "properties": {
+            "targets": {"description": "child name or list of names"},
+            "wait_ms": {"type": "integer"}}}},
+        {"name": "rlm_send",
+         "description": "Message a child: steers a running run, resumes a finished one's session (agent_message analogue).",
+         "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}, "message": {"type": "string"}},
+         "required": ["name", "message"]}},
+        {"name": "rlm_delete",
+         "description": "Stop a child run by name.",
+         "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}},
+         "required": ["name"]}},
+        {"name": "rlm_progress_note",
+         "description": "Report upward without steering: appends to this session's notes file (~/.gray/subagents/notes/<session>.md) and, when host.say is granted, delivers it to the parent.",
+         "parameters": {"type": "object", "properties": {
+            "message": {"type": "string", "description": "≤512 chars"}},
+         "required": ["message"]}},
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rlm_tools_declared() {
+        let t = manifest_tools();
+        let names: Vec<&str> = t
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        for n in [
+            "rlm_spawn",
+            "rlm_collect",
+            "rlm_send",
+            "rlm_delete",
+            "rlm_progress_note",
+        ] {
+            assert!(names.contains(&n), "missing {n}");
+        }
+        assert!(names.iter().all(|n| is_rlm_tool(n)));
+        assert!(!is_rlm_tool("narrow_delegate"));
+    }
+
+    #[test]
+    fn session_id_from_params() {
+        assert_eq!(session_id(&json!({"session": {"id": "abc"}})), "abc");
+        let p = json!({});
+        // falls back to proc-derived root, else "default" — just never empty
+        assert!(!session_id(&p).is_empty());
+    }
+}

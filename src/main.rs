@@ -1,12 +1,16 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use gray_subagents::widget::{AgentRow, AgentState, render_menu, render_widget, state_icon};
+use gray_subagents::widget::{
+    AgentRow, AgentState, pretty_model, render_menu, render_widget_spans, state_icon,
+};
 use serde_json::{Value, json};
 
-#[path = "mods/narrow_lib.rs"]
-pub mod narrow_lib;
 #[path = "mods/narrow.rs"]
 mod narrow;
+#[path = "mods/narrow_lib.rs"]
+pub mod narrow_lib;
+#[path = "mods/rlm.rs"]
+mod rlm;
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
@@ -108,7 +112,7 @@ enum Action {
     },
     Manifest,
 }
-fn home() -> Result<PathBuf> {
+pub(crate) fn home() -> Result<PathBuf> {
     std::env::var_os("GRAY_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".gray")))
@@ -145,7 +149,12 @@ fn settings(model: Option<String>, cap: Option<u32>, effort: Option<String>) -> 
 }
 // Retain the tested Python process supervisor while the UI/CLI is native Rust.
 // Embedded source makes the installed executable independent of the source tree.
-fn backend(action: &str, args: Value, model: Option<&str>, effort: Option<&str>) -> Result<Value> {
+pub(crate) fn backend(
+    action: &str,
+    args: Value,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<Value> {
     let cfg = settings(None, None, None)?;
     let script = concat!(
         "import sys,json\nns={'__name__':'gray_subagents_backend','__file__':sys.argv[3]}\nexec(sys.argv[1],ns)\nargs=json.loads(sys.argv[2])\naction=sys.argv[4]\n",
@@ -199,6 +208,12 @@ fn backend(action: &str, args: Value, model: Option<&str>, effort: Option<&str>)
     if let Some(bin) = std::env::var_os("GRAY_BIN") {
         cmd.env("GRAY_SUBAGENTS_BIN", bin);
     }
+    // Owning-session marker for the whole tree under this call: the
+    // supervisor's children inherit os.environ, so GRAY_SESSION_ID here
+    // scopes grandchildren to the caller's session without /proc sniffs.
+    if let Some(sid) = args["session"]["id"].as_str().filter(|s| !s.is_empty()) {
+        cmd.env("GRAY_SESSION_ID", sid);
+    }
     let out = cmd
         .output()
         .context("Python 3 is required for the process supervisor")?;
@@ -210,13 +225,21 @@ fn backend(action: &str, args: Value, model: Option<&str>, effort: Option<&str>)
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 fn manifest() -> Value {
-    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override"],"completion":["settings","setup","run","status","view","stop","steer","list","open","chat","narrow"],"commands":["/subagents","/narrow"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow"]});
-    // gray-narrow is folded in: its tool surface (narrow_delegate) and
-    // CLI verbs ride this manifest too.
-    let n = narrow::manifest_narrow();
-    if let Some(t) = n.get("tools").and_then(Value::as_array) {
-        m["tools"] = json!(t);
-    }
+    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","setup","run","status","view","stop","steer","list","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"]});
+    // Folded-in surfaces ride this manifest too: gray-narrow's tools
+    // (narrow_delegate) plus gray-rlm's rlm_* model-facing tools.
+    let mut tools: Vec<Value> = narrow::manifest_narrow()
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    tools.extend(
+        rlm::manifest_tools()
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    m["tools"] = json!(tools);
     m
 }
 fn widget(demo: bool) -> Result<Value> {
@@ -226,6 +249,8 @@ fn widget(demo: bool) -> Result<Value> {
             name: "auth-scout".into(),
             description: "Find authentication entry points".into(),
             stats: "14.2s".into(),
+            model: "Haiku 5.5".into(),
+            result: String::new(),
             state: AgentState::Running {
                 activity: "searching…".into(),
             },
@@ -234,6 +259,8 @@ fn widget(demo: bool) -> Result<Value> {
             name: "Reviewer".into(),
             description: "Check session handling".into(),
             stats: "38.4s".into(),
+            model: "Haiku 5.5".into(),
+            result: String::new(),
             state: AgentState::Running {
                 activity: "reading…".into(),
             },
@@ -244,42 +271,40 @@ fn widget(demo: bool) -> Result<Value> {
             .map(|entry| entry.row)
             .collect();
     }
-    let text = render_widget(&rows);
-    let shimmer: Vec<usize> = text
-        .lines()
-        .enumerate()
-        .filter_map(|(i, l)| l.contains("⬡").then_some(i))
-        .collect();
-    Ok(json!({"version":1,"text":text,"shimmer_lines":shimmer}))
+    let (text, ranges) = render_widget_spans(&rows);
+    // `shimmer_lines` stays for hosts that predate `shimmer_ranges`.
+    let mut shimmer: Vec<usize> = ranges.iter().map(|r| r.0).collect();
+    shimmer.dedup();
+    Ok(json!({"version":1,"text":text,"shimmer_lines":shimmer,"shimmer_ranges":ranges}))
 }
 
 /// One selectable Agents-menu row: the widget's [`AgentRow`] display plus
 /// the identity every verb resolves and the run's own gray session.
-struct Entry {
-    row: AgentRow,
+pub(crate) struct Entry {
+    pub row: AgentRow,
     /// What `view`/`stop`/`steer`/`chat`/`open` accept: the run_id for
     /// managed runs; for adopted `gray -p` workers the session slug when
     /// known (foreign_session_id resolves it), else the worker name.
-    target: String,
+    pub target: String,
     /// The run's own gray session — a real resumable session, the same
     /// model as opencode's child sessions (`parent_id`) and Claude Code's
     /// job sessions. Empty while the child has not reached one, or for
     /// foreign workers holding no `.open` file.
-    session: String,
+    pub session: String,
     /// Registry status verbatim; adopted workers are always "running".
-    status: String,
+    pub status: String,
     /// Registry runs accept steer/chat; raw `gray -p` workers do not.
-    managed: bool,
+    pub managed: bool,
     /// Creation time — `last` selects the newest run regardless of the
     /// finished-first display grouping.
-    created: f64,
+    pub created: f64,
 }
 
 /// This session's runs plus adopted `gray -p` workers, scoped exactly like
 /// the widget (owner session, legacy cwd, or in-tree). `include_stale`
 /// keeps finished runs past the widget's 30s fade — the menu selects old
 /// runs for `open`/`chat`.
-fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
+pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
     let cwd = std::env::current_dir()?;
     let my_sid = session_root().and_then(session_of_pid).unwrap_or_default();
     let dir = home()?.join("subagents/runs");
@@ -341,12 +366,14 @@ fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
                     activity: if status == "stopping" {
                         "stopping…".into()
                     } else {
-                        let a = job["activity"].as_str().unwrap_or("");
-                        if a.is_empty() {
-                            "working…".into()
-                        } else {
-                            a.into()
-                        }
+                        // The child's own transcript says `$ ls src`; the
+                        // registry only knows the bare tool name.
+                        let a = job["child_session"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .and_then(session_activity)
+                            .unwrap_or_else(|| job["activity"].as_str().unwrap_or("").into());
+                        if a.is_empty() { "working…".into() } else { a }
                     },
                 },
                 "completed" => AgentState::Completed,
@@ -375,19 +402,13 @@ fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
                             t
                         }
                     },
-                    stats: format!(
-                        "{}{}",
-                        fmt_elapsed(
-                            (job["finished"].as_f64().unwrap_or(now)
-                                - job["created"].as_f64().unwrap_or(now))
-                            .max(0.0)
-                        ),
-                        job["model"]
-                            .as_str()
-                            .filter(|m| !m.is_empty())
-                            .map(|m| format!(" · {}", m.rsplit('/').next().unwrap_or(m)))
-                            .unwrap_or_default()
+                    stats: fmt_elapsed(
+                        (job["finished"].as_f64().unwrap_or(now)
+                            - job["created"].as_f64().unwrap_or(now))
+                        .max(0.0),
                     ),
+                    model: pretty_model(job["model"].as_str().unwrap_or("")),
+                    result: job["result"].as_str().unwrap_or("").into(),
                     state,
                 },
                 target: job["run_id"].as_str().unwrap_or("").into(),
@@ -412,14 +433,11 @@ fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
                 } else {
                     w.task.chars().take(80).collect()
                 },
+                model: pretty_model(&w.model),
+                result: String::new(),
                 stats: format!(
-                    "{}{}{}",
+                    "{}{}",
                     fmt_elapsed(w.elapsed),
-                    if w.model.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" · {}", w.model)
-                    },
                     if w.cwd_base.is_empty() {
                         String::new()
                     } else {
@@ -438,7 +456,7 @@ fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
 /// Menu display order mirrors the widget's compact grouping — finished
 /// runs first, then running — so a number seen on the menu selects the
 /// same row the user just watched in the header.
-fn menu_order(mut entries: Vec<Entry>) -> Vec<Entry> {
+pub(crate) fn menu_order(mut entries: Vec<Entry>) -> Vec<Entry> {
     entries.sort_by_key(|e| matches!(e.row.state, AgentState::Running { .. } | AgentState::Queued));
     entries
 }
@@ -446,7 +464,7 @@ fn menu_order(mut entries: Vec<Entry>) -> Vec<Entry> {
 /// `N` (a menu number), exact name, session slug, run-id prefix, or `last`
 /// → the entry. Names win over numbers so a run literally called `2`
 /// stays addressable.
-fn resolve_entry<'a>(entries: &'a [Entry], target: &str) -> Option<&'a Entry> {
+pub(crate) fn resolve_entry<'a>(entries: &'a [Entry], target: &str) -> Option<&'a Entry> {
     entries
         .iter()
         .find(|e| e.row.name == target)
@@ -481,7 +499,7 @@ fn resolve_entry<'a>(entries: &'a [Entry], target: &str) -> Option<&'a Entry> {
 /// A menu number resolves against this session's rows; anything else
 /// passes through for the backend's own name/prefix/`last` resolution.
 /// (`all`/`mine`/names parse as non-numeric and pass untouched.)
-fn menu_target(target: &str) -> String {
+pub(crate) fn menu_target(target: &str) -> String {
     if target.parse::<usize>().is_err() {
         return target.to_string();
     }
@@ -494,13 +512,12 @@ fn menu_target(target: &str) -> String {
         .unwrap_or_else(|| target.to_string())
 }
 
-/// The interactive `/subagents` menu: same tree voice as the widget, each
+/// The interactive `/subagents` menu: same flat voice as the widget, each
 /// row numbered so one word selects it. Session-scoped like the widget.
 fn menu() -> Result<Value> {
     let entries = menu_order(collect_entries(true, false)?);
     if entries.is_empty() {
-        return Ok(json!({"content": "⬢ Agents
-  ⎿ no runs yet — gray subagents run 'task' to start one"}));
+        return Ok(json!({"content": "  no runs yet — gray subagents run 'task' to start one"}));
     }
     let running = entries
         .iter()
@@ -509,7 +526,7 @@ fn menu() -> Result<Value> {
     let rows: Vec<AgentRow> = entries.iter().map(|e| e.row.clone()).collect();
     let mut text = render_menu(&rows);
     text.push_str(&format!(
-        "\n  ⎿ N|NAME selects · open — enter a finished run's session · chat '…' — talk · view · steer{}",
+        "\n  N|NAME selects · open — enter a finished run's session · chat '…' — talk · view · steer{}",
         if running > 0 { " · stop N|all|mine" } else { "" }
     ));
     Ok(json!({"content": text}))
@@ -562,7 +579,7 @@ fn open_card(name: &str, status: &str, session: &str, managed: bool) -> Value {
     }
     let body = hints
         .iter()
-        .map(|h| format!("  ⎿ {h}"))
+        .map(|h| format!("  {h}"))
         .collect::<Vec<_>>()
         .join("\n");
     json!({"content": format!("{head}\n{body}")})
@@ -583,7 +600,7 @@ fn open(target: &str) -> Result<Value> {
     }
     if session_file(target).is_some() {
         return Ok(
-            json!({"content": format!("⬢ {target}\n  ⎿ /resume {target} — opens that session")}),
+            json!({"content": format!("⬢ {target}\n  /resume {target} — opens that session")}),
         );
     }
     let detail = backend("status", json!({"run_id": target}), None, None)?;
@@ -606,7 +623,7 @@ fn open(target: &str) -> Result<Value> {
 /// subagent session and how Claude Code messages a background task.
 /// Raw `gray -p` workers have no supervisor: there is nothing to queue
 /// into, so chat says so instead of steering into the void.
-fn chat(target: &str, message: Vec<String>) -> Result<Value> {
+pub(crate) fn chat(target: &str, message: Vec<String>) -> Result<Value> {
     let entries = menu_order(collect_entries(true, false)?);
     let entry = resolve_entry(&entries, target).map(|e| {
         (
@@ -711,7 +728,7 @@ fn gray_p_prompt(argv: &[String]) -> Option<String> {
 /// The session's interactive gray process: nearest ancestor that is `gray`
 /// without a prompt flag. The widget/command sidecars are spawned by it, so
 /// any process sharing it as an ancestor belongs to this session.
-fn session_root() -> Option<u64> {
+pub(crate) fn session_root() -> Option<u64> {
     let mut pid = std::process::id() as u64;
     let mut hops = 0;
     while let Some(ppid) = ppid_of(pid) {
@@ -766,7 +783,16 @@ struct ForeignWorker {
 
 /// The session id (slug) a process holds open: `~/.gray/sessions/<id>.open`
 /// is flock-held for the session's life, so it shows up under /proc/<pid>/fd.
-fn session_of_pid(pid: u64) -> Option<String> {
+/// Owning session of a process tree: the exported GRAY_SESSION_ID marker
+/// first (the root session the tree belongs to), then the process's own
+/// held session via `own_session_of_pid` for pre-env spawns.
+pub(crate) fn session_of_pid(pid: u64) -> Option<String> {
+    env_value(pid, "GRAY_SESSION_ID").or_else(|| own_session_of_pid(pid))
+}
+
+/// The session id a process holds open itself: `~/.gray/sessions/<id>.open`
+/// is flock-held for the session's life, so it shows up under /proc/<pid>/fd.
+fn own_session_of_pid(pid: u64) -> Option<String> {
     for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.flatten() {
         let Ok(target) = std::fs::read_link(entry.path()) else {
             continue;
@@ -964,7 +990,7 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>) -> Vec<ForeignWorker> 
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "?".into());
-        let session = session_of_pid(pid);
+        let session = own_session_of_pid(pid).or_else(|| env_value(pid, "GRAY_SESSION_ID"));
         let name = env_value(pid, "GRAY_AGENT_NAME")
             .or_else(|| session.clone())
             .unwrap_or_else(|| format!("worker-{pid}"));
@@ -986,6 +1012,74 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>) -> Vec<ForeignWorker> 
             model,
             activity,
         });
+    }
+    // Self-registered `gray -p` workers: the host writes
+    // ~/.gray/running/<pid>.json on startup (removed on exit), so a worker
+    // that never went through a spawn tool is discoverable without argv
+    // archaeology. The record's own metadata beats scraping; rows for
+    // dead pids are stale (kill -9) and drop on the liveness check.
+    if let Ok(dir) = home()
+        .map(|h| h.join("running"))
+        .and_then(|d| std::fs::read_dir(d).map_err(|e| e.into()))
+    {
+        for entry in dir.flatten() {
+            let Ok(raw) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(row) = serde_json::from_slice::<Value>(&raw) else {
+                continue;
+            };
+            let Some(pid) = row["pid"].as_u64() else {
+                continue;
+            };
+            if pid == self_pid
+                || managed.contains(&pid)
+                || workers.iter().any(|w| w.pid == pid)
+                || !std::path::Path::new(&format!("/proc/{pid}")).exists()
+                || !visible_in_session(pid)
+            {
+                continue;
+            }
+            let session = row["session"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| row["owner"].as_str().filter(|s| !s.is_empty()))
+                .map(str::to_string);
+            let elapsed = row["started"]
+                .as_f64()
+                .map(|t| {
+                    (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0)
+                        - t)
+                        .max(0.0)
+                })
+                .unwrap_or(0.0);
+            let cwd_base = row["cwd"]
+                .as_str()
+                .and_then(|c| c.rsplit('/').next())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("?")
+                .to_string();
+            workers.push(ForeignWorker {
+                pid,
+                name: row["name"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("worker-{pid}")),
+                task: row["task"].as_str().unwrap_or_default().to_string(),
+                elapsed,
+                cwd_base,
+                model: row["model"].as_str().unwrap_or_default().to_string(),
+                activity: session
+                    .as_deref()
+                    .and_then(session_activity)
+                    .unwrap_or_else(|| "starting…".into()),
+                session,
+            });
+        }
     }
     workers.sort_by(|a, b| a.elapsed.total_cmp(&b.elapsed));
     workers
@@ -1031,7 +1125,7 @@ fn signal_proc_or_group(pid: u64, sig: &str) {
     }
 }
 
-fn foreign_stop(rid: &str) -> Option<Value> {
+pub(crate) fn foreign_stop(rid: &str) -> Option<Value> {
     let worker = foreign_scan(&std::collections::HashSet::new())
         .into_iter()
         .find(|w| w.name == rid || w.pid.to_string() == rid || w.session.as_deref() == Some(rid))?;
@@ -1059,7 +1153,7 @@ fn foreign_stop(rid: &str) -> Option<Value> {
 
 const EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-fn check_effort(effort: &str) -> Result<String> {
+pub(crate) fn check_effort(effort: &str) -> Result<String> {
     let value = effort.trim().to_lowercase();
     anyhow::ensure!(
         EFFORTS.contains(&value.as_str()),
@@ -1073,7 +1167,7 @@ fn check_effort(effort: &str) -> Result<String> {
 /// (case-insensitive) id, then unique prefix, then unique substring.
 /// Unknown specs fail with up to 4 catalog candidates. No catalog → pass
 /// through and let the child validate.
-fn resolve_model(spec: &str) -> Result<String> {
+pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     let spec = spec.trim();
     anyhow::ensure!(
         !spec.is_empty() && spec.len() <= 256 && !spec.contains('\0'),
@@ -1123,7 +1217,7 @@ fn resolve_model(spec: &str) -> Result<String> {
     anyhow::bail!("unknown model '{spec}' — did you mean: {}", hits.join(", "));
 }
 
-const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--tools CAPS] [--approve CAPS] [--isolation worktree] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL [--effort LEVEL]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort override profile frontmatter and the global setting; profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. A run that times out reports partial output and stays steerable. Children cannot spawn subagents. Runs are detached — they keep going if this session ends. Do not invent subagent tools.";
+const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--tools CAPS] [--approve CAPS] [--isolation worktree] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL [--effort LEVEL]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort override profile frontmatter and the global setting; profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. A run that times out reports partial output and stays steerable. Children cannot spawn subagents. Runs are detached — they keep going if this session ends. The rlm_spawn/rlm_collect/rlm_send/rlm_delete/rlm_progress_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
 
 /// JSON rows for the host's agents panel: the same entries the text menu
 /// numbers, plus the session/target fields its actions need.
@@ -1148,7 +1242,11 @@ fn entries_json(all: bool) -> Result<Value> {
                 "task": e.row.description,
                 "icon": state_icon(&e.row.state),
                 "status": e.status,
-                "stats": e.row.stats,
+                "stats": if e.row.model.is_empty() {
+                    e.row.stats.clone()
+                } else {
+                    format!("{} · {}", e.row.stats, e.row.model)
+                },
                 "activity": activity,
                 "session": e.session,
                 "target": e.target,
@@ -1276,11 +1374,36 @@ fn sidecar() -> Result<()> {
         if req.get("id").is_none() {
             continue;
         }
+        // Folded-in gray-rlm surface: rlm_* tools and /rlm command.
+        if req["method"].as_str() == Some("tool/call")
+            && rlm::is_rlm_tool(req["params"]["name"].as_str().unwrap_or(""))
+        {
+            let (result, frames) = rlm::handle_tool(&req["params"]);
+            for f in frames {
+                println!("{f}");
+            }
+            println!("{}", json!({"id": req["id"], "result": result}));
+            io::stdout().flush()?;
+            continue;
+        }
+        if req["method"].as_str() == Some("command/run")
+            && matches!(req["params"]["name"].as_str(), Some("/rlm") | Some("rlm"))
+        {
+            let text = rlm::command(&req["params"]);
+            println!("{}", json!({"id": req["id"], "result": {"text": text}}));
+            io::stdout().flush()?;
+            continue;
+        }
         // Folded-in gray-narrow surface: its hooks/tools/commands go straight
         // to the narrow module's own dispatcher (it emits a full reply).
-        if matches!(req["method"].as_str(), Some("tool/before") | Some("tool/call"))
-            || (req["method"].as_str() == Some("command/run")
-                && matches!(req["params"]["name"].as_str(), Some("/narrow") | Some("narrow")))
+        if matches!(
+            req["method"].as_str(),
+            Some("tool/before") | Some("tool/call")
+        ) || (req["method"].as_str() == Some("command/run")
+            && matches!(
+                req["params"]["name"].as_str(),
+                Some("/narrow") | Some("narrow")
+            ))
         {
             let (reply, _) = narrow::handle_narrow(&req);
             if let Some(reply) = reply {
@@ -1306,7 +1429,10 @@ fn sidecar() -> Result<()> {
                     let nreq = json!({"id":0,"method":"prompt/context","params":req["params"]});
                     if let (Some(r), _) = narrow::handle_narrow(&nreq) {
                         if let Some(t) = r.pointer("/result/text").and_then(Value::as_str) {
-                            if !t.is_empty() { text.push_str("\n"); text.push_str(t); }
+                            if !t.is_empty() {
+                                text.push_str("\n");
+                                text.push_str(t);
+                            }
                         }
                     }
                     Ok(json!({"text":text}))
@@ -1371,12 +1497,26 @@ fn main() -> Result<()> {
     if argv.len() > 1 && argv[1] == "sidecar" {
         return sidecar();
     }
+    if argv.len() > 1 && argv[1] == "rlm" {
+        println!("{}", rlm::cli(&argv[2..].to_vec()));
+        return Ok(());
+    }
     if argv.len() > 1 && (argv[1] == "narrow" || argv[1] == "plan") {
-        let args = if argv[1] == "narrow" { argv[2..].to_vec() } else { argv[1..].to_vec() };
+        let args = if argv[1] == "narrow" {
+            argv[2..].to_vec()
+        } else {
+            argv[1..].to_vec()
+        };
         return match narrow::narrow_cli(args) {
-            Ok(s) => { println!("{s}"); Ok(()) }
+            Ok(s) => {
+                println!("{s}");
+                Ok(())
+            }
             Err(e) if e == "__sidecar" => sidecar(),
-            Err(e) => { eprintln!("{e}"); std::process::exit(2); }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
         };
     }
     let cli = match Cli::try_parse_from(preprocess(argv)) {
