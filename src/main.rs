@@ -11,6 +11,7 @@ mod narrow;
 pub mod narrow_lib;
 #[path = "mods/rlm.rs"]
 mod rlm;
+mod model_catalog;
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
@@ -34,6 +35,10 @@ enum Action {
         model: Option<String>,
         #[arg(long)]
         effort: Option<String>,
+        /// Context ceiling for children, exported as GRAY_COMPACT_AT
+        /// ("90k", "300k", "1m", or "auto").
+        #[arg(long)]
+        context: Option<String>,
         #[arg(long)]
         max_running: Option<u32>,
     },
@@ -47,6 +52,10 @@ enum Action {
         model: Option<String>,
         #[arg(long)]
         effort: Option<String>,
+        /// Context ceiling for this child (GRAY_COMPACT_AT): "90k", "300k",
+        /// "1m", or "auto". Above 200k a Claude model takes its [1m] route.
+        #[arg(long)]
+        context: Option<String>,
         #[arg(long)]
         name: Option<String>,
         /// Capability allowlist for the child (gray-narrow), e.g.
@@ -109,6 +118,9 @@ enum Action {
     Widget {
         #[arg(long)]
         demo: bool,
+        /// Skip the first N agent rows when rendering the band (paging).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
     Manifest,
 }
@@ -118,7 +130,12 @@ pub(crate) fn home() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".gray")))
         .context("cannot resolve Gray home")
 }
-fn settings(model: Option<String>, cap: Option<u32>, effort: Option<String>) -> Result<Value> {
+fn settings(
+    model: Option<String>,
+    cap: Option<u32>,
+    effort: Option<String>,
+    context: Option<String>,
+) -> Result<Value> {
     let path = home()?.join("subagents/settings.json");
     let mut value: Value = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -126,13 +143,16 @@ fn settings(model: Option<String>, cap: Option<u32>, effort: Option<String>) -> 
         Err(e) => return Err(e.into()),
     };
     anyhow::ensure!(value.is_object(), "settings must be an object");
-    let changed = model.is_some() || cap.is_some() || effort.is_some();
+    let changed = model.is_some() || cap.is_some() || effort.is_some() || context.is_some();
     if let Some(model) = model {
         let model = resolve_model(&model)?;
         value["model"] = json!(model);
     }
     if let Some(effort) = effort {
         value["effort"] = json!(check_effort(&effort)?);
+    }
+    if let Some(context) = context {
+        value["context"] = json!(check_context(&context)?);
     }
     if let Some(cap) = cap {
         anyhow::ensure!((1..=32).contains(&cap), "max-running must be 1–32");
@@ -155,7 +175,7 @@ pub(crate) fn backend(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<Value> {
-    let cfg = settings(None, None, None)?;
+    let cfg = settings(None, None, None, None)?;
     let script = concat!(
         "import sys,json\nns={'__name__':'gray_subagents_backend','__file__':sys.argv[3]}\nexec(sys.argv[1],ns)\nargs=json.loads(sys.argv[2])\naction=sys.argv[4]\n",
         "if action=='run': result=ns['spawn_jobs'](args,args.get('session') or {'cwd':__import__('os').getcwd()})\n",
@@ -164,6 +184,7 @@ pub(crate) fn backend(
         "elif action=='stop': result=ns['stop_job'](args.get('run_id'),(args.get('session') or {}).get('id',''))\n",
         "elif action=='steer': result=ns['steer_job'](args['run_id'],args['message'])\n",
         "elif action=='context': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''))}\n",
+        "elif action=='notices': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''),False)}\n",
         "elif action=='setup': result={'content':ns['setup_profiles']()}\n",
         "elif action=='list': result=ns['list_profiles']()\n",
         "print(json.dumps(result))\n"
@@ -205,6 +226,9 @@ pub(crate) fn backend(
     if let Some(effort) = effort.or(cfg["effort"].as_str()) {
         cmd.env("GRAY_THINKING_EFFORT", effort);
     }
+    if let Some(context) = cfg["context"].as_str() {
+        cmd.env("GRAY_COMPACT_AT", context);
+    }
     if let Some(bin) = std::env::var_os("GRAY_BIN") {
         cmd.env("GRAY_SUBAGENTS_BIN", bin);
     }
@@ -242,7 +266,7 @@ fn manifest() -> Value {
     m["tools"] = json!(tools);
     m
 }
-fn widget(demo: bool) -> Result<Value> {
+fn widget(demo: bool, offset: usize) -> Result<Value> {
     let mut rows = Vec::new();
     if demo {
         rows.push(AgentRow {
@@ -271,7 +295,7 @@ fn widget(demo: bool) -> Result<Value> {
             .map(|entry| entry.row)
             .collect();
     }
-    let (text, ranges) = render_widget_spans(&rows);
+    let (text, ranges) = render_widget_spans(&rows, offset);
     // `shimmer_lines` stays for hosts that predate `shimmer_ranges`.
     let mut shimmer: Vec<usize> = ranges.iter().map(|r| r.0).collect();
     shimmer.dedup();
@@ -332,6 +356,9 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
         for job in jobs {
             let status = job["status"].as_str().unwrap_or("lost");
             let active = matches!(status, "running" | "stopping");
+            // A queued run holds no slot and has no `finished` stamp yet, so it
+            // is live for the stale-row filter as well.
+            let live = active || status == "queued";
             if active
                 && let Some(pid) = job["child_pid"].as_u64()
                 && match job["child_birth"].as_str() {
@@ -358,7 +385,7 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
             }
             // The widget fades finished runs quickly; the menu keeps them
             // selectable (that's where `open`/`chat` act on them).
-            if !include_stale && !active && now - job["finished"].as_f64().unwrap_or(0.0) > 30.0 {
+            if !include_stale && !live && now - job["finished"].as_f64().unwrap_or(0.0) > 30.0 {
                 continue;
             }
             let state = match status {
@@ -367,15 +394,19 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                         "stopping…".into()
                     } else {
                         // The child's own transcript says `$ ls src`; the
-                        // registry only knows the bare tool name.
+                        // registry only knows the bare tool name. Rows
+                        // show the command — the `$ ` prompt marker stays
+                        // in the record, not the UI.
                         let a = job["child_session"]
                             .as_str()
                             .filter(|s| !s.is_empty())
                             .and_then(session_activity)
                             .unwrap_or_else(|| job["activity"].as_str().unwrap_or("").into());
-                        if a.is_empty() { "working…".into() } else { a }
+                        let a = a.strip_prefix("$ ").unwrap_or(&a);
+                        if a.is_empty() { "working…".into() } else { a.into() }
                     },
                 },
+                "queued" => AgentState::Queued,
                 "completed" => AgentState::Completed,
                 "stopped" => AgentState::Stopped,
                 _ => AgentState::Failed {
@@ -394,9 +425,9 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                             .as_str()
                             .unwrap_or("")
                             .chars()
-                            .take(88)
+                            .take(160)
                             .collect();
-                        if job["task"].as_str().unwrap_or("").chars().count() > 88 {
+                        if job["task"].as_str().unwrap_or("").chars().count() > 160 {
                             format!("{t}…")
                         } else {
                             t
@@ -407,7 +438,22 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                             - job["created"].as_f64().unwrap_or(now))
                         .max(0.0),
                     ),
-                    model: pretty_model(job["model"].as_str().unwrap_or("")),
+                    model: {
+                        let mut m = pretty_model(job["model"].as_str().unwrap_or(""));
+                        for part in [
+                            job["effort"].as_str().unwrap_or("").to_string(),
+                            job["context"]
+                                .as_str()
+                                .filter(|c| !c.is_empty())
+                                .map(|c| format!("ctx {c}"))
+                                .unwrap_or_default(),
+                        ] {
+                            if !part.is_empty() {
+                                m.push_str(&format!(" · {part}"));
+                            }
+                        }
+                        m
+                    },
                     result: job["result"].as_str().unwrap_or("").into(),
                     state,
                 },
@@ -431,7 +477,7 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                 description: if w.task.is_empty() {
                     "gray -p".into()
                 } else {
-                    w.task.chars().take(80).collect()
+                    w.task.chars().take(160).collect()
                 },
                 model: pretty_model(&w.model),
                 result: String::new(),
@@ -453,11 +499,12 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
     Ok(entries)
 }
 
-/// Menu display order mirrors the widget's compact grouping — finished
-/// runs first, then running — so a number seen on the menu selects the
-/// same row the user just watched in the header.
+/// Display order for the menu and the Agents panel: live work first —
+/// running/queued rows you check on — then finished ones; each group
+/// newest-first. Menu numbers follow this order.
 pub(crate) fn menu_order(mut entries: Vec<Entry>) -> Vec<Entry> {
-    entries.sort_by_key(|e| matches!(e.row.state, AgentState::Running { .. } | AgentState::Queued));
+    let live = |e: &Entry| matches!(e.row.state, AgentState::Running { .. } | AgentState::Queued);
+    entries.sort_by(|a, b| live(b).cmp(&live(a)).then(b.created.total_cmp(&a.created)));
     entries
 }
 
@@ -552,7 +599,7 @@ fn session_file(session: &str) -> Option<PathBuf> {
 fn open_card(name: &str, status: &str, session: &str, managed: bool) -> Value {
     let head = format!("⬢ {name} — {status}");
     let mut hints: Vec<String> = Vec::new();
-    if matches!(status, "running" | "stopping") {
+    if matches!(status, "running" | "stopping" | "queued") {
         if managed {
             hints.push(format!(
                 "chat {name} 'msg' — queue a follow-up · view {name} — transcript · stop {name}"
@@ -1153,6 +1200,29 @@ pub(crate) fn foreign_stop(rid: &str) -> Option<Value> {
 
 const EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// A context ceiling as GRAY_COMPACT_AT takes it: "auto", or a token count
+/// like "90k" / "300k" / "1.5m" / "90000" — normalized to lowercase. The
+/// supervisor twin is `clean_context` in mod; both must agree.
+pub(crate) fn check_context(value: &str) -> Result<String> {
+    let v = value.trim().to_lowercase();
+    if v == "auto" {
+        return Ok(v);
+    }
+    let digits = v.strip_suffix(['k', 'm']).unwrap_or(&v);
+    let mut parts = digits.split('.');
+    let number = matches!(parts.next(), Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && parts
+            .next()
+            .map_or(true, |p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().is_none();
+    let positive = digits.parse::<f64>().is_ok_and(|n| n > 0.0);
+    anyhow::ensure!(
+        number && positive,
+        "context must be 'auto' or a token count like 90k, 300k, 1m"
+    );
+    Ok(v)
+}
+
 pub(crate) fn check_effort(effort: &str) -> Result<String> {
     let value = effort.trim().to_lowercase();
     anyhow::ensure!(
@@ -1163,61 +1233,13 @@ pub(crate) fn check_effort(effort: &str) -> Result<String> {
     Ok(value)
 }
 
-/// Resolve a `--model` value against $GRAY_HOME/models.json: exact
-/// (case-insensitive) id, then unique prefix, then unique substring.
-/// Unknown specs fail with up to 4 catalog candidates. No catalog → pass
-/// through and let the child validate.
+/// Resolve a `--model` value against the caches under $GRAY_HOME; the rules
+/// live in `model_catalog::resolve_model` (shared with the `mod` supervisor).
 pub(crate) fn resolve_model(spec: &str) -> Result<String> {
-    let spec = spec.trim();
-    anyhow::ensure!(
-        !spec.is_empty() && spec.len() <= 256 && !spec.contains('\0'),
-        "model must be a 1-256 character string"
-    );
-    let Ok(raw) = std::fs::read(home()?.join("models.json")) else {
-        return Ok(spec.to_string());
-    };
-    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&raw) else {
-        return Ok(spec.to_string());
-    };
-    let low = spec.to_lowercase();
-    for id in map.keys() {
-        if id.to_lowercase() == low {
-            return Ok(id.clone());
-        }
-    }
-    let prefixed: Vec<&String> = map
-        .keys()
-        .filter(|k| k.to_lowercase().starts_with(&low))
-        .collect();
-    if prefixed.len() == 1 {
-        return Ok(prefixed[0].clone());
-    }
-    let mut hits: Vec<String> = if prefixed.is_empty() {
-        map.keys()
-            .filter(|k| k.to_lowercase().contains(&low))
-            .cloned()
-            .collect()
-    } else {
-        prefixed.into_iter().cloned().collect()
-    };
-    if hits.len() == 1 {
-        return Ok(hits.remove(0));
-    }
-    hits.sort();
-    hits.truncate(4);
-    if hits.is_empty() {
-        // Provider-qualified specs (plugin providers e.g.
-        // `devin-subscription/swe-2`) are absent from the API-model
-        // catalog: pass through and let the child validate the provider.
-        if spec.contains('/') {
-            return Ok(spec.to_string());
-        }
-        anyhow::bail!("unknown model '{spec}' — no match in the model catalog");
-    }
-    anyhow::bail!("unknown model '{spec}' — did you mean: {}", hits.join(", "));
+    model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--tools CAPS] [--approve CAPS] [--isolation worktree] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL [--effort LEVEL]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort override profile frontmatter and the global setting; profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. A run that times out reports partial output and stays steerable. Children cannot spawn subagents. Runs are detached — they keep going if this session ends. The rlm_spawn/rlm_collect/rlm_send/rlm_delete/rlm_progress_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
+const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL [--effort LEVEL] [--context CTX]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. Runs are detached — they keep going if this session ends. The rlm_spawn/rlm_collect/rlm_send/rlm_delete/rlm_progress_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
 
 /// JSON rows for the host's agents panel: the same entries the text menu
 /// numbers, plus the session/target fields its actions need.
@@ -1265,14 +1287,16 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
         Action::Settings {
             model,
             effort,
+            context,
             max_running,
-        } => settings(model, max_running, effort),
+        } => settings(model, max_running, effort, context),
         Action::Setup => backend("setup", json!({}), None, None),
         Action::Run {
             task,
             agent,
             model,
             effort,
+            context,
             name,
             tools,
             approve,
@@ -1294,6 +1318,9 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             }
             if let Some(effort) = effort {
                 args["effort"] = json!(check_effort(&effort)?);
+            }
+            if let Some(context) = context {
+                args["context"] = json!(check_context(&context)?);
             }
             if let Some(name) = name {
                 args["name"] = json!(name);
@@ -1318,7 +1345,21 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
         Action::Status {
             run_id: None,
             all: false,
-        } => menu(),
+        } => {
+            let mut v = menu()?;
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let notices = backend("notices", json!({"cwd": cwd}), None, None)
+                .ok()
+                .and_then(|n| n["text"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            if !notices.is_empty() {
+                let c = v["content"].as_str().unwrap_or_default().to_string();
+                v["content"] = json!(format!("{notices}\n\n{c}"));
+            }
+            Ok(v)
+        }
         Action::Status { run_id, .. } => backend(
             "status",
             json!({"run_id": run_id.map(|t| menu_target(&t))}),
@@ -1352,7 +1393,7 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             }
         }
         Action::List => backend("list", json!({}), None, None),
-        Action::Widget { demo } => widget(demo),
+        Action::Widget { demo, offset } => widget(demo, offset),
         Action::Manifest => Ok(manifest()),
     }
 }
@@ -1488,6 +1529,22 @@ fn preprocess(mut argv: Vec<String>) -> Vec<String> {
     argv
 }
 
+#[cfg(test)]
+mod tests {
+    use super::check_context;
+
+    #[test]
+    fn context_parses_like_the_python_twin() {
+        for ok in ["auto", "AUTO", "90k", "90K", "300k", "1m", "1.5m", "90000", "0.5m"] {
+            assert!(check_context(ok).is_ok(), "{ok:?}");
+        }
+        assert_eq!(check_context(" 90K ").unwrap(), "90k");
+        for bad in ["", " ", "ctx", "90kk", "1.5x", "0", "-5", "1e5", ".5k", "1.2.3m"] {
+            assert!(check_context(bad).is_err(), "{bad:?}");
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     // Folded-in gray-narrow argv surface:
@@ -1536,5 +1593,60 @@ fn main() -> Result<()> {
         Ok(())
     } else {
         sidecar()
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    /// gray headlines each tool with its declared label and only humanizes the
+    /// wire name when none is set, so every folded-in tool must declare one.
+    #[test]
+    fn every_folded_tool_has_a_clean_label() {
+        let m = manifest();
+        let tools = m["tools"].as_array().expect("manifest tools");
+        assert!(!tools.is_empty());
+        for t in tools {
+            let name = t["name"].as_str().unwrap_or("?");
+            let label = t["label"].as_str().unwrap_or("").trim();
+            assert!(!label.is_empty(), "tool {name} declares no label");
+            assert!(!label.contains('_'), "tool {name} label {label:?} is a wire name");
+        }
+    }
+
+    /// A {field} or {a.b|filter} placeholder renders empty when the field is not
+    /// a call arg, so every head path must be a declared parameter of the tool.
+    #[test]
+    fn every_folded_tool_preview_references_declared_params() {
+        let m = manifest();
+        for t in m["tools"].as_array().expect("manifest tools") {
+            let name = t["name"].as_str().unwrap_or("?");
+            let Some(preview) = t["preview"].as_str() else {
+                continue;
+            };
+            let props = &t["parameters"]["properties"];
+            let mut rest = preview;
+            while let Some(open) = rest.find('{') {
+                let Some(rel) = rest[open + 1..].find('}') else {
+                    break;
+                };
+                let head = rest[open + 1..open + 1 + rel]
+                    .split('|')
+                    .next()
+                    .unwrap_or("")
+                    .split('.')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !head.is_empty() {
+                    assert!(
+                        props.get(head).is_some(),
+                        "tool {name} preview references undeclared param {head:?}"
+                    );
+                }
+                rest = &rest[open + 1 + rel + 1..];
+            }
+        }
     }
 }

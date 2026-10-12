@@ -40,7 +40,11 @@ if mode == "empty":
 payload = {"prompt": prompt, "cwd": os.getcwd(), "resume": resume,
            "model": os.environ.get("GRAY_MODEL"),
            "effort": os.environ.get("GRAY_THINKING_EFFORT"),
-           "active": os.environ.get("GRAY_SUBAGENTS_ACTIVE")}
+           "active": os.environ.get("GRAY_SUBAGENTS_ACTIVE"),
+           "compact_at": os.environ.get("GRAY_COMPACT_AT"),
+           "provider": os.environ.get("GRAY_PROVIDER_ID"),
+           "auth": os.environ.get("GRAY_AUTH_REF"),
+           "base_url": os.environ.get("GRAY_BASE_URL")}
 if json_mode:
     print(json.dumps({"protocol": 1, "session_id": SID, "type": "progress",
                       "phase": "tool_ran", "tool": "bash", "label": "Bash",

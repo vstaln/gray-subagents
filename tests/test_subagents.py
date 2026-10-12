@@ -3,7 +3,9 @@
 Persistent sidecars mirror the host. Detached supervisors own children; tests
 also exercise shutdown, a fresh observer, and concurrent sidecar instances.
 """
-import json, os, pathlib, select, signal, subprocess, tempfile, time, unittest
+import json, os, pathlib, re, select, signal, subprocess, tempfile, time, unittest
+import importlib.machinery, importlib.util
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 MOD = REPO / "mod"
@@ -55,6 +57,12 @@ class SidecarCase(unittest.TestCase):
             GRAY_SUBAGENTS_TIMEOUT_SECS="6",
             GRAY_SUBAGENTS_MAX_RUNNING="2",
         )
+        # The suite itself may run inside a subagent or a live session: the
+        # recursion guard and the caller's per-run model/effort/session env
+        # must not leak into spawned test runs (the tests assert defaults).
+        for key in ("GRAY_SUBAGENTS_ACTIVE", "GRAY_MODEL", "GRAY_THINKING_EFFORT",
+                    "GRAY_SESSION_ID", "GRAY_NARROW_GRANT", "GRAY_SUBAGENTS_MAX_REQUESTS"):
+            self.env.pop(key, None)
         self.sc = Sidecar(self.env)
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(self.sc.close)
@@ -65,11 +73,11 @@ class SidecarCase(unittest.TestCase):
         try:
             reply = with_sc.call("subagents_status", {})
             for job in reply.get("jobs", []):
-                if job["status"] in ("running", "stopping"):
+                if job["status"] in ("running", "stopping", "queued"):
                     with_sc.call("subagents_stop", {"run_id": job["run_id"]})
                     for _ in range(150):
                         st = with_sc.call("subagents_status", {"run_id": job["run_id"]})
-                        if st.get("status") not in ("running", "stopping"):
+                        if st.get("status") not in ("running", "stopping", "queued"):
                             break
                         time.sleep(.02)
         finally:
@@ -83,12 +91,36 @@ class SidecarCase(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"run {rid} never reached {want}: {st}")
 
-    def spawn(self, task="do work", agent="scout", env_extra=None):
+    def spawn(self, task="do work", agent="scout", env_extra=None, args_extra=None, cwd=None):
         env = dict(self.env)
         env.update(env_extra or {})
         proc = Sidecar(env)
         self.addCleanup(proc.close)
-        return proc.call("subagent", {"agent": agent, "task": task})
+        args = {"agent": agent, "task": task}
+        args.update(args_extra or {})
+        params = {"name": "subagent", "args": args}
+        if cwd is not None:
+            params["session"] = {"cwd": str(cwd)}
+        reply = proc.rpc("tool/call", params)
+        assert "result" in reply, reply
+        result = reply["result"]
+        assert isinstance(result.get("content"), str), result
+        return result
+
+    def git_repo(self):
+        repo = pathlib.Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        (repo / "seed.txt").write_text("seed\n")
+        for argv in (["git", "init", "-q"],
+                     ["git", "config", "user.email", "test@example.com"],
+                     ["git", "config", "user.name", "test"],
+                     ["git", "add", "seed.txt"],
+                     ["git", "commit", "-qm", "seed"]):
+            subprocess.run(argv, cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def worktree_path(self, rid):
+        return self.home / "subagents" / "worktrees" / rid
 
     # -- manifest ------------------------------------------------------------
     def test_manifest_declares_tools_command_and_hook(self):
@@ -129,18 +161,264 @@ class SidecarCase(unittest.TestCase):
         self.assertTrue(r.get("is_error"))
         self.assertIn("recursion", r["content"].lower())
 
-    def test_running_cap_rejects_jobs_over_limit(self):
-        env = dict(FAKE_MODE="slow", FAKE_SLEEP="20", GRAY_SUBAGENTS_MAX_RUNNING="2")
-        ids = [self.spawn(task=f"t{i}", env_extra=env)["run_id"] for i in range(2)]
+    def read_record(self, rid):
+        return json.loads((self.run_dir / f"{rid}.json").read_text(encoding="utf-8"))
+
+    def test_running_cap_queues_fifo_and_starts_as_slots_free(self):
+        env = dict(FAKE_MODE="slow", FAKE_SLEEP="20", GRAY_SUBAGENTS_TIMEOUT_SECS="60")
+        busy = [self.spawn(task=f"busy{i}", env_extra=env)["run_id"] for i in range(2)]
+        first = self.spawn(task="third", env_extra=env)
+        self.assertNotIn("is_error", first)
+        self.assertIn("queued (cap 2; 0 ahead)", first["content"])
+        second = self.spawn(task="fourth", env_extra=env)
+        self.assertIn("queued (cap 2; 1 ahead)", second["content"])
+        q1, q2 = first["run_id"], second["run_id"]
         try:
-            for i in ids:
-                self.assertTrue((self.run_dir / f"{i}.json").exists())
-            r = self.spawn(task="third", env_extra=env)
-            self.assertTrue(r.get("is_error"))
-            self.assertIn("running", r["content"])
+            self.assertEqual(self.sc.call("subagents_status", {"run_id": q1})["status"], "queued")
+            self.assertNotIn("child_pid", self.read_record(q1))
+            self.sc.call("subagents_stop", {"run_id": busy[0]})
+            self.wait_status(q1, "running")  # the oldest queued run takes the freed slot
+            self.assertEqual(self.sc.call("subagents_status", {"run_id": q2})["status"], "queued")
         finally:
-            for i in ids:
-                self.sc.call("subagents_stop", {"run_id": i})
+            for rid in busy + [q1, q2]:
+                self.sc.call("subagents_stop", {"run_id": rid})
+
+    def test_stop_cancels_a_queued_run_without_launching_it(self):
+        env = dict(FAKE_MODE="slow", FAKE_SLEEP="20", GRAY_SUBAGENTS_TIMEOUT_SECS="60")
+        busy = [self.spawn(task=f"busy{i}", env_extra=env)["run_id"] for i in range(2)]
+        waiting = self.spawn(task="never", env_extra=env)["run_id"]
+        try:
+            self.assertEqual(self.sc.call("subagents_status", {"run_id": waiting})["status"], "queued")
+            self.assertNotIn("is_error", self.sc.call("subagents_stop", {"run_id": waiting}))
+            st = self.sc.call("subagents_status", {"run_id": waiting})
+            self.assertEqual(st["status"], "stopped")
+            self.assertIn("cancelled before start", st["error"])
+            self.assertNotIn("child_pid", self.read_record(waiting))
+        finally:
+            for rid in busy:
+                self.sc.call("subagents_stop", {"run_id": rid})
+
+    def test_batch_items_accept_prompt_as_task(self):
+        r = self.sc.call("subagent", {"tasks": [{"prompt": "alpha work"},
+                                                {"prompt": "beta work", "agent": "oracle"}]})
+        self.assertNotIn("is_error", r)
+        prompts = [json.loads(self.wait_status(rid, "completed")["result"])["prompt"]
+                   for rid in r["run_ids"]]
+        self.assertTrue(any("alpha work" in p for p in prompts), prompts)
+        self.assertTrue(any("beta work" in p for p in prompts), prompts)
+
+    def test_batch_error_names_the_item_and_its_keys(self):
+        bad = self.sc.call("subagent", {"tasks": [{"prompt": "fine"},
+                                                  {"agent": "scout", "note": "no task here"}]})
+        self.assertTrue(bad["is_error"])
+        self.assertIn("tasks[1]", bad["content"])
+        self.assertIn("item keys: agent, note", bad["content"])
+        self.assertEqual(self.sc.call("subagents_status", {})["jobs"], [])
+
+    def write_caches(self, listings=None, provider_cache=None, config=None):
+        self.home.mkdir(parents=True, exist_ok=True)
+        for name, data in (("provider_models.json", listings), ("config.json", config)):
+            if data is not None:
+                (self.home / name).write_text(json.dumps(data), encoding="utf-8")
+        if provider_cache is not None:
+            (self.home / "plugins").mkdir(exist_ok=True)
+            (self.home / "plugins" / "provider-cache.json").write_text(
+                json.dumps(provider_cache), encoding="utf-8")
+
+    def run_model(self, model):
+        """Model the child actually received for a run with this --model."""
+        rid = self.sc.call("subagent", {"task": "go", "model": model})["run_id"]
+        return json.loads(self.wait_status(rid, "completed")["result"])["model"]
+
+    def test_family_alias_picks_newest_version_from_provider_cache(self):
+        self.write_caches(listings={"plugin:claude:claude-subscription": {"fetched_at": 1, "rows": [
+            {"id": "claude-haiku-4-5-20251001", "name": "Haiku 4.5"},
+            {"id": "claude-haiku-5-5", "name": "Haiku 5.5"},
+            {"id": "claude-haiku-5-5-medium", "name": "Haiku 5.5 medium"},
+            {"id": "haiku", "name": "Haiku"}]}})
+        self.assertEqual(self.run_model("haiku"), "claude-haiku-5-5")
+        self.assertEqual(self.run_model("claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001")
+
+    def test_exact_provider_model_id_resolves_to_its_qualified_spelling(self):
+        self.write_caches(listings={
+            "plugin:claude:claude-subscription": {"rows": [{"id": "claude-haiku-5-5"}]},
+            "plugin:devin-sub:devin-subscription": {"rows": [{"id": "swe-2"}, {"id": "claude-haiku-5-5"}]}})
+        self.assertEqual(self.run_model("devin-subscription/swe-2"), "devin-subscription/swe-2")
+        self.assertEqual(self.run_model("Claude-Haiku-5-5"), "claude-haiku-5-5")
+
+    def test_unbreakable_tie_is_an_error_listing_candidates(self):
+        self.write_caches(listings={"plugin:a:alpha-sub": {"rows": [{"id": "vendor-a/widget-2"}]},
+                                    "plugin:b:beta-sub": {"rows": [{"id": "vendor-b/widget-2"}]}})
+        bad = self.sc.call("subagent", {"task": "go", "model": "widget"})
+        self.assertTrue(bad["is_error"])
+        self.assertIn("ambiguous", bad["content"])
+        self.assertIn("vendor-a/widget-2", bad["content"])
+
+    def test_configured_provider_breaks_an_otherwise_equal_tie(self):
+        self.write_caches(listings={"plugin:a:alpha-sub": {"rows": [{"id": "vendor-a/widget-2"}]},
+                                    "plugin:b:beta-sub": {"rows": [{"id": "vendor-b/widget-2"}]}},
+                          config={"provider_id": "b:beta-sub"})
+        self.assertEqual(self.run_model("widget"), "vendor-b/widget-2")
+
+    def test_provider_cache_model_lists_join_the_catalog(self):
+        self.write_caches(provider_cache={"schema": 1, "plugins": {"acme": {"enabled": True, "providers": [
+            {"id": "acme-sub", "models": [{"id": "acme-9-1"}, "acme-9-0"]}]}}})
+        self.assertEqual(self.run_model("acme-9"), "acme-9-1")
+
+    # -- provider routing -----------------------------------------------------
+    def write_provider_home(self):
+        """lock.json + manifests + listings + config for a claude-parent home
+        where devin-subscription owns the swe-2 family."""
+        plugins = self.home / "plugins"
+        plugins.mkdir(parents=True, exist_ok=True)
+        (plugins / "lock.json").write_text(json.dumps({"schema": 1, "plugins": {
+            "devin-sub": {"enabled": True}, "claude": {"enabled": True},
+            "other-sub": {"enabled": True}, "dead-sub": {"enabled": False}}}))
+        for key, pid, name, auth in (
+                ("devin-sub", "devin-subscription", "Devin subscription", "devin-login"),
+                ("claude", "claude-subscription", "Claude subscription", "claude-login"),
+                ("other-sub", "other-subscription", "Other subscription", "other-login"),
+                ("dead-sub", "dead-subscription", "Dead subscription", "dead-login")):
+            (plugins / f"{key}-manifest.json").write_text(json.dumps({"providers": [{
+                "id": pid, "name": name,
+                "auth_methods": [{"id": auth, "kind": "api_key"}]}]}))
+        self.write_caches(
+            listings={
+                "plugin:devin-sub:devin-subscription":
+                    {"rows": [{"id": "swe-2"}, {"id": "swe-2-max"}, {"id": "duo-1"}]},
+                "plugin:claude:claude-subscription": {"rows": [{"id": "claude-haiku-5-5"}]},
+                "plugin:other-sub:other-subscription": {"rows": [{"id": "duo-1"}]},
+                "plugin:dead-sub:dead-subscription": {"rows": [{"id": "ghost-1"}]}},
+            config={"provider_id": "claude:claude-subscription",
+                    "auth_ref": "plugin:claude:claude-subscription:claude-login",
+                    "base_url": "https://127.0.0.1:1/"})
+
+    def run_payload(self, model, env_extra=None):
+        """The env fake-gray reports for a run spawned with this model spec."""
+        rid = self.spawn(task="go", env_extra=env_extra,
+                         args_extra={"model": model})["run_id"]
+        return json.loads(self.wait_status(rid, "completed")["result"])
+
+    def test_qualified_plugin_provider_routes_child_env(self):
+        self.write_provider_home()
+        r = self.spawn(task="go", args_extra={"model": "devin-subscription/swe-2"})
+        self.assertIn("→ Devin subscription · swe-2", r["content"])
+        payload = json.loads(self.wait_status(r["run_id"], "completed")["result"])
+        self.assertEqual(payload["model"], "swe-2")
+        self.assertEqual(payload["provider"], "devin-sub:devin-subscription")
+        self.assertEqual(payload["auth"],
+                         "plugin:devin-sub:devin-subscription:devin-login")
+
+    def test_provider_alias_and_named_auth_route(self):
+        self.write_provider_home()
+        payload = self.run_payload("devin/swe-2-max")
+        self.assertEqual(payload["model"], "swe-2-max")
+        self.assertEqual(payload["provider"], "devin-sub:devin-subscription")
+        self.assertEqual(payload["auth"],
+                         "plugin:devin-sub:devin-subscription:devin-login")
+        payload = self.run_payload("devin-sub:devin-subscription:devin-login/swe-2")
+        self.assertEqual(payload["model"], "swe-2")
+        self.assertEqual(payload["auth"],
+                         "plugin:devin-sub:devin-subscription:devin-login")
+
+    def test_bare_id_unique_to_one_plugin_provider_routes(self):
+        self.write_provider_home()
+        payload = self.run_payload("swe-2")
+        self.assertEqual(payload["model"], "swe-2")
+        self.assertEqual(payload["provider"], "devin-sub:devin-subscription")
+        self.assertEqual(payload["auth"],
+                         "plugin:devin-sub:devin-subscription:devin-login")
+
+    def test_same_provider_model_runs_without_override(self):
+        self.write_provider_home()
+        payload = self.run_payload("claude-haiku-5-5")
+        self.assertEqual(payload["model"], "claude-haiku-5-5")
+        self.assertIsNone(payload["provider"])
+        self.assertIsNone(payload["auth"])
+
+    def test_bare_id_ambiguous_across_providers_errors(self):
+        self.write_provider_home()
+        r = self.sc.call("subagent", {"task": "go", "model": "duo-1"})
+        self.assertTrue(r["is_error"])
+        self.assertIn("ambiguous across providers", r["content"])
+        self.assertIn("devin-subscription/duo-1", r["content"])
+        self.assertIn("other-subscription/duo-1", r["content"])
+
+    def test_disabled_provider_cannot_be_a_route(self):
+        self.write_provider_home()
+        payload = self.run_payload("ghost-1")
+        self.assertEqual(payload["model"], "ghost-1")
+        self.assertIsNone(payload["provider"])
+
+    def test_routed_run_clears_inherited_base_url(self):
+        self.write_provider_home()
+        payload = self.run_payload("devin-subscription/swe-2",
+                                   env_extra={"GRAY_BASE_URL": "https://stale.example/"})
+        self.assertIsNone(payload["base_url"])
+        self.assertEqual(payload["provider"], "devin-sub:devin-subscription")
+        payload = self.run_payload("claude-haiku-5-5",
+                                   env_extra={"GRAY_BASE_URL": "https://stale.example/"})
+        self.assertEqual(payload["base_url"], "https://stale.example/")
+
+    # -- context ceiling (GRAY_COMPACT_AT) ---------------------------------
+
+    def write_ctx_home(self):
+        """A catalog where a Claude id has a [1m] sibling route."""
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "models.json").write_text(json.dumps({"gpt-4o": {}}))
+        (self.home / "provider_models.json").write_text(json.dumps({
+            "https://api.example.test/v1": {"rows": [
+                "claude-haiku-5-5", "claude-haiku-5-5[1m]", "gpt-4o"]}}))
+
+    def ctx_payload(self, r):
+        st = self.wait_status(r["run_id"], "completed")
+        return json.loads(st["result"])
+
+    def test_context_param_reaches_child_env(self):
+        r = self.spawn(args_extra={"context": "90k"})
+        self.assertEqual(self.ctx_payload(r)["compact_at"], "90k")
+
+    def test_context_env_is_the_settings_tier(self):
+        # The settings write path exports GRAY_COMPACT_AT on the supervisor
+        # env: a spawn without the knob inherits it; an explicit value wins.
+        r = self.spawn(env_extra={"GRAY_COMPACT_AT": "300k"})
+        self.assertEqual(self.ctx_payload(r)["compact_at"], "300k")
+        r = self.spawn(env_extra={"GRAY_COMPACT_AT": "300k"},
+                       args_extra={"context": "auto"})
+        self.assertEqual(self.ctx_payload(r)["compact_at"], "auto")
+        r = self.spawn()
+        self.assertIsNone(self.ctx_payload(r)["compact_at"])
+
+    def test_context_profile_beats_env_and_param_beats_profile(self):
+        agents = self.home / "subagents" / "agents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / "ctxy.md").write_text("---\ncontext: 500k\n---\n# Ctx\n\nDo it.\n")
+        r = self.spawn(agent="ctxy", env_extra={"GRAY_COMPACT_AT": "300k"})
+        self.assertEqual(self.ctx_payload(r)["compact_at"], "500k")
+        r = self.spawn(agent="ctxy", env_extra={"GRAY_COMPACT_AT": "300k"},
+                       args_extra={"context": "90k"})
+        self.assertEqual(self.ctx_payload(r)["compact_at"], "90k")
+
+    def test_context_above_200k_on_claude_takes_the_1m_route(self):
+        self.write_ctx_home()
+        r = self.spawn(args_extra={"model": "haiku", "context": "300k"})
+        self.assertEqual(self.ctx_payload(r)["model"], "claude-haiku-5-5[1m]")
+        # Under the threshold and on non-Claude ids the model stays put.
+        r = self.spawn(args_extra={"model": "haiku", "context": "90k"})
+        self.assertEqual(self.ctx_payload(r)["model"], "claude-haiku-5-5")
+        r = self.spawn(args_extra={"model": "gpt-4o", "context": "300k"})
+        self.assertEqual(self.ctx_payload(r)["model"], "gpt-4o")
+
+    def test_context_rejects_junk(self):
+        r = self.spawn(args_extra={"context": "lots"})
+        self.assertTrue(r["is_error"])
+        self.assertIn("context", r["content"])
+
+    def test_unknown_auth_method_errors(self):
+        self.write_provider_home()
+        r = self.sc.call("subagent", {"task": "go", "model": "devin-subscription:bogus/swe-2"})
+        self.assertTrue(r["is_error"])
+        self.assertIn("unknown auth method 'bogus'", r["content"])
 
     # -- status --------------------------------------------------------------
     def test_status_lists_all_jobs_most_recent_first(self):
@@ -466,6 +744,172 @@ class SidecarCase(unittest.TestCase):
         payload = json.loads(st["result"])
         self.assertEqual(payload["model"], "vendor/leg")
         self.assertEqual(payload["effort"], "low")
+
+    # -- timeout policy -------------------------------------------------------
+    def test_no_timeout_by_default(self):
+        env = dict(self.env)
+        env.pop("GRAY_SUBAGENTS_TIMEOUT_SECS", None)
+        env.update(FAKE_MODE="slow", FAKE_SLEEP="0.5")
+        runner = Sidecar(env)
+        self.addCleanup(runner.close)
+        rid = runner.call("subagent", {"agent": "scout", "task": "uncapped"})["run_id"]
+        job = json.loads((self.run_dir / f"{rid}.json").read_text())
+        self.assertIsNone(job["timeout"])
+        self.wait_status(rid, "completed")
+
+    def test_explicit_timeout_arg_is_enforced(self):
+        rid = self.spawn(task="hang", env_extra={"FAKE_MODE": "slow", "FAKE_SLEEP": "30"},
+                         args_extra={"timeout": 1})["run_id"]
+        st = self.wait_status(rid, "timeout", tries=200)
+        self.assertIn("timed out", st["error"])
+
+    def test_invalid_timeout_arg_is_tool_error(self):
+        for bad in (0, -1, 86401, "soon", True):
+            with self.subTest(timeout=bad):
+                r = self.spawn(task="x", args_extra={"timeout": bad})
+                self.assertTrue(r.get("is_error"))
+                self.assertIn("timeout", r["content"])
+
+    # -- worktree cleanup ------------------------------------------------------
+    def test_timed_out_run_keeps_clean_worktree(self):
+        repo = self.git_repo()
+        # chatty reports its session id before hanging, so the run is resumable.
+        rid = self.spawn(task="hang", env_extra={"FAKE_MODE": "chatty", "FAKE_SLEEP": "30"},
+                         args_extra={"isolation": "worktree", "timeout": 1},
+                         cwd=repo)["run_id"]
+        st = self.wait_status(rid, "timeout", tries=200)
+        self.assertTrue(self.worktree_path(rid).is_dir())
+        self.assertIn("worktree kept", st["content"])
+        self.assertIn("steer", st["content"])
+
+    def test_failed_run_keeps_clean_worktree(self):
+        repo = self.git_repo()
+        rid = self.spawn(task="boom", env_extra={"FAKE_MODE": "fail"},
+                         args_extra={"isolation": "worktree"}, cwd=repo)["run_id"]
+        st = self.wait_status(rid, "failed")
+        self.assertTrue(self.worktree_path(rid).is_dir())
+        self.assertIn("worktree kept", st["content"])
+
+    def test_successful_run_removes_clean_worktree(self):
+        repo = self.git_repo()
+        rid = self.spawn(task="clean run", args_extra={"isolation": "worktree"},
+                         cwd=repo)["run_id"]
+        st = self.wait_status(rid, "completed")
+        self.assertFalse(self.worktree_path(rid).exists())
+        self.assertNotIn("worktree kept", st["content"])
+        branches = subprocess.run(["git", "-C", str(repo), "branch", "--list", "sub/*"],
+                                  capture_output=True, text=True).stdout
+        self.assertEqual(branches.strip(), "")
+
+class ResolverTable(unittest.TestCase):
+    """Model resolution over a fixture cache. The Rust twin (src/model_catalog.rs)
+    resolves the same files to the same answers; keep the two tables in step."""
+
+    FIXTURE_MODELS = {"claude-haiku-4-5-20251001": {}, "claude-sonnet-9-9": {}, "gpt-4o": {}}
+    FIXTURE_LISTINGS = {
+        "plugin:claude:claude-subscription": {"fetched_at": 1, "rows": [
+            {"id": "claude-haiku-4-5"}, {"id": "claude-haiku-5-5"},
+            "claude-sonnet-4-6", "claude-opus-4-6-thinking", "claude-opus-4-6-fast"]},
+        "https://api.example.test/v1": {"rows": [["claude-sonnet-5-5", "label"]]},
+    }
+    FIXTURE_CACHE = {"plugins": {"opencode-sub": {"providers": [
+        {"id": "opencode-zen", "models": ["zen-x-1"]}]}}}
+    FIXTURE_CONFIG = {"provider_id": "claude:claude-subscription"}
+
+    @classmethod
+    def setUpClass(cls):
+        loader = importlib.machinery.SourceFileLoader("gray_subagents_mod", str(REPO / "mod"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.mod)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        home = pathlib.Path(self.tmp.name)
+        (home / "models.json").write_text(json.dumps(self.FIXTURE_MODELS))
+        (home / "provider_models.json").write_text(json.dumps(self.FIXTURE_LISTINGS))
+        (home / "plugins").mkdir()
+        (home / "plugins" / "provider-cache.json").write_text(json.dumps(self.FIXTURE_CACHE))
+        (home / "config.json").write_text(json.dumps(self.FIXTURE_CONFIG))
+        patch = mock.patch.dict(os.environ, {"GRAY_HOME": str(home)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_shared_table(self):
+        # claude-sonnet-9-9 is only in models.json (the stale catalog): never picked.
+        table = [
+            ("haiku", "claude-haiku-5-5"),
+            ("Claude-Haiku-5-5", "claude-haiku-5-5"),
+            ("claude-subscription/claude-haiku-5-5", "claude-subscription/claude-haiku-5-5"),
+            ("sonnet", "claude-sonnet-5-5"),
+            ("claude-s", "claude-sonnet-5-5"),
+            ("zen", "zen-x-1"),
+            ("gpt", "gpt-4o"),
+            ("haiku-5", "claude-haiku-5-5"),
+            ("5-5", "claude-haiku-5-5"),
+            ("mystery/model", "mystery/model"),
+        ]
+        for spec, want in table:
+            with self.subTest(spec=spec):
+                self.assertEqual(self.mod.resolve_model(spec), want)
+
+    def test_errors_name_the_newest_candidates(self):
+        with self.assertRaises(ValueError) as opus:
+            self.mod.resolve_model("opus")
+        self.assertIn("ambiguous", str(opus.exception))
+        self.assertIn("claude-opus-4-6-thinking, claude-opus-4-6-fast", str(opus.exception))
+        with self.assertRaises(ValueError) as nope:
+            self.mod.resolve_model("nope")
+        self.assertEqual(str(nope.exception), "unknown model 'nope' (no catalog match)")
+
+    def test_version_parse_matches_the_rust_twin(self):
+        version_of = self.mod.version_of
+        self.assertEqual(version_of("claude-haiku-4-5-20251001"), (4, 5))
+        self.assertEqual(version_of("claude-haiku-5-5"), (5, 5))
+        self.assertEqual(version_of("step-3.5-flash-2603"), (3, 5))
+        self.assertEqual(version_of("qwen3.8-flash"), (3, 8))
+        self.assertEqual(version_of("gpt-4o"), ())
+
+
+class ManifestLabels(unittest.TestCase):
+    """Every tool the supervisor declares carries a transcript label. gray headlines
+    a tool with its label and only humanizes the wire name when none is set."""
+
+    @classmethod
+    def setUpClass(cls):
+        loader = importlib.machinery.SourceFileLoader("gray_subagents_manifest", str(REPO / "mod"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.mod)
+
+    def test_every_declared_tool_has_a_clean_label(self):
+        tools = self.mod.dispatch("plugin/manifest", {})["tools"]
+        self.assertTrue(tools)
+        for tool in tools:
+            with self.subTest(tool=tool.get("name")):
+                label = tool.get("label")
+                self.assertIsInstance(label, str)
+                self.assertTrue(label.strip(), "label must be non-empty")
+                self.assertNotIn("_", label, "label must not be a raw wire name")
+
+    def test_preview_templates_reference_declared_params(self):
+        """A {field} or {a.b|filter} placeholder renders empty when the field
+        is not a call arg; every head path must be a declared parameter."""
+        for tool in self.mod.dispatch("plugin/manifest", {})["tools"]:
+            with self.subTest(tool=tool.get("name")):
+                preview = tool.get("preview")
+                if not isinstance(preview, str):
+                    continue
+                props = tool.get("parameters", {}).get("properties", {})
+                for inner in re.findall(r"\{([^{}]+)\}", preview):
+                    head = inner.split("|", 1)[0].split(".")[0].strip()
+                    if head:
+                        self.assertIn(
+                            head, props,
+                            f"preview references undeclared param {head!r}",
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

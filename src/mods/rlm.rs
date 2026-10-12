@@ -100,6 +100,28 @@ fn owned_runs(sid: &str) -> Vec<Value> {
 
 // ---------- tools ----------
 
+/// Batch items as the supervisor reads them: `prompt` is the documented alias
+/// of `task`, so an item with no `task` (or an empty one) takes its `prompt`.
+/// Other keys pass through unchanged.
+fn batch_items(tasks: &[Value]) -> Vec<Value> {
+    tasks
+        .iter()
+        .map(|item| {
+            let mut item = item.clone();
+            let task_missing = match item.get("task") {
+                None | Some(Value::Null) => true,
+                Some(task) => task.as_str() == Some(""),
+            };
+            if task_missing
+                && let Some(prompt) = item.get("prompt").cloned()
+            {
+                item["task"] = prompt;
+            }
+            item
+        })
+        .collect()
+}
+
 /// `rlm_spawn` — admit a supervised child, return a handle immediately.
 /// `prompt` (or `task`) is required; `tasks: [...]` fans out 1–8 in one
 /// admission (prime's batch spawn), each item taking name/agent/model/etc.
@@ -124,7 +146,7 @@ fn rlm_spawn(params: &Value, args: &Value) -> Result<String, String> {
         if tasks.is_empty() || tasks.len() > 8 {
             return Err("tasks must contain 1–8 items".into());
         }
-        run["tasks"] = args["tasks"].clone();
+        run["tasks"] = Value::Array(batch_items(tasks));
     } else {
         run["task"] = args["prompt"].as_str().or(args["task"].as_str()).into();
         for (k, t) in [
@@ -145,6 +167,9 @@ fn rlm_spawn(params: &Value, args: &Value) -> Result<String, String> {
         }
         if let Some(e) = args["effort"].as_str().filter(|s| !s.is_empty()) {
             run["effort"] = json!(crate::check_effort(e).map_err(|e| e.to_string())?);
+        }
+        if let Some(c) = args["context"].as_str().filter(|s| !s.is_empty()) {
+            run["context"] = json!(crate::check_context(c).map_err(|e| e.to_string())?);
         }
         if let Some(i) = args["isolation"].as_str().filter(|s| !s.is_empty()) {
             if i != "worktree" {
@@ -413,30 +438,42 @@ pub fn cli(argv: &[String]) -> String {
 pub fn manifest_tools() -> Value {
     json!([
         {"name": "rlm_spawn",
+         "label": "Started agent",
+         "preview": "{name} · {model|model} · {effort} · ctx {context}\n{prompt|firstline}",
          "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 4) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
-            "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, agent?, name?, model?, effort?}"},
+            "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, agent?, name?, model?, effort?, context?}"},
             "name": {"type": "string"}, "model": {"type": "string"},
-            "effort": {"type": "string"}, "agent": {"type": "string", "description": "profile (scout|worker|oracle|reviewer)"},
+            "effort": {"type": "string"},
+            "context": {"type": "string", "description": "context ceiling passed as GRAY_COMPACT_AT: '90k', '300k', '1m', or 'auto'; above 200k a Claude model auto-uses its [1m] route — Haiku bills 5x past 100k"},
+            "agent": {"type": "string", "description": "profile (scout|worker|oracle|reviewer)"},
             "tools": {"type": "string"}, "approve": {"type": "string"},
             "isolation": {"type": "string", "description": "e.g. worktree"}}}},
         {"name": "rlm_collect",
+         "label": "Checked agents",
+         "preview": "{targets}",
          "description": "Non-steering typed snapshots of children: name, status, settled, activity, transcript-tail preview. wait_ms polls until all settle (max ~120s). Default targets: this session's runs.",
          "parameters": {"type": "object", "properties": {
             "targets": {"description": "child name or list of names"},
             "wait_ms": {"type": "integer"}}}},
         {"name": "rlm_send",
+         "label": "Messaged",
+         "preview": "{name}\n{message|firstline}",
          "description": "Message a child: steers a running run, resumes a finished one's session (agent_message analogue).",
          "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "message": {"type": "string"}},
          "required": ["name", "message"]}},
         {"name": "rlm_delete",
+         "label": "Stopped",
+         "preview": "{name}",
          "description": "Stop a child run by name.",
          "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}},
          "required": ["name"]}},
         {"name": "rlm_progress_note",
+         "label": "Note",
+         "preview": "{message|firstline}",
          "description": "Report upward without steering: appends to this session's notes file (~/.gray/subagents/notes/<session>.md) and, when host.say is granted, delivers it to the parent.",
          "parameters": {"type": "object", "properties": {
             "message": {"type": "string", "description": "≤512 chars"}},
@@ -447,6 +484,22 @@ pub fn manifest_tools() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_items_take_prompt_as_task_when_task_is_missing() {
+        let items = vec![
+            json!({"prompt": "from prompt", "name": "a"}),
+            json!({"task": "keeps task", "prompt": "ignored"}),
+            json!({"task": "", "prompt": "fills empty"}),
+            json!({"name": "neither"}),
+        ];
+        let out = batch_items(&items);
+        assert_eq!(out[0]["task"], "from prompt");
+        assert_eq!(out[0]["name"], "a");
+        assert_eq!(out[1]["task"], "keeps task");
+        assert_eq!(out[2]["task"], "fills empty");
+        assert!(out[3].get("task").is_none());
+    }
 
     #[test]
     fn rlm_tools_declared() {

@@ -15,7 +15,6 @@
 //!   ledger  tail ~/.gray/narrow-ledger.jsonl
 //!   status  list narrow-spawned runs
 
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -47,7 +46,8 @@ pub fn manifest_narrow() -> Value {
         "sidecar_args": ["sidecar"],
         "tools": [{
             "name": "narrow_delegate",
-            "label": "Narrow Delegate",
+            "label": "Started restricted agent",
+            "preview": "{name} · {tools}\n{task|firstline}",
             "description": "Spawn a detached `gray -p` child agent whose tool grant is a strict subset of this session's grant — the child can never exceed the parent set, and every grant is recorded in an append-only ledger (~/.gray/narrow-ledger.jsonl). tools is a comma-separated allowlist: 'read,grep' = those tools; 'bash:git*' = bash constrained to git commands; omit it to inherit this session's full grant. Gated capabilities (bash) need approve='tool:bash'. Use for work that should run with least privilege.",
             "parameters": {
                 "type": "object",
@@ -327,7 +327,7 @@ fn spawn_child(
     cwd: &str,
     run_id: &str,
     name: &str,
-    model: Option<&str>,
+    route: Option<&crate::model_catalog::Route>,
     effort: Option<&str>,
 ) -> Result<u32, String> {
     let dir = runs_dir();
@@ -356,8 +356,16 @@ fn spawn_child(
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
         .env("GRAY_SHOW_REASONING", "0");
-    if let Some(m) = model {
-        cmd.env("GRAY_MODEL", m);
+    if let Some(route) = route {
+        // A routed spec carries the child provider identity env; a stale
+        // GRAY_BASE_URL must not override a plugin's declared transport.
+        if !route.env.is_empty() {
+            cmd.env_remove("GRAY_BASE_URL");
+            for (k, v) in &route.env {
+                cmd.env(k, v);
+            }
+        }
+        cmd.env("GRAY_MODEL", &route.model);
     }
     if let Some(e) = effort {
         cmd.env("GRAY_THINKING_EFFORT", e);
@@ -448,13 +456,27 @@ fn do_run_narrow(
     let name = name
         .map(str::to_string)
         .unwrap_or_else(|| name_from_task(task, &planned.run_id));
+    // provider/model specs onto an enabled plugin provider resolve to the bare
+    // id plus the provider env the child's connection needs.
+    let route = match model {
+        Some(m) => Some(
+            crate::model_catalog::resolve_route(m, &crate::narrow_lib::gray_home())
+                .map_err(|e| format!("model '{m}': {e}"))?,
+        ),
+        None => None,
+    };
+    let arrow = route
+        .as_ref()
+        .filter(|r| !r.label.is_empty())
+        .map(|r| format!(" → {}", r.label))
+        .unwrap_or_default();
     // Forward the owning-session marker: the child's own descendants
     // (and foreign_scan adoption) scope back to this session's tree.
     let mut env = planned.env.clone();
     if !session.is_empty() {
         env.push(("GRAY_SESSION_ID".into(), session.into()));
     }
-    let pid = spawn_child(&prompt, &env, cwd, &planned.run_id, &name, model, effort)?;
+    let pid = spawn_child(&prompt, &env, cwd, &planned.run_id, &name, route.as_ref(), effort)?;
     let ev = grant_event(
         via,
         &planned.run_id,
@@ -485,7 +507,7 @@ fn do_run_narrow(
         );
     }
     Ok(format!(
-        "Started narrowed run {name} [{}] pid {pid} — grant: {grant_csv}{note}. \
+        "Started narrowed run {name} [{}] pid {pid}{arrow} — grant: {grant_csv}{note}. \
          Ledger: {}. Log: {}",
         planned.run_id,
         ledger_path().display(),
@@ -829,26 +851,6 @@ pub fn handle_narrow(req: &Value) -> (Option<Value>, bool) {
         Err(e) => json!({"id": id, "error": {"code": -32601, "message": e}}),
     };
     (Some(reply), false)
-}
-
-fn sidecar_narrow() -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let Ok(req) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let (reply, exit) = handle_narrow(&req);
-        if let Some(reply) = reply {
-            writeln!(stdout, "{reply}")?;
-            stdout.flush()?;
-        }
-        if exit {
-            break;
-        }
-    }
-    Ok(())
 }
 
 /// In-process `gray narrow …` — `args` are the user's argv (no binary name,

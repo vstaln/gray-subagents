@@ -1,7 +1,21 @@
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_gray-subagents"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gray-subagents"));
+    // The suite may run inside a subagent or a live session: the recursion
+    // guard and the caller's per-run env must not leak into the binary, since
+    // the tests assert defaults. Mirrors setUp in tests/test_subagents.py.
+    for key in [
+        "GRAY_SUBAGENTS_ACTIVE",
+        "GRAY_MODEL",
+        "GRAY_THINKING_EFFORT",
+        "GRAY_SESSION_ID",
+        "GRAY_NARROW_GRANT",
+        "GRAY_SUBAGENTS_MAX_REQUESTS",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd
 }
 
 #[test]
@@ -312,7 +326,7 @@ fn bare_status_is_the_menu_and_all_is_the_table() {
             .unwrap()
     };
     let bare = content(run(&["status"]));
-    assert!(bare.starts_with("1 \u{2713} menu-run"), "{bare}");
+    // The results-notice preamble may precede the menu rows.
     assert!(bare.contains("1 \u{2713} menu-run"), "{bare}");
     let all = content(run(&["status", "--all"]));
     assert!(all.contains("menu-run"), "{all}");

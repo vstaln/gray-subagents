@@ -71,13 +71,19 @@ pub fn pretty_model(id: &str) -> String {
 
 /// Plain-text tree, without ANSI styling or a trailing newline.
 pub fn render_widget(agents: &[AgentRow]) -> String {
-    render_widget_spans(agents).0
+    render_widget_spans(agents, 0).0
 }
 
 /// [`render_widget`] plus the `(line, start, end)` char ranges the host
 /// shimmers: the running rows' icon and name only, never the whole row, so
 /// the sweep never reads as random bold words in the task text.
-pub fn render_widget_spans(agents: &[AgentRow]) -> (String, Vec<(usize, usize, usize)>) {
+/// `offset` pages the band: the first `offset` rows of `ordered` are skipped
+/// and a `↑N above` marker replaces them, so a taller band can page instead
+/// of silently clipping.
+pub fn render_widget_spans(
+    agents: &[AgentRow],
+    offset: usize,
+) -> (String, Vec<(usize, usize, usize)>) {
     if agents.is_empty() {
         return (String::new(), Vec::new());
     }
@@ -99,10 +105,13 @@ pub fn render_widget_spans(agents: &[AgentRow]) -> (String, Vec<(usize, usize, u
         .collect();
     let running = ordered.iter().filter(|a| is_running(a)).count();
     let finished = ordered.len() - running;
-    let budget = 10; // body lines; header, overflow and affordance reserve the rest.
+    // Body lines; header, overflow and affordance reserve the rest. The
+    // host band caps to screen height itself, so a generous budget only ever
+    // helps — eight running agents ≈ 16 body lines.
+    let budget = 24;
     let mut shown = Vec::new();
     let mut used = 0;
-    for a in &ordered {
+    for a in ordered.iter().skip(offset) {
         let h = 1 + usize::from(activity_of(a).is_some());
         if used + h > budget {
             break;
@@ -110,7 +119,7 @@ pub fn render_widget_spans(agents: &[AgentRow]) -> (String, Vec<(usize, usize, u
         used += h;
         shown.push(*a);
     }
-    let hidden = ordered.len() - shown.len();
+    let hidden = ordered.len().saturating_sub(offset + shown.len());
     let name_w = shown
         .iter()
         .map(|a| clean(&a.name).chars().count())
@@ -142,7 +151,10 @@ pub fn render_widget_spans(agents: &[AgentRow]) -> (String, Vec<(usize, usize, u
         if total == 1 { "" } else { "s" },
         counts.join(" \u{b7} ")
     ));
-    for (i, a) in shown.iter().enumerate() {
+    if offset > 0 {
+        lines.push(format!("  \u{2191}{offset} above"));
+    }
+    for a in shown.iter() {
         let name: String = clean(&a.name).chars().take(name_w).collect();
         let mut line = format!("  {} {name:<name_w$}", state_icon(&a.state));
         if model_w > 0 {
@@ -307,7 +319,7 @@ mod tests {
                 },
             ),
         ];
-        let (text, spans) = render_widget_spans(&rows);
+        let (text, spans) = render_widget_spans(&rows, 0);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "");
         assert_eq!(lines[1], "2 subagents \u{b7} 1 running \u{b7} 1 done");
@@ -322,5 +334,48 @@ mod tests {
         assert_eq!(spans, vec![(2, 2, 13)]);
         let shimmered: String = lines[2].chars().skip(2).take(11).collect();
         assert_eq!(shimmered, "\u{25cf} fan-count");
+    }
+
+    #[test]
+    fn band_fits_a_full_roster_without_clipping() {
+        // 8 running agents ≈ 16 body lines — everything fits under the
+        // raised budget: no +N more row, the affordance still lands.
+        let rows: Vec<AgentRow> = (0..8)
+            .map(|i| {
+                row(
+                    &format!("w{i}"),
+                    AgentState::Running {
+                        activity: "working".into(),
+                    },
+                )
+            })
+            .collect();
+        let (text, _) = render_widget_spans(&rows, 0);
+        assert!(!text.contains("more"), "{text}");
+        assert!(text.contains("/subagents"), "{text}");
+        assert_eq!(text.matches("\u{25cf}").count(), 8);
+    }
+
+    #[test]
+    fn offset_pages_the_band() {
+        // 16 running agents at offset 2: 14 candidates, 12 shown (24 lines),
+        // 2 above + 2 below — both overflow markers read honestly.
+        let rows: Vec<AgentRow> = (0..16)
+            .map(|i| {
+                row(
+                    &format!("w{i:02}"),
+                    AgentState::Running {
+                        activity: "x".into(),
+                    },
+                )
+            })
+            .collect();
+        let (text, _) = render_widget_spans(&rows, 2);
+        assert!(text.contains("\u{2191}2 above"), "{text}");
+        assert!(text.contains("+2 more"), "{text}");
+        assert!(text.contains("w02") && !text.contains("w00"), "{text}");
+        assert!(!text.contains("w14"), "{text}");
+        let (top, _) = render_widget_spans(&rows, 0);
+        assert!(!top.contains("\u{2191}"), "{top}");
     }
 }

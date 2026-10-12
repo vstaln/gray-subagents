@@ -35,8 +35,12 @@ any later session can inspect, steer, or stop them.
   per-item `model`/`effort` in batch tasks, and `model:`/`effort:` frontmatter
   defaults inside agent profiles. Precedence: task field → run flag → profile →
   `settings --model/--effort` → inherited env. Model specs resolve against
-  `~/.gray/models.json` (exact → unique prefix → unique substring; unknown ids
-  fail fast with up to 4 candidate suggestions). Effort is one of
+  the model caches under `$GRAY_HOME` (`models.json` plus the live provider
+  lists in `provider_models.json` and `plugins/provider-cache.json`): exact id
+  → exact `provider/id` → unique prefix → unique substring. A family word such
+  as `haiku` picks the newest versioned id carrying it (ids a live provider
+  lists before ids only `models.json` names); ties and unknown ids fail fast,
+  listing up to 4 candidates, newest first. Effort is one of
   off/minimal/low/medium/high/xhigh/max.
 - Named runs: `--name` or an auto `adjective-noun` handle; `status`/`stop`/`steer`
   accept a name, a unique hex prefix, or `last`.
@@ -120,7 +124,9 @@ swaps you into the child session and your next prompt continues that
 agent's work, with its own history and model. Running runs keep their
 session lock-held, so the card points at `chat`/`view`/`stop` instead
 (`/resume` refuses a live session). Multiple launches can run concurrently
-under the shared-home cap. Model order: per-launch `--model`, saved plugin
+under the shared-home cap; launches past the cap are admitted as `queued` and
+start FIFO as running runs finish (`stop` cancels a queued run). Model order:
+per-launch `--model`, saved plugin
 model, then the child Gray's inherited environment/saved config. Model
 configuration errors are not silently retried using a different model.
 
@@ -221,7 +227,8 @@ a host widget.
 - Children have your OS permissions and share the supplied working directory.
   Read-only profile wording and recursion environment flags are not sandboxes.
 - Timeout/cancellation do not undo side effects. Default timeout: 600 seconds;
-  default concurrency: 4; combined output ceiling: 256 KiB.
+  default concurrency: 4 (launches past it queue); combined output ceiling:
+  256 KiB.
 - `GRAY_SUBAGENTS_BIN` chooses a child executable when using the standalone
   plugin. Bridged Gray commands supply their own executable via `GRAY_BIN`.
 - Run records contain prompts/output and persist in private mode-0600 JSON files
