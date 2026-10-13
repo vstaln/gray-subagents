@@ -299,10 +299,12 @@ def session_of_pid(pid):
 
 def owner_session(explicit=""):
     # Twin of main.rs owner_session — keep in step. The explicit wire id, then
-    # GRAY_SESSION_ID, then the process-tree walk; "" when none resolves.
+    # GRAY_SESSION_ID, then the process-tree walk; "" when none resolves. An
+    # exported-but-empty marker means the caller cleared it on purpose — the
+    # process is session-less and the walk must not re-attach it.
     if explicit:
         return explicit
-    if os.environ.get("GRAY_SESSION_ID"):
+    if "GRAY_SESSION_ID" in os.environ:
         return os.environ["GRAY_SESSION_ID"]
     root = session_root_pid()
     return (session_of_pid(root) if root else None) or ""
@@ -474,6 +476,63 @@ def kill_tree(pid):
                 os.kill(target, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
+
+
+STOP_GRACE = 3.0  # seconds between SIGTERM and SIGKILL when a run is stopped
+
+
+def signal_group(pid, sig):
+    """Signal pid's process group, or pid alone when it leads none (kill_tree's semantics)."""
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def terminate_tree(proc, grace=STOP_GRACE):
+    """Wind down a stopped child's tree: SIGTERM to the child's group and to
+    every descendant, then SIGKILL whatever still lives after `grace` seconds.
+    Returns the pids that survived SIGKILL (empty when the tree is gone).
+
+    Members are tracked by (pid, birth tick), so a pid recycled mid-stop is
+    never signalled; the child's own group is signalled only while it is not
+    reaped (proc.poll() is None), so its pid cannot have been recycled."""
+    members = []
+
+    def note_members():
+        for p in descendants(proc.pid):
+            birth = identity(p)
+            if birth and (p, birth) not in members:
+                members.append((p, birth))
+
+    def live():
+        left = [p for p, birth in members if identity(p) == birth]
+        if proc.poll() is None:
+            left.insert(0, proc.pid)
+        return left
+
+    def send(sig):
+        if proc.poll() is None:
+            signal_group(proc.pid, sig)
+        for p, birth in members:
+            if identity(p) == birth:
+                signal_group(p, sig)
+
+    note_members()
+    send(signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while live() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if live():
+        note_members()
+        send(signal.SIGKILL)
+        end = time.monotonic() + 1.0
+        while live() and time.monotonic() < end:
+            time.sleep(0.05)
+    return live()
 
 
 def kill_orphan(job):
@@ -1904,6 +1963,16 @@ def run_phase(rid, prompt, resume_sid, job):
                     if changed:
                         write_job(job)
                 if stopping:
+                    # The run reads as stopped only once its tree is gone: TERM,
+                    # then KILL after STOP_GRACE. A survivor is named, not hidden.
+                    survivors = terminate_tree(proc)
+                    if survivors:
+                        log_event(rid, "stop_incomplete", survivors=survivors)
+                        with registry():
+                            job = read_job(rid)
+                            job["stop_note"] = ("process " + ", ".join(map(str, survivors))
+                                                + " survived SIGKILL")
+                            write_job(job)
                     status, error = "stopped", "stopped by request"
                     break
                 if deadline is not None and time.monotonic() >= deadline:
@@ -2048,6 +2117,8 @@ def supervise(rid):
             job = read_job(rid)
             if job["status"] == "stopping":
                 final_status, final_error = "stopped", "stopped by request"
+                if job.get("stop_note"):
+                    final_error += f"; {job['stop_note']}"
                 final_reason = "cancelled"
             job.update(status=final_status, error=final_error,
                        finished=time.time(), noticed=False)

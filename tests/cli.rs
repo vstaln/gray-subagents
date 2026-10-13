@@ -2,21 +2,14 @@ use std::process::Command;
 
 fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gray-subagents"));
-    // The suite may run inside a subagent or a live session: the recursion
-    // guard and the caller's per-run env must not leak into the binary, since
-    // the tests assert defaults. Mirrors setUp in tests/test_subagents.py.
-    for key in [
-        "GRAY_SUBAGENTS_ACTIVE",
-        "GRAY_SUBAGENTS_DEPTH",
-        "GRAY_SUBAGENTS_MAX_DEPTH",
-        "GRAY_SUBAGENTS_MAX_PHASES",
-        "GRAY_MODEL",
-        "GRAY_THINKING_EFFORT",
-        "GRAY_SESSION_ID",
-        "GRAY_NARROW_GRANT",
-        "GRAY_SUBAGENTS_MAX_REQUESTS",
-    ] {
-        cmd.env_remove(key);
+    // The suite may run inside a subagent or a live session: every GRAY_* var
+    // the caller exports (session id, model, recursion guards, binary and
+    // provider overrides) must not leak into the binary, since the tests
+    // assert defaults. Mirrors setUp in tests/test_subagents.py.
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("GRAY_")) {
+            cmd.env_remove(key);
+        }
     }
     cmd
 }

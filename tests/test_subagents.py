@@ -49,22 +49,23 @@ class SidecarCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = pathlib.Path(self.tmp.name) / "home"
         self.run_dir = self.home / "subagents" / "runs"
-        self.env = dict(
-            os.environ,
+        # The suite itself may run inside a subagent or a live session: every
+        # GRAY_* var the caller exports (session id, model, recursion guards,
+        # binary/provider/context overrides) must not leak into spawned test
+        # runs — the tests assert defaults.
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("GRAY_")}
+        self.env.update(
             GRAY_HOME=str(self.home),
+            # Pinned session-less: present-but-empty beats the ancestor walk
+            # (owner_session), so the suite resolves no session even when it
+            # runs inside a live one.
+            GRAY_SESSION_ID="",
             GRAY_SUBAGENTS_BIN=str(FAKE_GRAY),
             FAKE_LOG=str(pathlib.Path(self.tmp.name) / "log.txt"),
             GRAY_SUBAGENTS_TIMEOUT_SECS="6",
             GRAY_SUBAGENTS_MAX_RUNNING="2",
         )
-        # The suite itself may run inside a subagent or a live session: the
-        # recursion guard and the caller's per-run model/effort/session env
-        # must not leak into spawned test runs (the tests assert defaults).
-        for key in ("GRAY_SUBAGENTS_ACTIVE", "GRAY_SUBAGENTS_DEPTH",
-                    "GRAY_SUBAGENTS_MAX_DEPTH", "GRAY_SUBAGENTS_MAX_PHASES",
-                    "GRAY_MODEL", "GRAY_THINKING_EFFORT",
-                    "GRAY_SESSION_ID", "GRAY_NARROW_GRANT", "GRAY_SUBAGENTS_MAX_REQUESTS"):
-            self.env.pop(key, None)
         self.sc = Sidecar(self.env)
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(self.sc.close)

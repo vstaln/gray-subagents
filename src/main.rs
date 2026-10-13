@@ -251,7 +251,11 @@ pub(crate) fn backend(
     if let Some(context) = cfg["context"].as_str() {
         cmd.env("GRAY_COMPACT_AT", context);
     }
-    if let Some(bin) = std::env::var_os("GRAY_BIN") {
+    // GRAY_SUBAGENTS_BIN is the explicit override; GRAY_BIN only fills it in
+    // when unset, so a caller's chosen binary is never clobbered.
+    if std::env::var_os("GRAY_SUBAGENTS_BIN").is_none()
+        && let Some(bin) = std::env::var_os("GRAY_BIN")
+    {
         cmd.env("GRAY_SUBAGENTS_BIN", bin);
     }
     // Owning-session marker for the whole tree under this call: the
@@ -346,14 +350,13 @@ pub(crate) struct Entry {
     pub created: f64,
 }
 
-/// This session's runs plus adopted `gray -p` workers. A run is visible only
-/// to its owner session (`all` shows everyone); a session-less run only to a
-/// session-less viewer in its cwd. `include_stale`
-/// keeps finished runs past the widget's 30s fade — the menu selects old
-/// runs for `open`/`chat`.
+/// Every registered run plus adopted `gray -p` workers. Runs list globally —
+/// each row carries its owner in `session`, which is what the host's panel
+/// filters on — while worker *adoption* stays session-scoped in
+/// `foreign_scan` (`all` adopts everything). `include_stale` keeps finished
+/// runs past the widget's 30s fade — the menu selects old runs for
+/// `open`/`chat`.
 pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
-    let cwd = std::env::current_dir()?;
-    let my_sid = owner_session(None);
     let dir = home()?.join("subagents/runs");
     let mut managed_pids = std::collections::HashSet::new();
     let mut entries = Vec::new();
@@ -382,8 +385,10 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
             // A queued run holds no slot and has no `finished` stamp yet, so it
             // is live for the stale-row filter as well.
             let live = active || status == "queued";
-            if active
-                && let Some(pid) = job["child_pid"].as_u64()
+            // Any run whose child is still alive is managed, whatever its status:
+            // a stopped or finished run can leave its child running for a while,
+            // and that child must never be adopted as a raw worker.
+            if let Some(pid) = job["child_pid"].as_u64()
                 && match job["child_birth"].as_str() {
                     Some(birth) => {
                         start_ticks(pid).map(|t| t.to_string()).as_deref() == Some(birth)
@@ -392,18 +397,6 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                 }
             {
                 managed_pids.insert(pid);
-            }
-            let job_sid = job["session_id"].as_str().unwrap_or("");
-            // A run belongs to its owner: only that session sees it (`--all`
-            // shows everyone). A session-less run (manual `gray subagents run`)
-            // is visible only to a viewer with no session, from its own cwd.
-            let visible = if job_sid.is_empty() {
-                my_sid.is_none() && job["cwd"].as_str().map(PathBuf::from).as_ref() == Some(&cwd)
-            } else {
-                my_sid.as_deref() == Some(job_sid)
-            };
-            if !all && !visible {
-                continue;
             }
             // The widget fades finished runs quickly; the menu keeps them
             // selectable (that's where `open`/`chat` act on them).
@@ -862,17 +855,18 @@ pub(crate) fn session_of_pid(pid: u64) -> Option<String> {
 /// The session a call acts for, resolved the same way everywhere: the explicit
 /// wire session id, then this process's exported GRAY_SESSION_ID (which survives
 /// orphaning, e.g. `(gray subagents run ... &)` reparented to init), then the
-/// process-tree walk. Mirrored by `owner_session` in `mod` — keep them in step.
+/// process-tree walk. An exported-but-empty marker means the caller cleared it
+/// on purpose — the process is session-less and the walk must not re-attach it.
+/// Mirrored by `owner_session` in `mod` — keep them in step.
 pub(crate) fn owner_session(explicit: Option<&str>) -> Option<String> {
     explicit
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .or_else(|| {
-            std::env::var("GRAY_SESSION_ID")
-                .ok()
-                .filter(|s| !s.is_empty())
+        .or_else(|| match std::env::var("GRAY_SESSION_ID") {
+            Ok(sid) if !sid.is_empty() => Some(sid),
+            Ok(_) => None,
+            Err(_) => session_root().and_then(session_of_pid),
         })
-        .or_else(|| session_root().and_then(session_of_pid))
 }
 
 /// The session id a process holds open itself: `~/.gray/sessions/<id>.open`
@@ -1031,13 +1025,85 @@ fn session_model(sid: &str) -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
+/// Start window for a running record: the host writes ~/.gray/running/<pid>.json a
+/// few seconds after its process is born, so a genuine record's `started` sits
+/// just after the process's birth. Anything outside is a stale record whose pid
+/// was recycled.
+const RECORD_START_WINDOW: std::ops::RangeInclusive<f64> = -5.0..=60.0;
+
+/// When a process was born, in epoch seconds (boot time + starttime ticks).
+fn proc_birth_epoch(pid: u64) -> Option<f64> {
+    let btime = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime ")?.trim().parse::<f64>().ok())?;
+    Some(btime + start_ticks(pid)? as f64 / 100.0)
+}
+
+/// Running records keyed by pid, kept only while the pid still belongs to the
+/// process that wrote them. A record outlives its process (kill -9 skips the
+/// cleanup) and the pid can be recycled to an unrelated process: such a record
+/// must neither describe that process nor lend it an owner.
+fn current_running_records() -> std::collections::HashMap<u64, Value> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(dir) = home()
+        .map(|h| h.join("running"))
+        .and_then(|d| std::fs::read_dir(d).map_err(|e| e.into()))
+    else {
+        return out;
+    };
+    for entry in dir.flatten() {
+        let Ok(raw) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(row) = serde_json::from_slice::<Value>(&raw) else {
+            continue;
+        };
+        let (Some(pid), Some(started)) = (row["pid"].as_u64(), row["started"].as_f64()) else {
+            continue;
+        };
+        let current = proc_birth_epoch(pid)
+            .is_some_and(|born| RECORD_START_WINDOW.contains(&(started - born)));
+        if current {
+            out.insert(pid, row);
+        }
+    }
+    out
+}
+
+/// Owner identity of a process: its exported GRAY_SESSION_ID (every supervised
+/// child carries its owner's), else the running record's owner, else the
+/// record's session. `None` only when the process carries no identity at all.
+fn worker_identity(pid: u64, row: Option<&Value>) -> Option<String> {
+    env_value(pid, "GRAY_SESSION_ID")
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let row = row?;
+            ["owner", "session"]
+                .iter()
+                .find_map(|k| row[*k].as_str().filter(|s| !s.is_empty()))
+                .map(str::to_string)
+        })
+}
+
+/// Whether a raw worker shows in this viewer's panel. A process with an owner
+/// identity is shown only to that owner, never by lineage: an orphaned or
+/// recycled process can sit under any tree. Lineage to the viewer's session
+/// decides only for a process with no identity at all.
+fn adopt_worker(viewer: Option<&str>, identity: Option<&str>, in_lineage: bool) -> bool {
+    match identity {
+        Some(owner) => viewer == Some(owner),
+        None => in_lineage,
+    }
+}
+
 /// `gray -p` workers no run record owns: mcp `gray_prompt` children and plain
 /// scripted fan-outs never register, so the widget adopts them by scanning
-/// /proc. Managed children are excluded by pid; workers from other sessions
-/// are excluded by lineage when `scoped`. A worker's name is its
-/// GRAY_AGENT_NAME env (set by the spawner — `gray_prompt --name`, scripts),
-/// else its session slug
-/// (`<id>.open` held by the process), else `worker-<pid>`.
+/// /proc. Managed children are excluded by pid. Adoption follows the owner
+/// (`adopt_worker`); `scoped = false` (`--all`) adopts everything. A worker's
+/// name is its GRAY_AGENT_NAME env (set by the spawner — `gray_prompt --name`,
+/// scripts), else its session slug (`<id>.open` held by the process), else
+/// `worker-<pid>`.
 fn foreign_scan(managed: &std::collections::HashSet<u64>, scoped: bool) -> Vec<ForeignWorker> {
     let mut workers = Vec::new();
     let Some(uptime) = std::fs::read_to_string("/proc/uptime")
@@ -1049,6 +1115,15 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>, scoped: bool) -> Vec<F
     let self_pid = std::process::id() as u64;
     let Ok(proc_dir) = std::fs::read_dir("/proc") else {
         return workers;
+    };
+    let viewer = owner_session(None);
+    let records = current_running_records();
+    let adopted = |pid: u64, row: Option<&Value>| {
+        !scoped || {
+            let identity = worker_identity(pid, row);
+            let lineage = identity.is_none() && visible_in_session(pid);
+            adopt_worker(viewer.as_deref(), identity.as_deref(), lineage)
+        }
     };
     for entry in proc_dir.flatten() {
         let Some(pid) = entry
@@ -1065,7 +1140,7 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>, scoped: bool) -> Vec<F
         let Some(prompt) = gray_p_prompt(&argv) else {
             continue;
         };
-        if scoped && !visible_in_session(pid) {
+        if !adopted(pid, records.get(&pid)) {
             continue;
         }
         let task: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1102,70 +1177,54 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>, scoped: bool) -> Vec<F
     // Self-registered `gray -p` workers: the host writes
     // ~/.gray/running/<pid>.json on startup (removed on exit), so a worker
     // that never went through a spawn tool is discoverable without argv
-    // archaeology. The record's own metadata beats scraping; rows for
-    // dead pids are stale (kill -9) and drop on the liveness check.
-    if let Ok(dir) = home()
-        .map(|h| h.join("running"))
-        .and_then(|d| std::fs::read_dir(d).map_err(|e| e.into()))
-    {
-        for entry in dir.flatten() {
-            let Ok(raw) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let Ok(row) = serde_json::from_slice::<Value>(&raw) else {
-                continue;
-            };
-            let Some(pid) = row["pid"].as_u64() else {
-                continue;
-            };
-            if pid == self_pid
-                || managed.contains(&pid)
-                || workers.iter().any(|w| w.pid == pid)
-                || !std::path::Path::new(&format!("/proc/{pid}")).exists()
-                || (scoped && !visible_in_session(pid))
-            {
-                continue;
-            }
-            let session = row["session"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| row["owner"].as_str().filter(|s| !s.is_empty()))
-                .map(str::to_string);
-            let elapsed = row["started"]
-                .as_f64()
-                .map(|t| {
-                    (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or(0.0)
-                        - t)
-                        .max(0.0)
-                })
-                .unwrap_or(0.0);
-            let cwd_base = row["cwd"]
-                .as_str()
-                .and_then(|c| c.rsplit('/').next())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("?")
-                .to_string();
-            workers.push(ForeignWorker {
-                pid,
-                name: row["name"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("worker-{pid}")),
-                task: row["task"].as_str().unwrap_or_default().to_string(),
-                elapsed,
-                cwd_base,
-                model: row["model"].as_str().unwrap_or_default().to_string(),
-                activity: session
-                    .as_deref()
-                    .and_then(session_activity)
-                    .unwrap_or_else(|| "starting…".into()),
-                session,
-            });
+    // archaeology. Only current records count (see current_running_records).
+    for (&pid, row) in &records {
+        if pid == self_pid
+            || managed.contains(&pid)
+            || workers.iter().any(|w| w.pid == pid)
+            || !adopted(pid, Some(row))
+        {
+            continue;
         }
+        let session = row["session"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| row["owner"].as_str().filter(|s| !s.is_empty()))
+            .map(str::to_string);
+        let elapsed = row["started"]
+            .as_f64()
+            .map(|t| {
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0)
+                    - t)
+                    .max(0.0)
+            })
+            .unwrap_or(0.0);
+        let cwd_base = row["cwd"]
+            .as_str()
+            .and_then(|c| c.rsplit('/').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("?")
+            .to_string();
+        workers.push(ForeignWorker {
+            pid,
+            name: row["name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("worker-{pid}")),
+            task: row["task"].as_str().unwrap_or_default().to_string(),
+            elapsed,
+            cwd_base,
+            model: row["model"].as_str().unwrap_or_default().to_string(),
+            activity: session
+                .as_deref()
+                .and_then(session_activity)
+                .unwrap_or_else(|| "starting…".into()),
+            session,
+        });
     }
     workers.sort_by(|a, b| a.elapsed.total_cmp(&b.elapsed));
     workers
