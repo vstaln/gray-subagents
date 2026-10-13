@@ -1174,6 +1174,18 @@ def make_worktree(cwd, rid, name):
 def drop_worktree(cwd, path, branch):
     subprocess.run(["git", "-C", cwd, "worktree", "remove", "--force", path],
                    capture_output=True, timeout=20)
+    # The branch is the committed work — drop it only when nothing landed
+    # on it (tip still reachable from the default branch). A clean tree
+    # after a commit is finished work, not litter: deleting the ref there
+    # strands the commits as dangling objects.
+    tip = subprocess.run(["git", "-C", cwd, "rev-parse", "--verify", "--quiet", branch],
+                         capture_output=True, text=True, timeout=15)
+    if tip.returncode != 0:
+        return
+    base = subprocess.run(["git", "-C", cwd, "merge-base", "HEAD", branch],
+                          capture_output=True, text=True, timeout=15).stdout.strip()
+    if base and base != tip.stdout.strip():
+        return  # branch has commits past the merge base — keep it
     subprocess.run(["git", "-C", cwd, "branch", "-D", branch],
                    capture_output=True, timeout=20)
 
