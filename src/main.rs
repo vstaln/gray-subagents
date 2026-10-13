@@ -143,23 +143,41 @@ fn settings(
     let path = home()?.join("subagents/settings.json");
     let mut value: Value = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => json!({"max_running":4,"model":null}),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => json!({"max_running":128,"model":null}),
         Err(e) => return Err(e.into()),
     };
     anyhow::ensure!(value.is_object(), "settings must be an object");
     let changed = model.is_some() || cap.is_some() || effort.is_some() || context.is_some();
+    // "none"/"inherit"/"default" clear a field back to unset (inherit).
+    let clears = |v: &str| {
+        matches!(
+            v.trim().to_lowercase().as_str(),
+            "" | "none" | "null" | "inherit" | "default"
+        )
+    };
     if let Some(model) = model {
-        let model = resolve_model(&model)?;
-        value["model"] = json!(model);
+        value["model"] = if clears(&model) {
+            Value::Null
+        } else {
+            json!(resolve_model(&model)?)
+        };
     }
     if let Some(effort) = effort {
-        value["effort"] = json!(check_effort(&effort)?);
+        value["effort"] = if clears(&effort) {
+            Value::Null
+        } else {
+            json!(check_effort(&effort)?)
+        };
     }
     if let Some(context) = context {
-        value["context"] = json!(check_context(&context)?);
+        value["context"] = if clears(&context) {
+            Value::Null
+        } else {
+            json!(check_context(&context)?)
+        };
     }
     if let Some(cap) = cap {
-        anyhow::ensure!((1..=32).contains(&cap), "max-running must be 1–32");
+        anyhow::ensure!((1..=1024).contains(&cap), "max-running must be 1–1024");
         value["max_running"] = json!(cap);
     }
     if changed {
@@ -1243,7 +1261,7 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] [--max-phases N] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL [--effort LEVEL] [--context CTX]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. A run is marked stalled after 2 consecutive phases with no successful tool call or the same error 3 times in a row; each run's phase budget (default 32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every transition is audited to runs/<id>.events.jsonl. Runs are detached — they keep going if this session ends. The rlm_spawn/rlm_collect/rlm_send/rlm_delete/rlm_progress_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
+const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] [--max-phases N] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--max-running N]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. A run is marked stalled after 2 consecutive phases with no successful tool call or the same error 3 times in a row; each run's phase budget (default 32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every transition is audited to runs/<id>.events.jsonl. Runs are detached — they keep going if this session ends. The rlm_spawn/rlm_collect/rlm_send/rlm_delete/rlm_progress_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
 
 /// JSON rows for the host's agents panel: the same entries the text menu
 /// numbers, plus the session/target fields its actions need.
@@ -1505,6 +1523,14 @@ fn sidecar() -> Result<()> {
                         // shows `error` replies as a failed command.
                         Err(e) => Ok(json!({"text": e.render().to_string()})),
                         Ok(cli) => match cli.command {
+                            // Bare `settings` in the TUI opens the host's
+                            // settings pop-out; flagged stays a text set.
+                            Some(Action::Settings {
+                                model: None,
+                                effort: None,
+                                context: None,
+                                max_running: None,
+                            }) => Ok(json!({"subagent_settings":"subagents"})),
                             Some(action) => execute(action, session.as_ref())
                                 .map(|v| json!({"text":present(&v)})),
                             None => Ok(json!({"agent_picker":"subagents"})),

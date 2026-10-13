@@ -440,7 +440,7 @@ pub fn manifest_tools() -> Value {
         {"name": "rlm_spawn",
          "label": "Started agent",
          "preview": "{name} · {model|model} · {effort} · ctx {context}\n{prompt|firstline}",
-         "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 4) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
+         "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 128) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
             "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, agent?, name?, model?, effort?, context?}"},
