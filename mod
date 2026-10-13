@@ -12,7 +12,7 @@ follow-up on the run; the supervisor delivers it as a `--session` resume turn
 in the same child session between phases. Runs past GRAY_SUBAGENTS_MAX_RUNNING
 queue (status "queued") and start FIFO as slots free. Linux is required.
 Env: GRAY_SUBAGENTS_BIN (default `gray`), GRAY_SUBAGENTS_TIMEOUT_SECS (unset: no cap),
-GRAY_SUBAGENTS_MAX_RUNNING (4), GRAY_SUBAGENTS_MAX_PHASES (32 — the task turn
+GRAY_SUBAGENTS_MAX_RUNNING (128), GRAY_SUBAGENTS_MAX_PHASES (32 — the task turn
 plus each steered follow-up). The stall guard ends a run `stalled` after 2
 consecutive phases with no successful tool call, or the same error on the
 last 3 phases. Every transition appends to runs/<run_id>.events.jsonl —
@@ -1117,10 +1117,10 @@ def stop_job(rid, sid=""):
 def settings():
     raw = os.environ.get("GRAY_SUBAGENTS_TIMEOUT_SECS")
     ttl = None if raw is None else float(raw)  # unset: runs never time out
-    cap = int(os.environ.get("GRAY_SUBAGENTS_MAX_RUNNING", "4"))
+    cap = int(os.environ.get("GRAY_SUBAGENTS_MAX_RUNNING", "128"))
     if (ttl is not None and (not math.isfinite(ttl) or not 0 < ttl <= 86400)) \
-            or not 1 <= cap <= 32:
-        raise ValueError("timeout must be >0 and <=86400 seconds; max running 1–32")
+            or not 1 <= cap <= 1024:
+        raise ValueError("timeout must be >0 and <=86400 seconds; max running 1–1024")
     return ttl, cap
 
 
