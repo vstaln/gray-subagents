@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 mod narrow;
 #[path = "mods/narrow_lib.rs"]
 pub mod narrow_lib;
-#[path = "mods/rlm.rs"]
-mod rlm;
+#[path = "mods/agents.rs"]
+mod agents;
 mod model_catalog;
 use std::{
     io::{self, BufRead, Write},
@@ -273,14 +273,14 @@ pub(crate) fn backend(
 fn manifest() -> Value {
     let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","setup","run","status","view","stop","steer","list","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"]});
     // Folded-in surfaces ride this manifest too: gray-narrow's tools
-    // (narrow_delegate) plus gray-rlm's rlm_* model-facing tools.
+    // (narrow_delegate) plus the subagent_* model-facing tools.
     let mut tools: Vec<Value> = narrow::manifest_narrow()
         .get("tools")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
     tools.extend(
-        rlm::manifest_tools()
+        agents::manifest_tools()
             .as_array()
             .cloned()
             .unwrap_or_default(),
@@ -1261,7 +1261,7 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] [--max-phases N] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--max-running N]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. A run is marked stalled after 2 consecutive phases with no successful tool call or the same error 3 times in a row; each run's phase budget (default 32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every transition is audited to runs/<id>.events.jsonl. Runs are detached — they keep going if this session ends. The rlm_spawn/rlm_collect/rlm_send/rlm_delete/rlm_progress_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
+const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] [--max-phases N] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--max-running N]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. A run is marked stalled after 2 consecutive phases with no successful tool call or the same error 3 times in a row; each run's phase budget (default 32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every transition is audited to runs/<id>.events.jsonl. Runs are detached — they keep going if this session ends. The subagent_spawn/subagent_check/subagent_message/subagent_stop/subagent_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
 
 /// JSON rows for the host's agents panel: the same entries the text menu
 /// numbers, plus the session/target fields its actions need.
@@ -1441,11 +1441,11 @@ fn sidecar() -> Result<()> {
         if req.get("id").is_none() {
             continue;
         }
-        // Folded-in gray-rlm surface: rlm_* tools and /rlm command.
+        // Folded-in subagent tools (subagent_* names, legacy aliases included) and the /rlm command.
         if req["method"].as_str() == Some("tool/call")
-            && rlm::is_rlm_tool(req["params"]["name"].as_str().unwrap_or(""))
+            && agents::is_subagent_tool(req["params"]["name"].as_str().unwrap_or(""))
         {
-            let (result, frames) = rlm::handle_tool(&req["params"]);
+            let (result, frames) = agents::handle_tool(&req["params"]);
             for f in frames {
                 println!("{f}");
             }
@@ -1456,7 +1456,7 @@ fn sidecar() -> Result<()> {
         if req["method"].as_str() == Some("command/run")
             && matches!(req["params"]["name"].as_str(), Some("/rlm") | Some("rlm"))
         {
-            let text = rlm::command(&req["params"]);
+            let text = agents::command(&req["params"]);
             println!("{}", json!({"id": req["id"], "result": {"text": text}}));
             io::stdout().flush()?;
             continue;
@@ -1589,7 +1589,7 @@ fn main() -> Result<()> {
         return sidecar();
     }
     if argv.len() > 1 && argv[1] == "rlm" {
-        println!("{}", rlm::cli(&argv[2..].to_vec()));
+        println!("{}", agents::cli(&argv[2..].to_vec()));
         return Ok(());
     }
     if argv.len() > 1 && (argv[1] == "narrow" || argv[1] == "plan") {

@@ -1225,7 +1225,7 @@ def spawn_jobs(args, session):
         at = f"tasks[{index}]: " if "tasks" in args else ""
         if not isinstance(item, dict):
             raise ValueError(f"{at}each task must be an object")
-        # `task` wins; `prompt` is the batch alias rlm_spawn documents.
+        # `task` wins; `prompt` is the batch alias subagent_spawn documents.
         task = item.get("task") if item.get("task") is not None else item.get("prompt")
         agent = item.get("agent", "scout")
         if not isinstance(task, str) or not task.strip() or len(task) > 32000 or "\0" in task:

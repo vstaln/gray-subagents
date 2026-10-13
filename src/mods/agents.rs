@@ -1,4 +1,4 @@
-//! Folded-in gray-rlm surface: prime-agent-style RLM tools over the
+//! Folded-in subagent tool surface: prime-agent-style tools over the
 //! subagent supervisor (mechanics port — no prime code). The supervisor
 //! itself enforces depth-1 (`GRAY_SUBAGENTS_ACTIVE`) and the running cap
 //! (`max_running` setting); this layer adds the model-facing tool surface
@@ -21,7 +21,7 @@ use crate::{
 
 const MAX_SPAWNS: usize = 32;
 const COLLECT_MAX_WAIT_MS: u64 = 120_000;
-const DEPTH_MSG: &str = "rlm_spawn is unavailable inside a subagent run — children cannot spawn children (depth-1 only)";
+const DEPTH_MSG: &str = "subagent_spawn is unavailable inside a subagent run — children cannot spawn children (depth-1 only)";
 
 fn sanitize(s: &str) -> String {
     s.chars()
@@ -67,7 +67,7 @@ fn now() -> u64 {
 }
 
 /// Runs this session spawned — the supervisor records owner `session_id`
-/// on every job, so the registry doubles as the rlm spawn ledger.
+/// on every job, so the registry doubles as the subagent spawn ledger.
 fn owned_runs(sid: &str) -> Vec<Value> {
     let dir = match home() {
         Ok(h) => h.join("subagents").join("runs"),
@@ -122,17 +122,17 @@ fn batch_items(tasks: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// `rlm_spawn` — admit a supervised child, return a handle immediately.
+/// `subagent_spawn` — admit a supervised child, return a handle immediately.
 /// `prompt` (or `task`) is required; `tasks: [...]` fans out 1–8 in one
 /// admission (prime's batch spawn), each item taking name/agent/model/etc.
-fn rlm_spawn(params: &Value, args: &Value) -> Result<String, String> {
+fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
     if std::env::var_os("GRAY_SUBAGENTS_ACTIVE").is_some() {
         return Err(DEPTH_MSG.into());
     }
     let sid = session_id(params);
     let batch = args["tasks"].as_array();
     if batch.is_none() && args["prompt"].as_str().or(args["task"].as_str()).is_none() {
-        return Err("rlm_spawn requires prompt".into());
+        return Err("subagent_spawn requires prompt".into());
     }
     let owned = owned_runs(&sid);
     if owned.len() >= MAX_SPAWNS {
@@ -195,7 +195,7 @@ fn rlm_spawn(params: &Value, args: &Value) -> Result<String, String> {
         "handles": handles,
         "handle": handles.first().cloned().unwrap_or(Value::Null),
         "status": "admitted",
-        "note": "admission returns handles, never the child's answer — results arrive via rlm_collect, completion notices, or agent messages",
+        "note": "admission returns handles, never the child's answer — results arrive via subagent_check, completion notices, or agent messages",
         "cli": v["content"].as_str().unwrap_or("").lines().next().unwrap_or("").to_string(),
     })
     .to_string())
@@ -230,9 +230,9 @@ fn snapshot(e: &Entry, preview_lines: usize) -> Value {
     })
 }
 
-/// `rlm_collect` — non-steering typed snapshots; `wait_ms` polls until
+/// `subagent_check` — non-steering typed snapshots; `wait_ms` polls until
 /// every target settles (cap ~120s). Default targets: this session's runs.
-fn rlm_collect(params: &Value, args: &Value) -> Result<String, String> {
+fn subagent_check(params: &Value, args: &Value) -> Result<String, String> {
     let sid = session_id(params);
     let targets: Vec<String> = args["targets"]
         .as_array()
@@ -279,13 +279,15 @@ fn rlm_collect(params: &Value, args: &Value) -> Result<String, String> {
     }
 }
 
-/// `rlm_send` — steer a running child; a finished one's `chat` resumes its
+/// `subagent_message` — steer a running child; a finished one's `chat` resumes its
 /// session (prime's agent_message.send analogue).
-fn rlm_send(args: &Value) -> Result<String, String> {
-    let name = args["name"].as_str().ok_or("rlm_send requires name")?;
+fn subagent_message(args: &Value) -> Result<String, String> {
+    let name = args["name"]
+        .as_str()
+        .ok_or("subagent_message requires name")?;
     let message = args["message"]
         .as_str()
-        .ok_or("rlm_send requires message")?;
+        .ok_or("subagent_message requires message")?;
     let v = chat(&menu_target(name), vec![message.to_string()]).map_err(|e| e.to_string())?;
     Ok(v["content"]
         .as_str()
@@ -293,9 +295,9 @@ fn rlm_send(args: &Value) -> Result<String, String> {
         .unwrap_or_else(|| serde_json::to_string_pretty(&v).unwrap_or_default()))
 }
 
-/// `rlm_delete` — stop a child by name/id (foreign workers included).
-fn rlm_delete(params: &Value, args: &Value) -> Result<String, String> {
-    let name = args["name"].as_str().ok_or("rlm_delete requires name")?;
+/// `subagent_stop` — stop a child by name/id (foreign workers included).
+fn subagent_stop(params: &Value, args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().ok_or("subagent_stop requires name")?;
     let target = menu_target(name);
     if let Some(v) = foreign_stop(&target) {
         return Ok(v["content"].as_str().unwrap_or("stopped").to_string());
@@ -314,13 +316,13 @@ fn rlm_delete(params: &Value, args: &Value) -> Result<String, String> {
         .unwrap_or_else(|| serde_json::to_string_pretty(&v).unwrap_or_default()))
 }
 
-/// `rlm_progress_note` — report upward without steering: append to the
+/// `subagent_note` — report upward without steering: append to the
 /// session notes file and (when host.say is granted) emit a say frame.
-fn rlm_progress_note(params: &Value, args: &Value) -> Result<String, String> {
+fn subagent_note(params: &Value, args: &Value) -> Result<String, String> {
     let sid = session_id(params);
     let msg = args["message"]
         .as_str()
-        .ok_or("rlm_progress_note requires message")?
+        .ok_or("subagent_note requires message")?
         .chars()
         .take(512)
         .collect::<String>();
@@ -339,24 +341,47 @@ fn rlm_progress_note(params: &Value, args: &Value) -> Result<String, String> {
 
 // ---------- wire surface ----------
 
-pub fn is_rlm_tool(name: &str) -> bool {
+/// Names from before the rename. Sessions recorded earlier replay these
+/// `rlm_*` calls, so the dispatcher still routes them to the same handlers;
+/// `manifest_tools` never lists them.
+const LEGACY_TOOL_NAMES: &[(&str, &str)] = &[
+    ("rlm_spawn", "subagent_spawn"),
+    ("rlm_collect", "subagent_check"),
+    ("rlm_send", "subagent_message"),
+    ("rlm_delete", "subagent_stop"),
+    ("rlm_progress_note", "subagent_note"),
+];
+
+/// Canonical `subagent_*` name for `name`; names outside the table pass through.
+fn canonical_tool(name: &str) -> &str {
+    LEGACY_TOOL_NAMES
+        .iter()
+        .find(|&&(old, _)| old == name)
+        .map_or(name, |&(_, new)| new)
+}
+
+pub fn is_subagent_tool(name: &str) -> bool {
     matches!(
-        name,
-        "rlm_spawn" | "rlm_collect" | "rlm_send" | "rlm_delete" | "rlm_progress_note"
+        canonical_tool(name),
+        "subagent_spawn"
+            | "subagent_check"
+            | "subagent_message"
+            | "subagent_stop"
+            | "subagent_note"
     )
 }
 
 /// One tool call → (tool-result value, extra outbound frames to print
 /// first — currently just the optional host/say delivery).
 pub fn handle_tool(params: &Value) -> (Value, Vec<Value>) {
-    let name = params["name"].as_str().unwrap_or("");
+    let name = canonical_tool(params["name"].as_str().unwrap_or(""));
     let args = &params["args"];
     let res: Result<String, String> = match name {
-        "rlm_spawn" => rlm_spawn(params, args),
-        "rlm_collect" => rlm_collect(params, args),
-        "rlm_send" => rlm_send(args),
-        "rlm_delete" => rlm_delete(params, args),
-        "rlm_progress_note" => rlm_progress_note(params, args),
+        "subagent_spawn" => subagent_spawn(params, args),
+        "subagent_check" => subagent_check(params, args),
+        "subagent_message" => subagent_message(args),
+        "subagent_stop" => subagent_stop(params, args),
+        "subagent_note" => subagent_note(params, args),
         other => {
             return (
                 json!({"content": format!("unknown tool {other}"), "is_error": true}),
@@ -365,10 +390,10 @@ pub fn handle_tool(params: &Value) -> (Value, Vec<Value>) {
         }
     };
     let mut frames = Vec::new();
-    if name == "rlm_progress_note" && res.is_ok() {
+    if name == "subagent_note" && res.is_ok() {
         let msg = args["message"].as_str().unwrap_or("");
-        frames.push(json!({"id": "rlm-say", "method": "host/say",
-            "params": {"text": format!("rlm progress: {}", msg.chars().take(200).collect::<String>())}}));
+        frames.push(json!({"id": "subagent-say", "method": "host/say",
+            "params": {"text": format!("subagent progress: {}", msg.chars().take(200).collect::<String>())}}));
     }
     match res {
         Ok(c) => (json!({"content": c}), frames),
@@ -391,19 +416,20 @@ pub fn command(params: &Value) -> String {
     match argv.first().map(String::as_str) {
         Some("stop") => argv
             .get(1)
-            .map(|n| rlm_delete(params, &json!({"name": n})).unwrap_or_else(|e| e))
+            .map(|n| subagent_stop(params, &json!({"name": n})).unwrap_or_else(|e| e))
             .unwrap_or_else(|| "usage: /rlm stop <name>".into()),
-        Some("collect") => rlm_collect(params, &json!({})).unwrap_or_else(|e| e),
+        Some("collect") => subagent_check(params, &json!({})).unwrap_or_else(|e| e),
         Some("notes") => notes_file(&sid)
             .and_then(|p| std::fs::read_to_string(p).map_err(|e| e.into()))
             .unwrap_or_else(|_: anyhow::Error| "(no notes yet)".into()),
         _ => {
             let owned = owned_runs(&sid);
             if owned.is_empty() {
-                return "no rlm children this session — spawn via the rlm_spawn tool".into();
+                return "no subagent children this session — spawn via the subagent_spawn tool"
+                    .into();
             }
             let entries = menu_order(collect_entries(true, true).unwrap_or_default());
-            let mut lines = vec![format!("rlm children ({})", owned.len())];
+            let mut lines = vec![format!("subagent children ({})", owned.len())];
             for j in &owned {
                 let name = j["name"].as_str().unwrap_or("?");
                 let status = resolve_entry(&entries, name)
@@ -425,10 +451,10 @@ pub fn command(params: &Value) -> String {
 pub fn cli(argv: &[String]) -> String {
     let params = json!({"session": {"id": "cli"}});
     match argv.first().map(String::as_str) {
-        Some("collect") => rlm_collect(&params, &json!({})).unwrap_or_else(|e| e),
+        Some("collect") => subagent_check(&params, &json!({})).unwrap_or_else(|e| e),
         Some("stop") => argv
             .get(1)
-            .map(|n| rlm_delete(&params, &json!({"name": n})).unwrap_or_else(|e| e))
+            .map(|n| subagent_stop(&params, &json!({"name": n})).unwrap_or_else(|e| e))
             .unwrap_or_else(|| "usage: gray rlm stop <name>".into()),
         Some("notes") => command(&json!({"argv": ["notes"], "session": {"id": "cli"}})),
         _ => command(&params),
@@ -437,7 +463,7 @@ pub fn cli(argv: &[String]) -> String {
 
 pub fn manifest_tools() -> Value {
     json!([
-        {"name": "rlm_spawn",
+        {"name": "subagent_spawn",
          "label": "Started agent",
          "preview": "{name} · {model|model} · {effort} · ctx {context}\n{prompt|firstline}",
          "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 128) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
@@ -450,28 +476,28 @@ pub fn manifest_tools() -> Value {
             "agent": {"type": "string", "description": "profile (scout|worker|oracle|reviewer)"},
             "tools": {"type": "string"}, "approve": {"type": "string"},
             "isolation": {"type": "string", "description": "e.g. worktree"}}}},
-        {"name": "rlm_collect",
+        {"name": "subagent_check",
          "label": "Checked agents",
          "preview": "{targets}",
          "description": "Non-steering typed snapshots of children: name, status, settled, activity, transcript-tail preview. wait_ms polls until all settle (max ~120s). Default targets: this session's runs.",
          "parameters": {"type": "object", "properties": {
             "targets": {"description": "child name or list of names"},
             "wait_ms": {"type": "integer"}}}},
-        {"name": "rlm_send",
+        {"name": "subagent_message",
          "label": "Messaged",
          "preview": "{name}\n{message|firstline}",
          "description": "Message a child: steers a running run, resumes a finished one's session (agent_message analogue).",
          "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "message": {"type": "string"}},
          "required": ["name", "message"]}},
-        {"name": "rlm_delete",
+        {"name": "subagent_stop",
          "label": "Stopped",
          "preview": "{name}",
          "description": "Stop a child run by name.",
          "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}},
          "required": ["name"]}},
-        {"name": "rlm_progress_note",
+        {"name": "subagent_note",
          "label": "Note",
          "preview": "{message|firstline}",
          "description": "Report upward without steering: appends to this session's notes file (~/.gray/subagents/notes/<session>.md) and, when host.say is granted, delivers it to the parent.",
@@ -502,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn rlm_tools_declared() {
+    fn subagent_tools_declared() {
         let t = manifest_tools();
         let names: Vec<&str> = t
             .as_array()
@@ -511,16 +537,16 @@ mod tests {
             .filter_map(|t| t["name"].as_str())
             .collect();
         for n in [
-            "rlm_spawn",
-            "rlm_collect",
-            "rlm_send",
-            "rlm_delete",
-            "rlm_progress_note",
+            "subagent_spawn",
+            "subagent_check",
+            "subagent_message",
+            "subagent_stop",
+            "subagent_note",
         ] {
             assert!(names.contains(&n), "missing {n}");
         }
-        assert!(names.iter().all(|n| is_rlm_tool(n)));
-        assert!(!is_rlm_tool("narrow_delegate"));
+        assert!(names.iter().all(|n| is_subagent_tool(n)));
+        assert!(!is_subagent_tool("narrow_delegate"));
     }
 
     #[test]
