@@ -288,23 +288,23 @@ explicit `--model`/`--effort`/`--isolation` flag (or a
 per-task field) always beats the profile default. `gray subagents status` shows the resolved model per run and
 the row stats carry the model basename.
 
-## Folded in: gray-rlm
+## Folded in: subagent tools
 
-The `rlm_*` tools (`src/mods/rlm.rs`) give the model a programmatic surface
+The `subagent_*` tools (`src/mods/agents.rs`) give the model a programmatic surface
 over this same supervisor — a mechanics port of
 [prime-agent](https://github.com/PrimeIntellect-ai/prime-agent)'s recursive
 subagent API (MIT-licensed; no prime-agent code is copied):
 
-- `rlm_spawn {prompt, name?, agent?, model?, effort?, isolation?}` — admit a
+- `subagent_spawn {prompt, name?, agent?, model?, effort?, isolation?}` — admit a
   child, return a handle immediately, never the answer. `tasks: [...]` fans
   out 1–8 in one admission. Depth-1 is enforced by the supervisor itself;
   the per-session budget is 32 spawns.
-- `rlm_collect {targets?, wait_ms?}` — typed snapshots (name, status,
+- `subagent_check {targets?, wait_ms?}` — typed snapshots (name, status,
   settled, activity, transcript-tail preview) without steering.
-- `rlm_send {name, message}` — steer a running child; a finished one's
+- `subagent_message {name, message}` — steer a running child; a finished one's
   session resumes.
-- `rlm_delete {name}` — stop a run (foreign workers included).
-- `rlm_progress_note {message}` — append to `~/.gray/subagents/notes/<sid>.md`
+- `subagent_stop {name}` — stop a run (foreign workers included).
+- `subagent_note {message}` — append to `~/.gray/subagents/notes/<sid>.md`
   and deliver upward via `host/say` when granted.
 
 `/rlm` (and `gray rlm`) lists this session's children; `/rlm notes`, `/rlm

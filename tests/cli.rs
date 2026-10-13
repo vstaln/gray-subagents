@@ -48,8 +48,8 @@ fn cli_settings_preserve_fields_and_widget_is_empty_without_jobs() {
 
 #[test]
 fn manifest_exposes_folded_tool_surface() {
-    // gray-narrow and gray-rlm are folded in: the manifest carries their
-    // model-facing tools (narrow_delegate + the rlm_* supervisor surface)
+    // gray-narrow and the subagent tools are folded in: the manifest carries their
+    // model-facing tools (narrow_delegate + the subagent_* supervisor surface)
     // plus the Agents-view widget override and both plugin commands.
     let home = tempfile::tempdir().unwrap();
     let out = bin()
@@ -67,11 +67,11 @@ fn manifest_exposes_folded_tool_surface() {
         .collect();
     for name in [
         "narrow_delegate",
-        "rlm_spawn",
-        "rlm_collect",
-        "rlm_send",
-        "rlm_delete",
-        "rlm_progress_note",
+        "subagent_spawn",
+        "subagent_check",
+        "subagent_message",
+        "subagent_stop",
+        "subagent_note",
     ] {
         assert!(tools.contains(&name), "missing tool {name}");
     }
@@ -346,4 +346,66 @@ fn empty_menu_invites_a_run() {
         .unwrap();
     let text = content(out);
     assert!(text.contains("no runs yet"), "{text}");
+}
+
+#[test]
+fn legacy_rlm_tool_names_dispatch_but_are_not_advertised() {
+    // Sessions recorded before the rename replay rlm_* calls. The sidecar must
+    // still route them to the subagent_* handlers, while the manifest lists
+    // only the canonical names.
+    use std::io::Write;
+    let home = tempfile::tempdir().unwrap();
+    let manifest_out = bin()
+        .arg("manifest")
+        .env("GRAY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(manifest_out.status.success());
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_out.stdout).unwrap();
+    let tools: Vec<&str> = manifest["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for legacy in [
+        "rlm_spawn",
+        "rlm_collect",
+        "rlm_send",
+        "rlm_delete",
+        "rlm_progress_note",
+    ] {
+        assert!(!tools.contains(&legacy), "legacy {legacy} is advertised");
+    }
+    let mut sidecar = bin()
+        .arg("sidecar")
+        .env("GRAY_HOME", home.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let requests = concat!(
+        r#"{"id":1,"method":"tool/call","params":{"name":"rlm_send","args":{}}}"#,
+        "\n",
+        r#"{"id":2,"method":"tool/call","params":{"name":"subagent_message","args":{}}}"#,
+        "\n",
+    );
+    sidecar
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(requests.as_bytes())
+        .unwrap();
+    let out = sidecar.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let replies: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    for reply in &replies {
+        assert_eq!(reply["result"]["content"], "subagent_message requires name");
+        assert_eq!(reply["result"]["is_error"], serde_json::json!(true));
+    }
 }
