@@ -17,6 +17,17 @@ prompt = args[1]
 json_mode = "--json" in args[2:]
 SID = "fake-child-session"
 mode = os.environ.get("FAKE_MODE", "ok")
+# FAKE_MODE_FILE holds one line "mode[:sleep_secs]" read fresh at each child
+# start — lets a single host env drive per-run/per-phase behavior in e2e.
+mode_file = os.environ.get("FAKE_MODE_FILE")
+if mode_file:
+    try:
+        spec = Path(mode_file).read_text().strip().splitlines()[0].strip()
+        mode, _, spec_sleep = spec.partition(":")
+        if spec_sleep:
+            os.environ["FAKE_SLEEP"] = spec_sleep
+    except (OSError, IndexError):
+        pass
 if mode == "slow":
     time.sleep(float(os.environ.get("FAKE_SLEEP", "30")))
 if mode == "descendant":
@@ -37,6 +48,15 @@ if mode == "chatty":
     time.sleep(float(os.environ.get("FAKE_SLEEP", "2")))
 if mode == "empty":
     sys.exit(0)
+if mode == "sessfail":
+    # Fails like "fail" but leaves a resumable child session and a successful
+    # tool row first, so the run stays steerable and only errors accumulate.
+    if json_mode:
+        print(json.dumps({"protocol": 1, "session_id": SID, "type": "progress",
+                          "phase": "tool_ran", "tool": "bash", "label": "Bash",
+                          "detail": "fake tool ran"}), flush=True)
+    print("deliberate child failure", file=sys.stderr)
+    sys.exit(7)
 payload = {"prompt": prompt, "cwd": os.getcwd(), "resume": resume,
            "model": os.environ.get("GRAY_MODEL"),
            "effort": os.environ.get("GRAY_THINKING_EFFORT"),
@@ -46,9 +66,11 @@ payload = {"prompt": prompt, "cwd": os.getcwd(), "resume": resume,
            "auth": os.environ.get("GRAY_AUTH_REF"),
            "base_url": os.environ.get("GRAY_BASE_URL")}
 if json_mode:
-    print(json.dumps({"protocol": 1, "session_id": SID, "type": "progress",
-                      "phase": "tool_ran", "tool": "bash", "label": "Bash",
-                      "detail": "fake tool ran"}))
+    # "quiet" phases emit a result but no tool row — no progress evidence.
+    if mode != "quiet":
+        print(json.dumps({"protocol": 1, "session_id": SID, "type": "progress",
+                          "phase": "tool_ran", "tool": "bash", "label": "Bash",
+                          "detail": "fake tool ran"}))
     print(json.dumps({"protocol": 1, "session_id": SID, "type": "result",
                       "text": json.dumps(payload)}))
 else:

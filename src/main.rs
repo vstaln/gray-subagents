@@ -70,6 +70,10 @@ enum Action {
         /// runs edit the same repository so they cannot collide.
         #[arg(long)]
         isolation: Option<String>,
+        /// Phase budget for this run — the task turn plus each steered
+        /// follow-up (1-1024, default 32; GRAY_SUBAGENTS_MAX_PHASES overrides).
+        #[arg(long)]
+        max_phases: Option<u32>,
     },
     Steer {
         run_id: String,
@@ -1239,7 +1243,7 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL [--effort LEVEL] [--context CTX]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. Runs are detached — they keep going if this session ends. The rlm_spawn/rlm_collect/rlm_send/rlm_delete/rlm_progress_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
+const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] [--max-phases N] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings --model PROVIDER/MODEL [--effort LEVEL] [--context CTX]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. A run is marked stalled after 2 consecutive phases with no successful tool call or the same error 3 times in a row; each run's phase budget (default 32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every transition is audited to runs/<id>.events.jsonl. Runs are detached — they keep going if this session ends. The rlm_spawn/rlm_collect/rlm_send/rlm_delete/rlm_progress_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
 
 /// JSON rows for the host's agents panel: the same entries the text menu
 /// numbers, plus the session/target fields its actions need.
@@ -1301,6 +1305,7 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             tools,
             approve,
             isolation,
+            max_phases,
         } => {
             let mut args = json!({"task":task.join(" "),"agent":agent});
             if let Some(tools) = tools {
@@ -1312,6 +1317,9 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             if let Some(isolation) = isolation {
                 anyhow::ensure!(isolation == "worktree", "isolation must be 'worktree'");
                 args["isolation"] = json!(isolation);
+            }
+            if let Some(max_phases) = max_phases {
+                args["max_phases"] = json!(max_phases);
             }
             if let Some(model) = model {
                 args["model"] = json!(resolve_model(&model)?);

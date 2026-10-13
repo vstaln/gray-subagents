@@ -60,7 +60,9 @@ class SidecarCase(unittest.TestCase):
         # The suite itself may run inside a subagent or a live session: the
         # recursion guard and the caller's per-run model/effort/session env
         # must not leak into spawned test runs (the tests assert defaults).
-        for key in ("GRAY_SUBAGENTS_ACTIVE", "GRAY_MODEL", "GRAY_THINKING_EFFORT",
+        for key in ("GRAY_SUBAGENTS_ACTIVE", "GRAY_SUBAGENTS_DEPTH",
+                    "GRAY_SUBAGENTS_MAX_DEPTH", "GRAY_SUBAGENTS_MAX_PHASES",
+                    "GRAY_MODEL", "GRAY_THINKING_EFFORT",
                     "GRAY_SESSION_ID", "GRAY_NARROW_GRANT", "GRAY_SUBAGENTS_MAX_REQUESTS"):
             self.env.pop(key, None)
         self.sc = Sidecar(self.env)
@@ -671,6 +673,45 @@ class SidecarCase(unittest.TestCase):
         payload = json.loads(st["result"])
         self.assertEqual(payload["resume"], "fake-child-session")
         self.assertIn("leg three", payload["prompt"])
+
+    # -- budgets, stall guard, audit trail ------------------------------------
+    def test_max_phases_budget_ends_revived_run(self):
+        rid = self.sc.call("subagent", {"task": "one turn", "max_phases": 1})["run_id"]
+        self.wait_status(rid, "completed")
+        self.sc.call("subagents_steer", {"run_id": rid, "message": "again"})
+        st = self.wait_status(rid, "failed")
+        self.assertIn("budget", st["error"])
+
+    def test_stalled_after_two_phases_without_tool_calls(self):
+        # The steered supervisor inherits the steering sidecar's env — the
+        # FAKE_MODE must ride on it so the revived phase stays tool-less.
+        sc = Sidecar(dict(self.env, FAKE_MODE="quiet"))
+        self.addCleanup(sc.close)
+        rid = sc.call("subagent", {"agent": "scout", "task": "do work"})["run_id"]
+        self.wait_status(rid, "completed")
+        sc.call("subagents_steer", {"run_id": rid, "message": "continue"})
+        st = self.wait_status(rid, "stalled")
+        self.assertIn("stalled", st["error"])
+
+    def test_same_error_three_times_marks_stalled(self):
+        sc = Sidecar(dict(self.env, FAKE_MODE="sessfail"))
+        self.addCleanup(sc.close)
+        rid = sc.call("subagent", {"agent": "scout", "task": "do work"})["run_id"]
+        self.wait_status(rid, "failed")
+        sc.call("subagents_steer", {"run_id": rid, "message": "retry"})
+        self.wait_status(rid, "failed")
+        sc.call("subagents_steer", {"run_id": rid, "message": "retry"})
+        self.wait_status(rid, "stalled")
+
+    def test_events_log_records_transitions_without_content(self):
+        rid = self.sc.call("subagent", {"task": "audit-marker-xyzzy"})["run_id"]
+        self.wait_status(rid, "completed")
+        lines = (self.run_dir / f"{rid}.events.jsonl").read_text().splitlines()
+        events = [json.loads(line) for line in lines]
+        self.assertEqual([e["ev"] for e in events],
+                         ["enqueued", "started", "phase_started", "phase_ended", "completed"])
+        self.assertTrue(all(isinstance(e.get("ts"), (int, float)) for e in events))
+        self.assertNotIn("audit-marker-xyzzy", "\n".join(lines))
 
     # -- model / effort delegation -------------------------------------------
     def test_per_run_model_and_effort_reach_child_env(self):

@@ -7,6 +7,9 @@ fn bin() -> Command {
     // the tests assert defaults. Mirrors setUp in tests/test_subagents.py.
     for key in [
         "GRAY_SUBAGENTS_ACTIVE",
+        "GRAY_SUBAGENTS_DEPTH",
+        "GRAY_SUBAGENTS_MAX_DEPTH",
+        "GRAY_SUBAGENTS_MAX_PHASES",
         "GRAY_MODEL",
         "GRAY_THINKING_EFFORT",
         "GRAY_SESSION_ID",

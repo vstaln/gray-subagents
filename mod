@@ -12,16 +12,23 @@ follow-up on the run; the supervisor delivers it as a `--session` resume turn
 in the same child session between phases. Runs past GRAY_SUBAGENTS_MAX_RUNNING
 queue (status "queued") and start FIFO as slots free. Linux is required.
 Env: GRAY_SUBAGENTS_BIN (default `gray`), GRAY_SUBAGENTS_TIMEOUT_SECS (unset: no cap),
-GRAY_SUBAGENTS_MAX_RUNNING (4). Per-run `model`/`effort` overrides reach the
+GRAY_SUBAGENTS_MAX_RUNNING (4), GRAY_SUBAGENTS_MAX_PHASES (32 — the task turn
+plus each steered follow-up). The stall guard ends a run `stalled` after 2
+consecutive phases with no successful tool call, or the same error on the
+last 3 phases. Every transition appends to runs/<run_id>.events.jsonl —
+payloads as digests, never text. Per-run `model`/`effort` overrides reach the
 child as GRAY_MODEL / GRAY_THINKING_EFFORT / GRAY_COMPACT_AT; agent profiles
 may carry a `---` frontmatter block with `model:`/`effort:`/`context:` defaults. GRAY_SUBAGENTS_ACTIVE=1 is
 the recursion
-guard: sidecars inside child runs refuse to spawn further subagents.
+guard: sidecars inside child runs refuse to spawn further subagents, and
+GRAY_SUBAGENTS_DEPTH stamps each run's tree depth on the child env (bounded
+by GRAY_SUBAGENTS_MAX_DEPTH, default 4) so future nesting stays capped.
 GRAY_SESSION_ORIGIN=subagent marks child session files as auxiliary so they
 stay out of the parent's /resume picker while remaining steerable by id.
 """
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -77,12 +84,13 @@ TOOLS = [
                 "context": {"type": "string", "description": "Context ceiling for this run, passed as GRAY_COMPACT_AT: '90k', '300k', '1m', '90000', or 'auto'. Overrides profile and settings; above 200k a Claude model auto-uses its [1m] route. Haiku bills 5x past 100k."},
                 "effort": {"type": "string", "enum": sorted(EFFORTS), "description": "Thinking effort level for this run."},
                 "timeout": {"type": "number", "description": "Per-phase cap in seconds (>0, <=86400). Omit for no time limit; GRAY_SUBAGENTS_TIMEOUT_SECS sets a default cap."},
+                "max_phases": {"type": "number", "description": "Phase budget for this run — the task turn plus each steered follow-up (whole number 1-1024). Default 32; GRAY_SUBAGENTS_MAX_PHASES overrides."},
                 "tools": {"type": "string", "description": "Capability allowlist for the child via gray-narrow (e.g. 'read,grep,bash:*'). Can only narrow this session's grant, never widen it."},
                 "approve": {"type": "string", "description": "Gated capabilities to approve for this run (e.g. 'tool:bash')."},
                 "isolation": {"type": "string", "enum": ["worktree"], "description": "'worktree' runs the child in its own git worktree — required when parallel runs edit the same repo."},
                 "tasks": {"type": "array", "minItems": 1, "maxItems": 8,
-                          "description": "Parallel tasks; use instead of top-level task/agent. Each item accepts agent/task/name/model/effort/context/timeout/tools/approve/isolation.",
-                          "items": {"type": "object", "properties": {"agent": {"type": "string"}, "task": {"type": "string"}, "name": {"type": "string"}, "model": {"type": "string"}, "effort": {"type": "string"}, "context": {"type": "string"}, "timeout": {"type": "number"}, "tools": {"type": "string"}, "approve": {"type": "string"}, "isolation": {"type": "string"}}, "required": ["task"]}},
+                          "description": "Parallel tasks; use instead of top-level task/agent. Each item accepts agent/task/name/model/effort/context/timeout/max_phases/tools/approve/isolation.",
+                          "items": {"type": "object", "properties": {"agent": {"type": "string"}, "task": {"type": "string"}, "name": {"type": "string"}, "model": {"type": "string"}, "effort": {"type": "string"}, "context": {"type": "string"}, "timeout": {"type": "number"}, "max_phases": {"type": "number"}, "tools": {"type": "string"}, "approve": {"type": "string"}, "isolation": {"type": "string"}}, "required": ["task"]}},
             },
             "oneOf": [{"required": ["task"]}, {"required": ["tasks"]}],
         },
@@ -174,6 +182,9 @@ CONTENT_LIMIT = 40000
 ACTIVE = {"running", "stopping"}
 QUEUED = "queued"  # admitted over the running cap; holds no slot until one frees
 LIVE = ACTIVE | {QUEUED}
+DEFAULT_MAX_PHASES = 32   # phase budget: the task turn plus steered follow-ups
+MAX_PHASES_LIMIT = 1024
+DEFAULT_MAX_DEPTH = 4     # tree-depth cap for delegation (nesting is off today)
 # Env a run's child inherits from the session that admitted it. A queued run
 # starts from whichever process frees its slot, so these are replayed from the
 # job record instead of inherited.
@@ -224,6 +235,32 @@ def agents_dir():
 
 def runs_dir():
     return root() / "runs"
+
+
+def events_path(rid):
+    return runs_dir() / f"{rid}.events.jsonl"
+
+
+def dig(text):
+    """Content digest for the audit trail — the log carries hashes and
+    sizes, never prompt/result/message text (no secrets in the trail)."""
+    raw = (text or "").encode("utf-8", "replace")
+    return {"len": len(raw), "sha256": hashlib.sha256(raw).hexdigest()[:16]}
+
+
+def log_event(rid, event, **fields):
+    """Append one transition to runs/<rid>.events.jsonl. Never raises: the
+    audit trail must not take a run down with it. O_APPEND keeps whole-line
+    writes atomic across supervisors and sidecars."""
+    try:
+        fields = {k: v for k, v in fields.items() if v is not None}
+        line = json.dumps({"ts": round(time.time(), 3), "ev": event, **fields},
+                          ensure_ascii=True, separators=(",", ":"))
+        fd = os.open(events_path(rid), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+    except Exception:
+        pass
 
 
 @contextlib.contextmanager
@@ -387,6 +424,7 @@ def sweep():
             kill_orphan(job)
             job.update(status="lost", error="supervisor exited before recording a result", finished=time.time())
             write_job(job)
+            log_event(job["run_id"], "lost", reason="supervisor_exit")
     start_queued()
 
 
@@ -417,9 +455,12 @@ def start_queued():
             except Exception:
                 pass
             write_job(job)
+            log_event(job["run_id"], "failed", reason="start_failed",
+                      error=dig(job["error"]))
             continue
         job.update(status="running", started=time.time(), supervisor_pid=proc.pid, supervisor_birth=birth)
         write_job(job)
+        log_event(job["run_id"], "started", supervisor=proc.pid, queued=True)
         running += 1
 
 
@@ -831,6 +872,47 @@ def clean_timeout(value):
     return float(value)
 
 
+def clean_max_phases(value):
+    """Per-run phase budget — the task turn plus each steered follow-up."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value) or not float(value).is_integer() \
+            or not 1 <= value <= MAX_PHASES_LIMIT:
+        raise ValueError(f"max_phases must be a whole number 1-{MAX_PHASES_LIMIT}")
+    return int(value)
+
+
+def max_phases_default():
+    raw = os.environ.get("GRAY_SUBAGENTS_MAX_PHASES")
+    if raw is None:
+        return DEFAULT_MAX_PHASES
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if not 1 <= n <= MAX_PHASES_LIMIT:
+        raise ValueError(f"GRAY_SUBAGENTS_MAX_PHASES must be a whole number 1-{MAX_PHASES_LIMIT}")
+    return n
+
+
+def spawn_depth():
+    """Tree depth a new run takes: the caller's GRAY_SUBAGENTS_DEPTH + 1, so a
+    root session spawns depth-1 runs and a future nested spawn lands one
+    level below its parent. Bounded by GRAY_SUBAGENTS_MAX_DEPTH."""
+    try:
+        depth = int(os.environ.get("GRAY_SUBAGENTS_DEPTH") or 0) + 1
+    except ValueError:
+        depth = 1
+    try:
+        cap = int(os.environ.get("GRAY_SUBAGENTS_MAX_DEPTH") or DEFAULT_MAX_DEPTH)
+    except ValueError:
+        cap = DEFAULT_MAX_DEPTH
+    if depth > cap:
+        raise ValueError(f"delegation depth {depth} exceeds the cap ({cap})")
+    return depth
+
+
 # Run names that collide with CLI verbs or selectors are unselectable.
 RESERVED = frozenset({
     "last", "all", "mine", "run", "status", "view", "stop", "steer", "open",
@@ -940,7 +1022,8 @@ def run_handle(job):
 
 
 def job_view(job):
-    view = {key: job.get(key, "") for key in ("run_id", "agent", "task", "status", "result", "error", "model", "effort", "context")}
+    view = {key: job.get(key, "") for key in ("run_id", "agent", "task", "status", "result", "error", "model", "effort", "context", "depth", "max_phases")}
+    view["events"] = str(events_path(job["run_id"]))
     view["name"] = job.get("name", "")
     view["activity"] = job.get("activity", "")
     view["child_session"] = job.get("child_session", "")
@@ -1013,10 +1096,13 @@ def stop_job(rid, sid=""):
                 except Exception:
                     pass
                 write_job(job)
+                log_event(job["run_id"], "cancelled",
+                          reason="cancelled before start")
                 cancelled.append(job)
             elif job["status"] in ACTIVE:
                 job["status"] = "stopping"
                 write_job(job)
+                log_event(job["run_id"], "stopping")
                 stopping.append(job)
         if not stopping and not cancelled:
             raise ValueError(f"run {jobs[0]['run_id']} already {jobs[0]['status']}")
@@ -1117,6 +1203,8 @@ def spawn_jobs(args, session):
     if os.environ.get("GRAY_SUBAGENTS_ACTIVE"):
         raise ValueError("recursion guard: subagents cannot spawn subagents")
     ttl, cap = settings()
+    depth = spawn_depth()
+    default_phases = max_phases_default()
     if "tasks" in args:
         if "task" in args or "agent" in args:
             raise ValueError("use either task/agent or tasks, not both")
@@ -1161,6 +1249,7 @@ def spawn_jobs(args, session):
         isolation = clean_isolation(first_set(item.get("isolation"), args.get("isolation"),
                                             prof["isolation"]))
         timeout = clean_timeout(first_set(item.get("timeout"), args.get("timeout"), ttl))
+        max_phases = clean_max_phases(first_set(item.get("max_phases"), args.get("max_phases"))) or default_phases
         prompt = (f"You are the '{agent}' subagent of a parent Gray session.\n\n{prof['body']}\n\n"
                   f"# Task\n\n{task}\n\nWork only on this assignment. Do not spawn more agents. "
                   "If blocked, report the blocker; do not guess unapproved decisions. "
@@ -1171,7 +1260,8 @@ def spawn_jobs(args, session):
                              model=model, provider_env=provider_env,
                              provider_label=provider_label, effort=effort,
                              context=context, tools=tools,
-                             approve=approve, isolation=isolation, timeout=timeout))
+                             approve=approve, isolation=isolation, timeout=timeout,
+                             max_phases=max_phases))
     # Materialize outside the registry lock: uuids, narrowing plans (a
     # subprocess), worktrees (git) — no other run should wait on them.
     worktrees = []
@@ -1230,7 +1320,8 @@ def spawn_jobs(args, session):
                        worktree=p["worktree"], branch=p["branch"],
                        tool_count=0, worktree_note="",
                        cwd=cwd, session_id=session.get("id", ""), binary=str(Path(binary).resolve()),
-                       timeout=p["timeout"], created=time.time(),
+                       timeout=p["timeout"], max_phases=p["max_phases"], depth=depth,
+                       created=time.time(),
                        status=QUEUED if queue_now else "running", result="", error="",
                        noticed=False, activity="", child_session="", steer_queue=[], phases=[])
             if queue_now:
@@ -1238,6 +1329,9 @@ def spawn_jobs(args, session):
                 job.update(queue_seq=stamp,
                            admission_env={k: os.environ[k] for k in ADMISSION_ENV if k in os.environ})
                 write_job(job)
+                log_event(job["run_id"], "enqueued", name=name, agent=p["agent"],
+                          queued=True, depth=depth, max_phases=p["max_phases"],
+                          prompt=dig(p["prompt"]))
                 ahead[job["run_id"]] = waiting
                 waiting += 1
                 started.append(job["run_id"])
@@ -1246,6 +1340,10 @@ def spawn_jobs(args, session):
                 proc, birth = spawn_supervisor(job["run_id"])
                 job.update(supervisor_pid=proc.pid, supervisor_birth=birth)
                 write_job(job)
+                log_event(job["run_id"], "enqueued", name=name, agent=p["agent"],
+                          queued=False, depth=depth, max_phases=p["max_phases"],
+                          prompt=dig(p["prompt"]))
+                log_event(job["run_id"], "started", supervisor=proc.pid)
             except OSError:
                 # Roll back the accepted part of the batch: stop started runs, cancel queued ones.
                 for rid in started:
@@ -1259,6 +1357,8 @@ def spawn_jobs(args, session):
                     else:
                         prior["status"] = "stopping"
                     write_job(prior)
+                    log_event(rid, "cancelled" if prior["status"] == "stopped" else "stopping",
+                              reason="batch rolled back")
                 raise
             running += 1
             started.append(job["run_id"])
@@ -1410,6 +1510,8 @@ def steer_job(rid, message):
         job["noticed"] = False
         if job["status"] in LIVE:
             write_job(job)
+            log_event(job["run_id"], "steered", queued=len(queue),
+                      message=dig(message))
             where = ("queued; lands when the current turn ends" if job["status"] in ACTIVE
                      else "waiting for a free slot; lands after its first turn")
         else:
@@ -1424,8 +1526,12 @@ def steer_job(rid, message):
                 job["steer_queue"].pop()
                 job["status"] = "failed"
                 write_job(job)
+                log_event(job["run_id"], "failed", reason="respawn_failed")
                 raise
             write_job(job)
+            log_event(job["run_id"], "steered", queued=len(queue),
+                      message=dig(message))
+            log_event(job["run_id"], "started", supervisor=proc.pid, revived=True)
             where = "resuming the child session now"
     return {"content": f"Steer for {run_handle(job)}: {where}", "queued": len(queue)}
 
@@ -1604,10 +1710,13 @@ def run_phase(rid, prompt, resume_sid, job):
 
     Protocol rows (protocol==1) yield the child session id, live activity and
     the final text; any other stdout is kept verbatim as the result fallback
-    so older/plain children still work. Returns (status, error, result)."""
+    so older/plain children still work. Returns (status, error, result, ok_tools)
+    where ok_tools counts tool calls that ran without an error marker — the
+    stall guard's progress evidence."""
     binary, timeout = job["binary"], job["timeout"]
     cwd = job.get("worktree") or job["cwd"]
     env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", GRAY_SESSION_ORIGIN="subagent",
+               GRAY_SUBAGENTS_DEPTH=str(job.get("depth") or 1),
                NO_COLOR="1", TERM="dumb", GRAY_SHOW_REASONING="0")
     # gray-narrow resolved grant (subset of ours), run correlation —
     # overrides the inherited GRAY_NARROW_* values for this child only.
@@ -1636,7 +1745,8 @@ def run_phase(rid, prompt, resume_sid, job):
         job.update(child_pid=proc.pid, child_birth=identity(proc.pid))
         write_job(job)
     raw, pending = bytearray(), b""
-    st = {"sid": "", "activity": "", "result": "", "error_row": "", "plain": bytearray(), "tools": 0}
+    st = {"sid": "", "activity": "", "result": "", "error_row": "", "plain": bytearray(),
+          "tools": 0, "ok_tools": 0}
     status, error = "failed", "supervisor did not finish"
 
     def feed(line):
@@ -1651,6 +1761,10 @@ def run_phase(rid, prompt, resume_sid, job):
                 st["activity"] = describe_row(row)
                 if row.get("phase") == "tool_started":
                     st["tools"] += 1
+                elif row.get("phase") in ("tool_ran", "tool_finished") \
+                        and row.get("ok") is not False and not row.get("error") \
+                        and not row.get("is_error"):
+                    st["ok_tools"] += 1
             elif row.get("type") == "result":
                 st["result"] = row.get("text") or ""
             elif row.get("type") == "error":
@@ -1717,18 +1831,43 @@ def run_phase(rid, prompt, resume_sid, job):
             else:
                 status = "failed"
                 error = st["error_row"] or (f"child exited {code}" if code else "child returned empty output")
-        return status, error, result
+        return status, error, result, st["ok_tools"]
     finally:
         kill_tree(proc.pid)
         proc.wait()
         proc.stdout.close()
 
 
+def stall_guard(phases):
+    """The stall guard over phase evidence: 2 consecutive phases with no
+    successful tool call, or the same error on the last 3 phases. A phase a
+    cancel cut short ('stopped') clears the count; a phase with no recorded
+    tool evidence is progress-unknown — neither a strike nor a reset.
+    Returns (code, message) or ("", "")."""
+    streak = 0
+    for p in phases:
+        if p.get("status") == "stopped":
+            streak = 0
+            continue
+        tools = p.get("tools")
+        if tools is None:
+            continue
+        streak = streak + 1 if not tools else 0
+    if streak >= 2:
+        return "no_progress", "no successful tool calls in 2 consecutive phases"
+    errs = [p.get("error") or "" for p in phases]
+    if len(errs) >= 3 and errs[-1] and errs[-1] == errs[-2] == errs[-3]:
+        return "repeated_error", f"the same error on 3 consecutive phases: {errs[-1][:200]}"
+    return "", ""
+
+
 def supervise(rid):
     """Survives plugin EOF/shutdown; owns exit status, timeout and bounded pipes.
     Loops phases: the task turn, then each queued steer as a --session resume
-    turn in the same child session. A failed phase ends the run."""
+    turn in the same child session. A failed phase ends the run; the stall
+    guard and the max_phases budget can end it first."""
     final_status, final_error = "failed", "supervisor did not finish"
+    final_reason = ""
     try:
         while True:
             with registry():
@@ -1745,6 +1884,12 @@ def supervise(rid):
                     if not queue:
                         final_status, final_error = "completed", ""
                         return
+                    limit = job.get("max_phases") or DEFAULT_MAX_PHASES
+                    if len(phases) >= limit:
+                        final_status = "failed"
+                        final_error = f"phase budget exhausted ({limit} phases)"
+                        final_reason = "max_phases"
+                        return
                     prompt = queue.pop(0)
                     resume_sid = job.get("child_session")
                     if not resume_sid:
@@ -1753,23 +1898,34 @@ def supervise(rid):
                     kind = "steer"
                 phases.append({"kind": kind, "prompt": prompt[:2000],
                                "started": time.time(), "status": "running",
-                               "result": "", "error": ""})
+                               "result": "", "error": "", "tools": 0})
                 job["activity"] = ""
                 write_job(job)
-            pst, perr, ptext = run_phase(rid, prompt, resume_sid, job)
+                log_event(rid, "phase_started", n=len(phases), kind=kind,
+                          prompt=dig(prompt), resume=bool(resume_sid))
+            pst, perr, ptext, ptools = run_phase(rid, prompt, resume_sid, job)
             with registry():
                 job = read_job(rid)
                 phase = job["phases"][-1]
-                phase.update(status=pst, error=perr, result=ptext, finished=time.time())
+                phase.update(status=pst, error=perr, result=ptext,
+                             finished=time.time(), tools=ptools)
                 if ptext:
                     job["result"] = ptext
-                if job["status"] == "stopping":
+                stopping = job["status"] == "stopping"
+                if stopping:
                     job["steer_queue"] = []
-                    write_job(job)
-                    return
-                job["error"] = perr
+                else:
+                    job["error"] = perr
                 write_job(job)
-            if pst == "stopped":
+                n_phases = len(job["phases"])
+                stall_code, stall_msg = ("", "") if stopping else stall_guard(job["phases"])
+            log_event(rid, "phase_ended", n=n_phases, status=pst, tools=ptools,
+                      error=dig(perr) if perr else None)
+            if stopping or pst == "stopped":
+                return
+            if stall_code:
+                final_status, final_error = "stalled", f"stalled: {stall_msg}"
+                final_reason = stall_code
                 return
             if pst != "ok":
                 final_status, final_error = pst, perr
@@ -1781,6 +1937,7 @@ def supervise(rid):
             job = read_job(rid)
             if job["status"] == "stopping":
                 final_status, final_error = "stopped", "stopped by request"
+                final_reason = "cancelled"
             job.update(status=final_status, error=final_error,
                        finished=time.time(), noticed=False)
             try:
@@ -1788,6 +1945,9 @@ def supervise(rid):
             except Exception:
                 pass
             write_job(job)
+            log_event(rid, job["status"], reason=final_reason or None,
+                      error=dig(job.get("error")) if job.get("error") else None,
+                      phases=len(job.get("phases") or []))
             # Idle-parent wake: the inbox file is the delivery — a session
             # without a live poller keeps it until next open (deferred),
             # exactly like a bash-job notice.
