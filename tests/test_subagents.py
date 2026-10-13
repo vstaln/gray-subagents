@@ -434,6 +434,42 @@ class SidecarCase(unittest.TestCase):
         r = self.sc.call("subagents_status", {"run_id": "deadbeef"})
         self.assertTrue(r.get("is_error"))
 
+    def test_runs_show_only_in_their_owner_session(self):
+        # Full stack through the real sidecar: a run admitted by session A is
+        # listed and notified for A alone; B sees it only with all=true.
+        def tool(name, args, session, rid):
+            reply = self.sc.rpc("tool/call", {"name": name, "args": args, "session": session}, rid)
+            self.assertIn("result", reply, reply)
+            return reply["result"]
+        cwd = os.getcwd()
+        a, b = {"id": "sess-a", "cwd": cwd}, {"id": "sess-b", "cwd": cwd}
+        rid = tool("subagent", {"agent": "scout", "task": "owned by a"}, a, 10)["run_id"]
+        for _ in range(100):
+            if tool("subagents_status", {"run_id": rid}, a, 11)["status"] == "completed":
+                break
+            time.sleep(0.1)
+        # The finished report lands in A's cron inbox only; B's never exists.
+        inbox_a = self.home / "cron" / "inbox" / "sess-a"
+        for _ in range(100):
+            if inbox_a.is_dir() and any(inbox_a.glob("*.json")):
+                break
+            time.sleep(0.1)
+        self.assertTrue(any(inbox_a.glob("*.json")))
+        self.assertIn(rid, "".join(p.read_text() for p in inbox_a.glob("*.json")))
+        self.assertFalse((self.home / "cron" / "inbox" / "sess-b").exists())
+        ids = lambda reply: [j["run_id"] for j in reply["jobs"]]
+        self.assertIn(rid, ids(tool("subagents_status", {}, a, 12)))
+        self.assertNotIn(rid, ids(tool("subagents_status", {}, b, 13)))
+        self.assertIn(rid, ids(tool("subagents_status", {"all": True}, b, 14)))
+
+    def test_spawn_without_wire_session_is_owned_by_exported_env(self):
+        # No wire session id: the run is owned by the exported GRAY_SESSION_ID,
+        # never recorded session-less (which would show to every folder peer).
+        self.spawn(env_extra={"GRAY_SESSION_ID": "sess-env"})
+        runs = self.home / "subagents" / "runs"
+        owners = [json.loads(p.read_text()).get("session_id") for p in runs.glob("*.json")]
+        self.assertEqual(owners, ["sess-env"])
+
     # -- stop ----------------------------------------------------------------
     def test_stop_kills_running_job(self):
         env = dict(FAKE_MODE="slow", FAKE_SLEEP="30")

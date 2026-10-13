@@ -16,7 +16,7 @@ use gray_subagents::widget::AgentState;
 
 use crate::{
     Entry, backend, chat, collect_entries, foreign_stop, home, menu_order, menu_target,
-    resolve_entry, session_of_pid, session_root,
+    owner_session, resolve_entry,
 };
 
 const MAX_SPAWNS: usize = 32;
@@ -38,17 +38,7 @@ fn sanitize(s: &str) -> String {
 /// Session scope from the wire params, else the exported env marker,
 /// else the process-tree-derived root.
 fn session_id(params: &Value) -> String {
-    params
-        .pointer("/session/id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            std::env::var("GRAY_SESSION_ID")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| session_root().and_then(session_of_pid))
+    owner_session(params.pointer("/session/id").and_then(Value::as_str))
         .unwrap_or_else(|| "default".into())
 }
 
@@ -449,14 +439,15 @@ pub fn command(params: &Value) -> String {
 
 /// `gray rlm <verb>` argv surface — read verbs work without a host.
 pub fn cli(argv: &[String]) -> String {
-    let params = json!({"session": {"id": "cli"}});
+    let sid = owner_session(None).unwrap_or_else(|| "cli".into());
+    let params = json!({"session": {"id": sid}});
     match argv.first().map(String::as_str) {
         Some("collect") => subagent_check(&params, &json!({})).unwrap_or_else(|e| e),
         Some("stop") => argv
             .get(1)
             .map(|n| subagent_stop(&params, &json!({"name": n})).unwrap_or_else(|e| e))
             .unwrap_or_else(|| "usage: gray rlm stop <name>".into()),
-        Some("notes") => command(&json!({"argv": ["notes"], "session": {"id": "cli"}})),
+        Some("notes") => command(&json!({"argv": ["notes"], "session": {"id": sid}})),
         _ => command(&params),
     }
 }

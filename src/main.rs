@@ -201,7 +201,7 @@ pub(crate) fn backend(
     let script = concat!(
         "import sys,json\nns={'__name__':'gray_subagents_backend','__file__':sys.argv[3]}\nexec(sys.argv[1],ns)\nargs=json.loads(sys.argv[2])\naction=sys.argv[4]\n",
         "if action=='run': result=ns['spawn_jobs'](args,args.get('session') or {'cwd':__import__('os').getcwd()})\n",
-        "elif action=='status': result=ns['status_job'](args.get('run_id'))\n",
+        "elif action=='status': result=ns['status_job'](args.get('run_id'),(args.get('session') or {}).get('id',''),bool(args.get('all')))\n",
         "elif action=='view': result=ns['view_transcript'](args.get('run_id'),args.get('lines'))\n",
         "elif action=='stop': result=ns['stop_job'](args.get('run_id'),(args.get('session') or {}).get('id',''))\n",
         "elif action=='steer': result=ns['steer_job'](args['run_id'],args['message'])\n",
@@ -346,13 +346,14 @@ pub(crate) struct Entry {
     pub created: f64,
 }
 
-/// This session's runs plus adopted `gray -p` workers, scoped exactly like
-/// the widget (owner session, legacy cwd, or in-tree). `include_stale`
+/// This session's runs plus adopted `gray -p` workers. A run is visible only
+/// to its owner session (`all` shows everyone); a session-less run only to a
+/// session-less viewer in its cwd. `include_stale`
 /// keeps finished runs past the widget's 30s fade — the menu selects old
 /// runs for `open`/`chat`.
 pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
     let cwd = std::env::current_dir()?;
-    let my_sid = session_root().and_then(session_of_pid).unwrap_or_default();
+    let my_sid = owner_session(None);
     let dir = home()?.join("subagents/runs");
     let mut managed_pids = std::collections::HashSet::new();
     let mut entries = Vec::new();
@@ -393,16 +394,15 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                 managed_pids.insert(pid);
             }
             let job_sid = job["session_id"].as_str().unwrap_or("");
-            let owned = !job_sid.is_empty() && job_sid == my_sid;
-            // Session-less runs (manual `gray subagents run`) keep the
-            // cwd match; once a run knows its session it hides elsewhere.
-            let legacy =
-                job_sid.is_empty() && job["cwd"].as_str().map(PathBuf::from).as_ref() == Some(&cwd);
-            let in_tree = active
-                && job["child_pid"]
-                    .as_u64()
-                    .is_some_and(|pid| visible_in_session(pid));
-            if !all && !owned && !legacy && !in_tree {
+            // A run belongs to its owner: only that session sees it (`--all`
+            // shows everyone). A session-less run (manual `gray subagents run`)
+            // is visible only to a viewer with no session, from its own cwd.
+            let visible = if job_sid.is_empty() {
+                my_sid.is_none() && job["cwd"].as_str().map(PathBuf::from).as_ref() == Some(&cwd)
+            } else {
+                my_sid.as_deref() == Some(job_sid)
+            };
+            if !all && !visible {
                 continue;
             }
             // The widget fades finished runs quickly; the menu keeps them
@@ -487,7 +487,7 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
             });
         }
     }
-    for w in foreign_scan(&managed_pids) {
+    for w in foreign_scan(&managed_pids, !all) {
         entries.push(Entry {
             target: w.session.clone().unwrap_or_else(|| w.name.clone()),
             session: w.session.clone().unwrap_or_default(),
@@ -817,10 +817,10 @@ pub(crate) fn session_root() -> Option<u64> {
 
 /// Worker processes belong to a session when the session's interactive gray
 /// is one of their ancestors — run-all.sh subshells and mcp sidecars both
-/// keep that lineage. No root (manual CLI invocation) means show everything.
+/// keep that lineage. No root (manual CLI invocation) matches no workers.
 fn visible_in_session(pid: u64) -> bool {
     let Some(root) = session_root() else {
-        return true;
+        return false;
     };
     let mut cur = pid;
     let mut hops = 0;
@@ -857,6 +857,22 @@ struct ForeignWorker {
 /// held session via `own_session_of_pid` for pre-env spawns.
 pub(crate) fn session_of_pid(pid: u64) -> Option<String> {
     env_value(pid, "GRAY_SESSION_ID").or_else(|| own_session_of_pid(pid))
+}
+
+/// The session a call acts for, resolved the same way everywhere: the explicit
+/// wire session id, then this process's exported GRAY_SESSION_ID (which survives
+/// orphaning, e.g. `(gray subagents run ... &)` reparented to init), then the
+/// process-tree walk. Mirrored by `owner_session` in `mod` — keep them in step.
+pub(crate) fn owner_session(explicit: Option<&str>) -> Option<String> {
+    explicit
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var("GRAY_SESSION_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| session_root().and_then(session_of_pid))
 }
 
 /// The session id a process holds open itself: `~/.gray/sessions/<id>.open`
@@ -1018,10 +1034,11 @@ fn session_model(sid: &str) -> Option<String> {
 /// `gray -p` workers no run record owns: mcp `gray_prompt` children and plain
 /// scripted fan-outs never register, so the widget adopts them by scanning
 /// /proc. Managed children are excluded by pid; workers from other sessions
-/// are excluded by lineage. A worker's name is its GRAY_AGENT_NAME env (set
-/// by the spawner — `gray_prompt --name`, scripts), else its session slug
+/// are excluded by lineage when `scoped`. A worker's name is its
+/// GRAY_AGENT_NAME env (set by the spawner — `gray_prompt --name`, scripts),
+/// else its session slug
 /// (`<id>.open` held by the process), else `worker-<pid>`.
-fn foreign_scan(managed: &std::collections::HashSet<u64>) -> Vec<ForeignWorker> {
+fn foreign_scan(managed: &std::collections::HashSet<u64>, scoped: bool) -> Vec<ForeignWorker> {
     let mut workers = Vec::new();
     let Some(uptime) = std::fs::read_to_string("/proc/uptime")
         .ok()
@@ -1048,7 +1065,7 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>) -> Vec<ForeignWorker> 
         let Some(prompt) = gray_p_prompt(&argv) else {
             continue;
         };
-        if !visible_in_session(pid) {
+        if scoped && !visible_in_session(pid) {
             continue;
         }
         let task: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1105,7 +1122,7 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>) -> Vec<ForeignWorker> 
                 || managed.contains(&pid)
                 || workers.iter().any(|w| w.pid == pid)
                 || !std::path::Path::new(&format!("/proc/{pid}")).exists()
-                || !visible_in_session(pid)
+                || (scoped && !visible_in_session(pid))
             {
                 continue;
             }
@@ -1195,7 +1212,7 @@ fn signal_proc_or_group(pid: u64, sig: &str) {
 }
 
 pub(crate) fn foreign_stop(rid: &str) -> Option<Value> {
-    let worker = foreign_scan(&std::collections::HashSet::new())
+    let worker = foreign_scan(&std::collections::HashSet::new(), false)
         .into_iter()
         .find(|w| w.name == rid || w.pid.to_string() == rid || w.session.as_deref() == Some(rid))?;
     let mut tree = descendants_of(worker.pid);
@@ -1351,11 +1368,16 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             if let Some(name) = name {
                 args["name"] = json!(name);
             }
-            if let Some(session) = session {
-                args["session"] = session.clone();
-            } else if let Some(sid) = session_root().and_then(session_of_pid) {
-                args["session"] = json!({"id": sid});
+            // Owner: the wire session (its id may be empty), then env, then the
+            // process tree. The object always travels so the cwd survives.
+            let mut owner = session
+                .filter(|s| s.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if let Some(sid) = owner_session(owner["id"].as_str()) {
+                owner["id"] = json!(sid);
             }
+            args["session"] = owner;
             backend("run", args, None, None)
         }
         Action::Steer { run_id, message } => backend(
@@ -1386,9 +1408,10 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             }
             Ok(v)
         }
-        Action::Status { run_id, .. } => backend(
+        Action::Status { run_id, all } => backend(
             "status",
-            json!({"run_id": run_id.map(|t| menu_target(&t))}),
+            json!({"run_id": run_id.map(|t| menu_target(&t)), "all": all,
+                    "session": {"id": owner_session(session.and_then(|s| s["id"].as_str())).unwrap_or_default()}}),
             None,
             None,
         ),
@@ -1408,7 +1431,8 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             {
                 Some(v) => Ok(v),
                 None => {
-                    let sid = session_root().and_then(session_of_pid).unwrap_or_default();
+                    let sid =
+                        owner_session(session.and_then(|s| s["id"].as_str())).unwrap_or_default();
                     backend(
                         "stop",
                         json!({"run_id": rid, "session": {"id": sid}}),

@@ -221,6 +221,103 @@ def gen_name(rid, taken):
     return f"{base}-{rid[:4]}"
 
 
+def env_value(pid, key):
+    # Twin of main.rs env_value: one K=V from /proc/<pid>/environ.
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    prefix = key.encode() + b"="
+    for kv in raw.split(b"\0"):
+        if kv.startswith(prefix):
+            return kv[len(prefix):].decode("utf-8", "replace").strip() or None
+    return None
+
+
+def proc_argv(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def ppid_of(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # comm may hold spaces/parens: the fields resume after the last ')'.
+    fields = stat.rsplit(")", 1)[1].split()
+    return int(fields[1]) if len(fields) > 1 else None
+
+
+def is_gray_prompt(argv):
+    # Twin of main.rs gray_p_prompt: argv carries a prompt flag.
+    if not argv or Path(argv[0]).name != "gray":
+        return False
+    return any(a in ("-p", "--prompt") or a.startswith(("--prompt=", "-p="))
+               or (len(a) > 2 and a.startswith("-p")) for a in argv[1:])
+
+
+def session_root_pid():
+    # Twin of main.rs session_root: nearest ancestor that is an interactive gray.
+    pid, hops = os.getpid(), 0
+    while True:
+        ppid = ppid_of(pid)
+        if ppid is None or ppid <= 1 or hops > 64:
+            return None
+        argv = proc_argv(ppid)
+        if argv and Path(argv[0]).name == "gray" and not is_gray_prompt(argv):
+            return ppid
+        pid, hops = ppid, hops + 1
+
+
+def session_of_pid(pid):
+    # Twin of main.rs session_of_pid: exported marker, else the .open/.jsonl
+    # session file the process holds open.
+    sid = env_value(pid, "GRAY_SESSION_ID")
+    if sid:
+        return sid
+    try:
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        path = Path(target.removesuffix(" (deleted)"))
+        if path.parent.name != "sessions":
+            continue
+        for suffix in (".open", ".jsonl"):
+            if path.name.endswith(suffix) and len(path.name) > len(suffix):
+                return path.name[: -len(suffix)]
+    return None
+
+
+def owner_session(explicit=""):
+    # Twin of main.rs owner_session — keep in step. The explicit wire id, then
+    # GRAY_SESSION_ID, then the process-tree walk; "" when none resolves.
+    if explicit:
+        return explicit
+    if os.environ.get("GRAY_SESSION_ID"):
+        return os.environ["GRAY_SESSION_ID"]
+    root = session_root_pid()
+    return (session_of_pid(root) if root else None) or ""
+
+
+def visible_to(job, sid, cwd):
+    # A run belongs to its owner: only that session sees it. A session-less run
+    # (manual `gray subagents run`) is visible only to a viewer with no session,
+    # from its own cwd — never to sessions that merely share the folder.
+    owner = job.get("session_id") or ""
+    if owner:
+        return owner == sid
+    return not sid and job.get("cwd") == cwd
+
+
 def home():
     return Path(os.environ.get("GRAY_HOME") or Path.home() / ".gray").expanduser().resolve()
 
@@ -1047,12 +1144,16 @@ def job_view(job):
     return view
 
 
-def status_job(rid=None):
+def status_job(rid=None, sid="", all_runs=False):
+    sid = owner_session(sid)
     with registry():
         sweep()
         if rid is not None:
             return job_view(read_job(resolve_rid(rid)))
         jobs = all_jobs()
+    if not all_runs:
+        cwd = str(Path(os.getcwd()).resolve())
+        jobs = [j for j in jobs if visible_to(j, sid, cwd)]
     def line(j):
         head = " · ".join(x for x in (j.get("model", ""),
                                      f"ctx {j['context']}" if j.get("context") else "") if x)
@@ -1062,7 +1163,7 @@ def status_job(rid=None):
     # Session-less runs have no prompt/context hook to drain them: report
     # them through whichever surface asks first — this status call.
     content = limited("\n".join(line(j) for j in jobs)) or "no subagent runs"
-    notices = completion_notices(None, "", with_profiles=False)
+    notices = completion_notices(None, sid, with_profiles=False)
     if notices:
         content = notices + "\n\n" + content
     return {"content": content,
@@ -1070,6 +1171,7 @@ def status_job(rid=None):
 
 
 def stop_job(rid, sid=""):
+    sid = owner_session(sid)
     with registry():
         sweep()
         if rid and rid not in ("all", "mine"):
@@ -1080,9 +1182,8 @@ def stop_job(rid, sid=""):
             # "mine" (bare stop): this session's runs. With no resolvable
             # session it hits only session-less (manual) runs — never jobs
             # owned by another session.
-            jobs = [j for j in all_jobs()
-                    if j["status"] in LIVE
-                    and (j.get("session_id") or "") == sid]
+            cwd = str(Path(os.getcwd()).resolve())
+            jobs = [j for j in all_jobs() if j["status"] in LIVE and visible_to(j, sid, cwd)]
         if not jobs:
             return {"content": "nothing running to stop"}
         stopping, cancelled = [], []
@@ -1331,7 +1432,7 @@ def spawn_jobs(args, session):
                        narrow_note=p["narrow_note"], isolation=p["isolation"] or "",
                        worktree=p["worktree"], branch=p["branch"],
                        tool_count=0, worktree_note="",
-                       cwd=cwd, session_id=session.get("id", ""), binary=str(Path(binary).resolve()),
+                       cwd=cwd, session_id=owner_session(session.get("id") or ""), binary=str(Path(binary).resolve()),
                        timeout=p["timeout"], max_phases=p["max_phases"], depth=depth,
                        created=time.time(),
                        status=QUEUED if queue_now else "running", result="", error="",
@@ -1469,17 +1570,15 @@ def completion_notices(cwd, sid="", with_profiles=True):
         return ""
     # CLI callers carry no session arg: the spawning session's own runs
     # (owned, not legacy) still drain when the env names the session.
-    sid = sid or os.environ.get("GRAY_SESSION_ID", "")
+    sid = owner_session(sid)
     cwd = str(Path(cwd or os.getcwd()).resolve())
     lines, size = [], 0
     with registry():
         sweep()
         for job in reversed(all_jobs()):
             # A finished run reports back to the session that spawned it.
-            # Session-less runs (manual `gray subagents run`) fall back to cwd.
-            owned = sid and job.get("session_id") == sid
-            legacy = not job.get("session_id") and job["cwd"] == cwd
-            if job["status"] in LIVE or job.get("noticed") or not (owned or legacy):
+            # Session-less runs reach only a session-less viewer in their cwd.
+            if job["status"] in LIVE or job.get("noticed") or not visible_to(job, sid, cwd):
                 continue
             text = limited(job_view(job)["content"], 6000)
             if size + len(text.encode()) > CONTENT_LIMIT:
@@ -1975,6 +2074,11 @@ def supervise(rid):
                 pass
 
 
+def wire_sid(params):
+    session = params.get("session") or {}
+    return session.get("id", "") if isinstance(session, dict) else ""
+
+
 def dispatch(method, params):
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
@@ -1995,11 +2099,11 @@ def dispatch(method, params):
                 raise ValueError("session must be an object")
             return spawn_jobs(args, session)
         if name == "subagents_status":
-            return status_job(args.get("run_id"))
+            return status_job(args.get("run_id"), wire_sid(params), bool(args.get("all")))
         if name == "subagents_view":
             return view_transcript(args.get("run_id"), args.get("lines"))
         if name == "subagents_stop":
-            return stop_job(args.get("run_id"))
+            return stop_job(args.get("run_id"), wire_sid(params))
         if name == "subagents_steer":
             return steer_job(args.get("run_id"), args.get("message"))
         if name == "subagents_list":
@@ -2014,16 +2118,16 @@ def dispatch(method, params):
         if argv == ["list"]:
             return {"text": list_profiles()["content"]}
         if argv == ["status"]:
-            return {"text": status_job()["content"]}
+            return {"text": status_job(None, wire_sid(params))["content"]}
         if argv[:1] == ["status"] and len(argv) == 2:
-            return {"text": status_job(argv[1])["content"]}
+            return {"text": status_job(argv[1], wire_sid(params))["content"]}
         if argv[:1] == ["view"] and len(argv) >= 2:
             lines = None
             if len(argv) > 2 and argv[2] == "--lines" and len(argv) > 3:
                 lines = int(argv[3])
             return {"text": view_transcript(argv[1], lines)["content"]}
         if argv[:1] == ["stop"] and len(argv) == 2:
-            return {"text": stop_job(argv[1])["content"]}
+            return {"text": stop_job(argv[1], wire_sid(params))["content"]}
         if argv[:1] == ["steer"] and len(argv) >= 3:
             return {"text": steer_job(argv[1], " ".join(argv[2:]))["content"]}
         return {"text": "Usage: /subagents setup|list|status [RUN_ID]|view RUN_ID [--lines N]|stop RUN_ID|steer RUN_ID MESSAGE"}
