@@ -198,9 +198,6 @@ SUPERVISORS = []
 NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 
-# Tool calls counted as writes — the difference between a finished run and
-# a read-only corpse. Tool names cover direct editors; bash/exec detail is
-# matched for redirects and mutating commands (a heuristic, for display).
 WRITE_TOOLS = frozenset({
     "edit", "write", "notebook_edit", "multi_edit", "apply_patch", "patch",
     "create_file", "delete_file", "move_file", "str_replace", "fs_write"})
@@ -2138,9 +2135,6 @@ def supervise(rid):
         log_event(rid, job["status"], reason=reason or None,
                   error=dig(job.get("error")) if job.get("error") else None,
                   phases=len(job.get("phases") or []))
-        # Idle-parent wake: the inbox file is the delivery — a session
-        # without a live poller keeps it until next open (deferred),
-        # exactly like a bash-job notice.
         try:
             if notify_parent_inbox(job):
                 job["noticed"] = True
@@ -2210,9 +2204,6 @@ def supervise(rid):
                 if stopping or pst == "stopped":
                     settle("stopped", "stopped by request", "")
                     return
-                # A steer queued while the phase was still running keeps the
-                # run alive — it lands as the next resume turn, whatever this
-                # phase's outcome.
                 if not job.get("steer_queue"):
                     if stall_code:
                         settle("stalled", f"stalled: {stall_msg}", stall_code)

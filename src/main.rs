@@ -343,8 +343,6 @@ pub(crate) struct Entry {
     pub session: String,
     /// Registry status verbatim; adopted workers are always "running".
     pub status: String,
-    /// Owning session id (`session_id` on the run record) — what the host's
-    /// panel filters on; empty for session-less runs and foreign workers.
     pub owner: String,
     /// Registry runs accept steer/chat; raw `gray -p` workers do not.
     pub managed: bool,
@@ -353,11 +351,6 @@ pub(crate) struct Entry {
     pub created: f64,
 }
 
-/// This session's runs plus adopted `gray -p` workers. A run is visible only
-/// to its owner session — the `session_id` recorded at admission (`all` shows
-/// everyone); a session-less run only to a session-less viewer in its cwd.
-/// `include_stale` keeps finished runs past the widget's 30s fade — the menu
-/// selects old runs for `open`/`chat`.
 pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
     let cwd = std::env::current_dir()?;
     let my_sid = owner_session(None);
@@ -382,9 +375,6 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                 .as_f64()
                 .unwrap_or(0.0)
                 .total_cmp(&b["created"].as_f64().unwrap_or(0.0))
-                // Runs can share a created stamp (same second, or seeded
-                // fixtures); without a tie-break the order rides read_dir
-                // and menu numbers shuffle between calls.
                 .then_with(|| a["run_id"].as_str().cmp(&b["run_id"].as_str()))
         });
         for job in jobs {
@@ -395,9 +385,6 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
             let live = active || status == "queued";
             // Any run whose child is still alive is managed, whatever its status:
             // a stopped or finished run can leave its child running for a while,
-            // and that child must never be adopted as a raw worker. This applies
-            // to every run — hidden ones too, so another session's live child
-            // is never adopted.
             if let Some(pid) = job["child_pid"].as_u64()
                 && match job["child_birth"].as_str() {
                     Some(birth) => {
@@ -1256,9 +1243,6 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>, scoped: bool) -> Vec<F
     workers
 }
 
-/// Pids a run record still owns: a live `child_pid` whose birth tick
-/// matches the record. Foreign scans exclude them — a managed child must
-/// never be stopped or adopted as a raw `gray -p` worker.
 fn managed_pids() -> std::collections::HashSet<u64> {
     let mut out = std::collections::HashSet::new();
     let Ok(dir) = home().map(|h| h.join("subagents/runs")) else {
@@ -1329,11 +1313,6 @@ fn signal_proc_or_group(pid: u64, sig: &str) {
     }
 }
 
-/// `stop <pid|name>` for an adopted worker: TERM, then KILL if it lingers.
-/// In a session it reaches only that session's workers — never another
-/// session's `gray -p` and never a registry-owned child pid. A bare CLI
-/// caller (no session resolvable) keeps global reach; anything else falls
-/// through to the registry.
 pub(crate) fn foreign_stop(rid: &str) -> Option<Value> {
     let worker = foreign_scan(&managed_pids(), owner_session(None).is_some())
         .into_iter()

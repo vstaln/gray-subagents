@@ -332,9 +332,6 @@ fn bare_status_is_the_menu_and_all_is_the_table() {
 
 #[test]
 fn entries_scope_runs_to_their_owner_session() {
-    // Three orphan runs (bare `gray subagents run` — no owner) plus a run owned
-    // by sess-a: another session's panel must adopt none of the orphans, and
-    // only --all lists across owners.
     let home = tempfile::tempdir().unwrap();
     for i in 0..3 {
         seed_job(
@@ -365,22 +362,18 @@ fn entries_scope_runs_to_their_owner_session() {
             .collect::<Vec<_>>()
     };
     let seeded = ["orphan-0", "orphan-1", "orphan-2", "a-run"];
-    // Another session's panel adopts nothing: no orphans, no foreign-owned run.
     let other = names(&["entries"], Some("sess-b"));
     assert!(
         !seeded.iter().any(|n| other.iter().any(|e| e == n)),
         "{other:?}"
     );
-    // The owner session sees its own run — and still no orphans.
     let owned = names(&["entries"], Some("sess-a"));
     assert_eq!(owned, ["a-run"], "{owned:?}");
-    // --all is the documented global view: every seeded run lists.
     let all = names(&["entries", "--all"], Some("sess-b"));
     assert!(
         seeded.iter().all(|n| all.iter().any(|e| e == n)),
         "{all:?}"
     );
-    // A session-less viewer sees only its own cwd's orphan runs.
     let orphan_view = names(&["entries"], None);
     assert!(
         ["orphan-0", "orphan-1", "orphan-2"]
