@@ -353,12 +353,11 @@ pub(crate) struct Entry {
     pub created: f64,
 }
 
-/// Every registered run plus adopted `gray -p` workers. Runs list globally —
-/// each row carries its owner in `session`, which is what the host's panel
-/// filters on — while worker *adoption* stays session-scoped in
-/// `foreign_scan` (`all` adopts everything). `include_stale` keeps finished
-/// runs past the widget's 30s fade — the menu selects old runs for
-/// `open`/`chat`.
+/// This session's runs plus adopted `gray -p` workers. A run is visible only
+/// to its owner session — the `session_id` recorded at admission (`all` shows
+/// everyone); a session-less run only to a session-less viewer in its cwd.
+/// `include_stale` keeps finished runs past the widget's 30s fade — the menu
+/// selects old runs for `open`/`chat`.
 pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
     let cwd = std::env::current_dir()?;
     let my_sid = owner_session(None);
@@ -409,20 +408,14 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
             {
                 managed_pids.insert(pid);
             }
-            // A run belongs to its owner session (`all` lists everyone); a
-            // session-less run is visible only to a session-less viewer in
-            // its own cwd — the same rule `visible_to` applies in `mod`.
-            if !all {
-                let owner = job["session_id"].as_str().unwrap_or("");
-                let visible = if owner.is_empty() {
-                    my_sid.is_none()
-                        && job["cwd"].as_str().map(PathBuf::from).as_ref() == Some(&cwd)
-                } else {
-                    my_sid.as_deref() == Some(owner)
-                };
-                if !visible {
-                    continue;
-                }
+            let job_sid = job["session_id"].as_str().unwrap_or("");
+            let visible = if job_sid.is_empty() {
+                my_sid.is_none() && job["cwd"].as_str().map(PathBuf::from).as_ref() == Some(&cwd)
+            } else {
+                my_sid.as_deref() == Some(job_sid)
+            };
+            if !all && !visible {
+                continue;
             }
             // The widget fades finished runs quickly; the menu keeps them
             // selectable (that's where `open`/`chat` act on them).
