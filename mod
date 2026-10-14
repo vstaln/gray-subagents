@@ -198,6 +198,27 @@ SUPERVISORS = []
 NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 
+# Tool calls counted as writes — the difference between a finished run and
+# a read-only corpse. Tool names cover direct editors; bash/exec detail is
+# matched for redirects and mutating commands (a heuristic, for display).
+WRITE_TOOLS = frozenset({
+    "edit", "write", "notebook_edit", "multi_edit", "apply_patch", "patch",
+    "create_file", "delete_file", "move_file", "str_replace", "fs_write"})
+WRITE_DETAIL = re.compile(
+    r">>?(?!&)"
+    r"|\bsed\b[^\n|;&]*\s-i\b|\bperl\b[^\n|;&]*\s-i\b|\btee\b|\bpatch\b"
+    r"|\bgit\s+(?:-[a-zA-Z]\s*\S+\s+)*(?:add|am|apply|checkout|cherry-pick|clean|"
+    r"clone|commit|config|fetch|init|merge|mv|pull|push|rebase|reset|restore|"
+    r"revert|rm|stash|switch|tag|worktree)\b|\bgit\s+branch\s+-[dDmM]"
+    r"|\b(?:rm|mv|cp|mkdir|rmdir|touch|ln|chmod|chown|chgrp|truncate|dd|"
+    r"install|rsync|scp|shred|unzip)\b|\btar\b[^\n|;&]*[xzc]"
+    r"|\b(?:curl|wget)\b[^\n|;&]*\s-[oO]\b"
+    r"|\b(?:cargo|npm|pnpm|yarn|pip3?|apt(?:-get)?|brew|go|gem|mvn|gradle|"
+    r"composer)\s+(?:add|install|i|ci|build|test|publish|run|fix|fmt|clippy|"
+    r"generate|new|init|update|upgrade|remove|uninstall|exec|x)\b"
+    r"|\b(?:make|cmake|ninja|pytest|tox|rustfmt|gofmt|black|ruff\s+format|"
+    r"clang-format)\b")
+
 ADJ = ("amber", "brisk", "calm", "delta", "ember", "faint", "grand", "hazy",
        "ionic", "jade", "keen", "lunar", "misty", "nova", "opal", "prime",
        "quiet", "rapid", "solar", "tidal", "ultra", "vivid", "warm", "xeno",
@@ -1189,7 +1210,14 @@ def job_view(job):
     activity = f"\n{job.get('activity', '')}" if job["status"] in ACTIVE and job.get("activity") else ""
     dur = (job.get("finished") or time.time()) - job.get("created", time.time())
     tools = job.get("tool_count") or 0
-    stats = f" · {dur:.0f}s" + (f" · {tools} tool calls" if tools else "")
+    stats = f" · {dur:.0f}s"
+    if job["status"] in LIVE:
+        stats += f" · {tools} tool calls" if tools else ""
+    else:
+        stats += f" · ended: {tools} calls"
+        writes = job.get("write_count")
+        if writes is not None:
+            stats += ", no writes" if not writes else f", {writes} writes"
     head = " · ".join(x for x in (job.get("model", ""),
                                   f"ctx {job['context']}" if job.get("context") else "") if x)
     model = f" <{head}>" if head else ""
@@ -1201,6 +1229,15 @@ def job_view(job):
         result = f"(partial output — run did not finish{resume})\n{result}"
     view["content"] = limited(f"{run_handle(job)} [{job['status']}{queue}] {job['agent']}{model} · run {job['run_id']}{stats}{activity}\n{job.get('error', '')}\n{result}{wt}")
     return view
+
+
+def write_flag(job):
+    """' · no writes' on a terminal run — a corpse (read-only calls, no file
+    changes) reads differently from a finish that changed something."""
+    if job.get("status") in LIVE or "write_count" not in job:
+        return ""
+    writes = job.get("write_count") or 0
+    return f" · {writes} writes" if writes else " · no writes"
 
 
 def status_job(rid=None, sid="", all_runs=False):
@@ -1216,7 +1253,7 @@ def status_job(rid=None, sid="", all_runs=False):
     def line(j):
         head = " · ".join(x for x in (j.get("model", ""),
                                      f"ctx {j['context']}" if j.get("context") else "") if x)
-        return (f"{run_handle(j)} [{j['status']}] {j['agent']}"
+        return (f"{run_handle(j)} [{j['status']}{write_flag(j)}] {j['agent']}"
                 f"{f' <{head}>' if head else ''}: {j['task'][:100]}")
     keys = ("run_id", "name", "agent", "status", "created", "model", "effort", "context")
     # Session-less runs have no prompt/context hook to drain them: report
@@ -1490,7 +1527,7 @@ def spawn_jobs(args, session):
                        tools=p["tools"] or "", narrow_env=p["narrow_env"],
                        narrow_note=p["narrow_note"], isolation=p["isolation"] or "",
                        worktree=p["worktree"], branch=p["branch"],
-                       tool_count=0, worktree_note="",
+                       tool_count=0, write_count=0, worktree_note="",
                        cwd=cwd, session_id=owner_session(session.get("id") or ""), binary=str(Path(binary).resolve()),
                        timeout=p["timeout"], max_phases=p["max_phases"], depth=depth,
                        created=time.time(),
@@ -1834,8 +1871,8 @@ def view_transcript(rid, lines=None):
         job = read_job(resolve_rid(rid))
         sid = job.get("child_session") or None
         tag = f" <{job['model']}>" if job.get("model") else ""
-        header = (f"{run_handle(job)} [{job['status']}] {job['agent']}{tag}"
-                  f" — {job['task'][:160]}")
+        header = (f"{run_handle(job)} [{job['status']}{write_flag(job)}]"
+                  f" {job['agent']}{tag} — {job['task'][:160]}")
     except ValueError:
         sid = foreign_session_id(rid)
         if sid:
@@ -1853,6 +1890,16 @@ def view_transcript(rid, lines=None):
     tail = "\n".join(body) or "(empty transcript)"
     note = f"session {sid} · last {lines} entries" if len(entries) > lines else f"session {sid}"
     return {"content": limited(f"{header}\n{tail}\n— {note}")}
+
+
+def is_write_call(name, detail):
+    """Tool-started/ran rows → whether the call plausibly writes files."""
+    name = (name or "").lower()
+    if name in WRITE_TOOLS:
+        return True
+    if name in ("bash", "exec", "shell", "sh"):
+        return bool(detail and WRITE_DETAIL.search(detail))
+    return False
 
 
 def describe_row(row):
@@ -1880,11 +1927,14 @@ def run_phase(rid, prompt, resume_sid, job):
 
     Protocol rows (protocol==1) yield the child session id, live activity and
     the final text; any other stdout is kept verbatim as the result fallback
-    so older/plain children still work. Returns (status, error, result, ok_tools)
-    where ok_tools counts tool calls that ran without an error marker — the
-    stall guard's progress evidence."""
+    so older/plain children still work. Returns (status, error, result,
+    ok_tools, writes); ok_tools counts tool calls that ran without an error
+    marker — the stall guard's progress evidence — and writes counts calls
+    that plausibly changed files (the empty-completion marker's evidence)."""
     binary, timeout = job["binary"], job["timeout"]
-    cwd = job.get("worktree") or job["cwd"]
+    cwd = job.get("worktree") or ""
+    if not cwd or not Path(cwd).is_dir():
+        cwd = job["cwd"]
     env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", GRAY_SESSION_ORIGIN="subagent",
                GRAY_SUBAGENTS_DEPTH=str(job.get("depth") or 1),
                NO_COLOR="1", TERM="dumb", GRAY_SHOW_REASONING="0")
@@ -1916,7 +1966,7 @@ def run_phase(rid, prompt, resume_sid, job):
         write_job(job)
     raw, pending = bytearray(), b""
     st = {"sid": "", "activity": "", "result": "", "error_row": "", "plain": bytearray(),
-          "tools": 0, "ok_tools": 0}
+          "tools": 0, "ok_tools": 0, "writes": 0, "calls": {}, "seq": 0}
     status, error = "failed", "supervisor did not finish"
 
     def feed(line):
@@ -1929,12 +1979,23 @@ def run_phase(rid, prompt, resume_sid, job):
                 st["sid"] = row["session_id"]
             if row.get("type") == "progress":
                 st["activity"] = describe_row(row)
-                if row.get("phase") == "tool_started":
-                    st["tools"] += 1
-                elif row.get("phase") in ("tool_ran", "tool_finished") \
-                        and row.get("ok") is not False and not row.get("error") \
-                        and not row.get("is_error"):
-                    st["ok_tools"] += 1
+                if row.get("phase") in ("tool_started", "tool_ran", "tool_finished"):
+                    cid = row.get("call_id")
+                    if not cid:
+                        st["seq"] += 1
+                        cid = f"~{st['seq']}"
+                    call = st["calls"].setdefault(cid, [False, False])
+                    st["tools"] = len(st["calls"])
+                    if not call[0] and row.get("phase") in ("tool_ran", "tool_finished") \
+                            and row.get("ok") is not False and not row.get("error") \
+                            and not row.get("is_error"):
+                        call[0] = True
+                        st["ok_tools"] += 1
+                    if not call[1] and is_write_call(
+                            row.get("tool") or row.get("label") or "",
+                            row.get("detail") or ""):
+                        call[1] = True
+                        st["writes"] += 1
             elif row.get("type") == "result":
                 st["result"] = row.get("text") or ""
             elif row.get("type") == "error":
@@ -1959,6 +2020,11 @@ def run_phase(rid, prompt, resume_sid, job):
                         changed = True
                     if st["tools"] != job.get("tool_count"):
                         job["tool_count"] = st["tools"]
+                        changed = True
+                    writes = st["writes"] + sum(
+                        (p.get("writes") or 0) for p in job["phases"][:-1])
+                    if writes != job.get("write_count"):
+                        job["write_count"] = writes
                         changed = True
                     if changed:
                         write_job(job)
@@ -2011,7 +2077,7 @@ def run_phase(rid, prompt, resume_sid, job):
             else:
                 status = "failed"
                 error = st["error_row"] or (f"child exited {code}" if code else "child returned empty output")
-        return status, error, result, st["ok_tools"]
+        return status, error, result, st["ok_tools"], st["writes"]
     finally:
         kill_tree(proc.pid)
         proc.wait()
@@ -2048,6 +2114,45 @@ def supervise(rid):
     guard and the max_phases budget can end it first."""
     final_status, final_error = "failed", "supervisor did not finish"
     final_reason = ""
+    settled = False
+
+    def settle(status, error, reason):
+        """Terminal write; the caller holds registry(). Settling inside the
+        hold that observed the terminal state keeps a raced steer — queued
+        while the record still read "running" — from being orphaned on a run
+        that already reported itself finished."""
+        nonlocal settled
+        job = read_job(rid)
+        if job["status"] == "stopping":
+            status, error = "stopped", "stopped by request"
+            if job.get("stop_note"):
+                error += f"; {job['stop_note']}"
+            reason = "cancelled"
+        job.update(status=status, error=error,
+                   finished=time.time(), noticed=False)
+        try:
+            job["worktree_note"] = cleanup_worktree(job)
+        except Exception:
+            pass
+        write_job(job)
+        log_event(rid, job["status"], reason=reason or None,
+                  error=dig(job.get("error")) if job.get("error") else None,
+                  phases=len(job.get("phases") or []))
+        # Idle-parent wake: the inbox file is the delivery — a session
+        # without a live poller keeps it until next open (deferred),
+        # exactly like a bash-job notice.
+        try:
+            if notify_parent_inbox(job):
+                job["noticed"] = True
+                write_job(job)
+        except Exception:
+            pass
+        try:
+            start_queued()  # this run's slot is free: admit the next queued run
+        except Exception:
+            pass
+        settled = True
+
     try:
         while True:
             with registry():
@@ -2062,33 +2167,35 @@ def supervise(rid):
                 else:
                     queue = job.setdefault("steer_queue", [])
                     if not queue:
-                        final_status, final_error = "completed", ""
+                        settle("completed", "", "")
                         return
                     limit = job.get("max_phases") or DEFAULT_MAX_PHASES
                     if len(phases) >= limit:
-                        final_status = "failed"
-                        final_error = f"phase budget exhausted ({limit} phases)"
-                        final_reason = "max_phases"
+                        settle("failed", f"phase budget exhausted ({limit} phases)",
+                               "max_phases")
                         return
                     prompt = queue.pop(0)
                     resume_sid = job.get("child_session")
                     if not resume_sid:
-                        final_status, final_error = "failed", "child session unavailable for steering"
+                        settle("failed", "child session unavailable for steering", "")
                         return
                     kind = "steer"
                 phases.append({"kind": kind, "prompt": prompt[:2000],
                                "started": time.time(), "status": "running",
-                               "result": "", "error": "", "tools": 0})
+                               "result": "", "error": "", "tools": 0,
+                               "writes": 0})
                 job["activity"] = ""
                 write_job(job)
                 log_event(rid, "phase_started", n=len(phases), kind=kind,
                           prompt=dig(prompt), resume=bool(resume_sid))
-            pst, perr, ptext, ptools = run_phase(rid, prompt, resume_sid, job)
+            pst, perr, ptext, ptools, pwrites = run_phase(rid, prompt, resume_sid, job)
             with registry():
                 job = read_job(rid)
                 phase = job["phases"][-1]
                 phase.update(status=pst, error=perr, result=ptext,
-                             finished=time.time(), tools=ptools)
+                             finished=time.time(), tools=ptools, writes=pwrites)
+                job["write_count"] = sum(
+                    (p.get("writes") or 0) for p in job["phases"])
                 if ptext:
                     job["result"] = ptext
                 stopping = job["status"] == "stopping"
@@ -2097,52 +2204,28 @@ def supervise(rid):
                 else:
                     job["error"] = perr
                 write_job(job)
-                n_phases = len(job["phases"])
+                log_event(rid, "phase_ended", n=len(job["phases"]), status=pst,
+                          tools=ptools, error=dig(perr) if perr else None)
                 stall_code, stall_msg = ("", "") if stopping else stall_guard(job["phases"])
-            log_event(rid, "phase_ended", n=n_phases, status=pst, tools=ptools,
-                      error=dig(perr) if perr else None)
-            if stopping or pst == "stopped":
-                return
-            if stall_code:
-                final_status, final_error = "stalled", f"stalled: {stall_msg}"
-                final_reason = stall_code
-                return
-            if pst != "ok":
-                final_status, final_error = pst, perr
-                return
+                if stopping or pst == "stopped":
+                    settle("stopped", "stopped by request", "")
+                    return
+                # A steer queued while the phase was still running keeps the
+                # run alive — it lands as the next resume turn, whatever this
+                # phase's outcome.
+                if not job.get("steer_queue"):
+                    if stall_code:
+                        settle("stalled", f"stalled: {stall_msg}", stall_code)
+                        return
+                    if pst != "ok":
+                        settle(pst, perr, "")
+                        return
     except Exception as exc:
         final_status, final_error = "failed", f"supervisor failed: {type(exc).__name__}: {exc}"
     finally:
-        with registry():
-            job = read_job(rid)
-            if job["status"] == "stopping":
-                final_status, final_error = "stopped", "stopped by request"
-                if job.get("stop_note"):
-                    final_error += f"; {job['stop_note']}"
-                final_reason = "cancelled"
-            job.update(status=final_status, error=final_error,
-                       finished=time.time(), noticed=False)
-            try:
-                job["worktree_note"] = cleanup_worktree(job)
-            except Exception:
-                pass
-            write_job(job)
-            log_event(rid, job["status"], reason=final_reason or None,
-                      error=dig(job.get("error")) if job.get("error") else None,
-                      phases=len(job.get("phases") or []))
-            # Idle-parent wake: the inbox file is the delivery — a session
-            # without a live poller keeps it until next open (deferred),
-            # exactly like a bash-job notice.
-            try:
-                if notify_parent_inbox(job):
-                    job["noticed"] = True
-                    write_job(job)
-            except Exception:
-                pass
-            try:
-                start_queued()  # this run's slot is free: admit the next queued run
-            except Exception:
-                pass
+        if not settled:
+            with registry():
+                settle(final_status, final_error, final_reason)
 
 
 def wire_sid(params):
