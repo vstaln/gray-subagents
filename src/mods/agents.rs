@@ -172,7 +172,10 @@ fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
         .get("session")
         .cloned()
         .filter(|s| s.is_object())
-        .unwrap_or_else(|| json!({"id": sid}));
+        .unwrap_or_else(|| {
+            json!({"id": owner_session(params.pointer("/session/id").and_then(Value::as_str))
+                .unwrap_or_default()})
+        });
     let v = backend("run", run, None, None).map_err(|e| e.to_string())?;
     let rids = v["run_ids"].as_array().cloned().unwrap_or_default();
     let names = v["names"].as_array().cloned().unwrap_or_default();
