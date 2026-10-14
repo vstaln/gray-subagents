@@ -25,6 +25,10 @@ GRAY_SUBAGENTS_DEPTH stamps each run's tree depth on the child env (bounded
 by GRAY_SUBAGENTS_MAX_DEPTH, default 4) so future nesting stays capped.
 GRAY_SESSION_ORIGIN=subagent marks child session files as auxiliary so they
 stay out of the parent's /resume picker while remaining steerable by id.
+Worktree isolation self-collects: on terminal runs a clean tree comes down
+and its sub/* ref dies once its tip is reachable from the repo HEAD — a
+throttled sweep (GRAY_SUBAGENTS_GC_SECS, 30) re-checks kept trees, unclaimed
+worktrees/ dirs and merged sub/* refs on every status call.
 """
 import contextlib
 import fcntl
@@ -599,6 +603,7 @@ def sweep():
             job.update(status="lost", error="supervisor exited before recording a result", finished=time.time())
             write_job(job)
             log_event(job["run_id"], "lost", reason="supervisor_exit")
+    gc_worktrees()
     start_queued()
 
 
@@ -1365,44 +1370,170 @@ def make_worktree(cwd, rid, name):
     return str(path), branch
 
 
+def _git_ok(args, cwd, timeout=20):
+    """git subprocess that degrades to None on spawn/timeout failure."""
+    try:
+        return subprocess.run(["git", "-C", str(cwd)] + args,
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def branch_collectible(repo, branch):
+    """The ref's tip is reachable from the repo's HEAD — merged work or a
+    branch nothing ever landed on. False only when commits sit past the
+    merge base: deleting the ref there would strand them as dangling
+    objects."""
+    if not branch:
+        return True
+    tip = _git_ok(["rev-parse", "--verify", "--quiet", branch], repo, 15)
+    if tip is None or tip.returncode != 0:
+        return True
+    base = _git_ok(["merge-base", "HEAD", branch], repo, 15)
+    out = base.stdout.strip() if base is not None else ""
+    return bool(out) and out == tip.stdout.strip()
+
+
+def gc_branch(repo, branch):
+    if branch and branch_collectible(repo, branch):
+        _git_ok(["branch", "-D", branch], repo)
+
+
 def drop_worktree(cwd, path, branch):
-    subprocess.run(["git", "-C", cwd, "worktree", "remove", "--force", path],
-                   capture_output=True, timeout=20)
-    # The branch is the committed work — drop it only when nothing landed
-    # on it (tip still reachable from the default branch). A clean tree
-    # after a commit is finished work, not litter: deleting the ref there
-    # strands the commits as dangling objects.
-    tip = subprocess.run(["git", "-C", cwd, "rev-parse", "--verify", "--quiet", branch],
-                         capture_output=True, text=True, timeout=15)
-    if tip.returncode != 0:
-        return
-    base = subprocess.run(["git", "-C", cwd, "merge-base", "HEAD", branch],
-                          capture_output=True, text=True, timeout=15).stdout.strip()
-    if base and base != tip.stdout.strip():
-        return  # branch has commits past the merge base — keep it
-    subprocess.run(["git", "-C", cwd, "branch", "-D", branch],
-                   capture_output=True, timeout=20)
+    _git_ok(["worktree", "remove", "--force", str(path)], cwd)
+    gc_branch(cwd, branch)
 
 
 def cleanup_worktree(job):
-    """Clean worktrees are removed with their branch; dirty ones stay and
-    get a note so the merge decision lands on the caller, not the sweeper."""
+    """Terminal runs: clean trees come down, dirty ones stay for review; the
+    branch is collected only when its tip is reachable from the repo's HEAD
+    (merged, or never committed). Abnormal exits keep their tree while the
+    run is still resumable, or while its branch carries unmerged commits —
+    the merge decision lands on the caller, not the sweeper."""
     wt, branch, repo = job.get("worktree"), job.get("branch"), job.get("cwd", "")
-    if not wt or not branch:
+    if not wt and not branch:
         return ""
-    if job.get("status") not in ("completed", "stopped"):
+    if job.get("status") in LIVE:
         why = "steer/chat can still resume it" if job.get("child_session") \
             else "inspect it, then merge or remove it"
         return f"worktree kept: run {job.get('status')} in {wt} (branch {branch}) — {why}"
+    note = ""
+    if wt and Path(wt).is_dir():
+        proc = _git_ok(["status", "--porcelain"], wt, 15)
+        clean = proc is not None and proc.returncode == 0 and not proc.stdout.strip()
+        abnormal = job["status"] not in ("completed", "stopped")
+        ahead = bool(branch) and not branch_collectible(repo, branch)
+        if not clean:
+            note = f"worktree kept: changes in {wt} (branch {branch}) — merge or remove it"
+        elif abnormal and job.get("child_session"):
+            note = (f"worktree kept: {job['status']} run in {wt} can still be"
+                    f" steered back (branch {branch})")
+        elif abnormal and ahead:
+            note = (f"worktree kept: {job['status']} run left unmerged commits on"
+                    f" {branch} — inspect {wt}, then merge or remove it")
+        else:
+            gone = _git_ok(["worktree", "remove", "--force", wt], repo)
+            if gone is not None and gone.returncode == 0:
+                job["worktree"] = ""
+                log_event(job["run_id"], "worktree_collected", status=job["status"])
+            else:
+                note = f"worktree kept: cleanup failed for {wt} (branch {branch})"
+    elif wt:
+        job["worktree"] = ""  # dir deleted by hand — stop pointing at it
+    if not job.get("worktree") and branch:
+        # Collect a reachable ref whenever the tree is gone — including on a
+        # later sweep, after its commits merged into the default branch.
+        gc_branch(repo, branch)
+        job["branch"] = ""
+    return note
+
+
+GC_STAMP_AGE = float(os.environ.get("GRAY_SUBAGENTS_GC_SECS") or "30")
+
+
+def _claimed_dir(d):
+    """Orphan worktree dir → (repo, branch) when it is a registered git
+    worktree checked out on a sub/* branch; anything else is left alone."""
+    if not (d / ".git").is_file():
+        return None
+    head = _git_ok(["rev-parse", "--abbrev-ref", "HEAD"], d, 15)
+    if head is None or not head.stdout.strip().startswith("sub/"):
+        return None
+    common = _git_ok(["rev-parse", "--git-common-dir"], d, 15)
+    if common is None or not common.stdout.strip():
+        return None
+    return str(Path(common.stdout.strip()).resolve().parent), head.stdout.strip()
+
+
+def gc_worktrees():
+    """Second-chance pass behind cleanup_worktree: terminal runs' kept trees
+    get re-checked (a branch that merged since is no longer unmergeable),
+    worktrees/ dirs no run claims get the same provable-empty test, and
+    merged sub/* refs in repos runs touched are collected. Throttled by a
+    stamp file — each pass is one git probe per candidate."""
+    stamp = root() / "worktrees" / ".gc-stamp"
     try:
-        proc = subprocess.run(["git", "-C", wt, "status", "--porcelain"],
-                              capture_output=True, text=True, timeout=15)
-        if proc.returncode != 0 or proc.stdout.strip():
-            return f"worktree kept: changes in {wt} (branch {branch}) — merge or remove it"
-        drop_worktree(repo, wt, branch)
-        return ""
-    except (OSError, subprocess.TimeoutExpired):
-        return f"worktree kept: cleanup failed for {wt} (branch {branch})"
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < GC_STAMP_AGE:
+            return
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+    except OSError:
+        pass
+    jobs = all_jobs()
+    claimed_dirs = {str(Path(j["worktree"]).resolve()) for j in jobs if j.get("worktree")}
+    claimed_branches = {(str(Path(j.get("cwd") or "/").resolve()), j["branch"])
+                        for j in jobs if j.get("branch")}
+    repos = {str(Path(j["cwd"]).resolve()) for j in jobs if j.get("cwd")}
+    for job in jobs:
+        if job["status"] in LIVE or not (job.get("worktree") or job.get("branch")):
+            continue
+        before = (job.get("worktree"), job.get("branch"), job.get("worktree_note"))
+        try:
+            job["worktree_note"] = cleanup_worktree(job)
+        except Exception:
+            continue
+        if (job.get("worktree"), job.get("branch"), job.get("worktree_note")) != before:
+            write_job(job)
+    try:
+        orphans = [d for d in (root() / "worktrees").iterdir() if d.is_dir()]
+    except OSError:
+        orphans = []
+    for d in orphans:
+        if str(d.resolve()) in claimed_dirs:
+            continue
+        try:
+            # A spawn creates the tree before its run record lands — a dir
+            # younger than a minute may still be mid-admission, not orphaned.
+            if time.time() - d.stat().st_mtime < 60:
+                continue
+            hit = _claimed_dir(d)
+            if not hit:
+                continue
+            repo, branch = hit
+            proc = _git_ok(["status", "--porcelain"], d, 15)
+            clean = proc is not None and proc.returncode == 0 \
+                and not proc.stdout.strip()
+            if not clean or not branch_collectible(repo, branch):
+                continue
+            gone = _git_ok(["worktree", "remove", "--force", str(d)], repo)
+            if gone is not None and gone.returncode == 0:
+                _git_ok(["branch", "-D", branch], repo)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    for repo in repos:
+        refs = _git_ok(["for-each-ref", "refs/heads/sub",
+                        "--format=%(refname:short) %(creatordate:unix)"], repo, 15)
+        if refs is None or refs.returncode != 0:
+            continue
+        for line in refs.stdout.splitlines():
+            branch, _, created = line.rpartition(" ")
+            if (repo, branch) in claimed_branches:
+                continue
+            # Same admission race as the dir pass: a ref born seconds ago may
+            # belong to a run whose record has not been written yet.
+            if created.isdigit() and time.time() - int(created) < 60:
+                continue
+            gc_branch(repo, branch)
 
 
 def spawn_jobs(args, session):
