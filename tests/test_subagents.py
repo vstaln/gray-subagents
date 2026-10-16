@@ -599,6 +599,11 @@ class SidecarCase(unittest.TestCase):
         self.assertIn("output limit", st["error"])
         self.assertLessEqual(len(st["result"].encode()), 262144)
 
+    def test_output_volume_does_not_kill_run(self):
+        rid = self.spawn(env_extra={"FAKE_MODE": "verbose"})["run_id"]
+        st = self.wait_status(rid, "completed")
+        self.assertTrue(st["result"].strip())
+
     def test_parallel_batch_and_no_partial_launch_on_invalid_task(self):
         bad = self.sc.call("subagent", {"tasks": [{"task": "first"}, {"agent": "missing", "task": "second"}]})
         self.assertTrue(bad["is_error"])

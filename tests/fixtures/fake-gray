@@ -41,6 +41,13 @@ if mode == "flood":
     while True:
         sys.stdout.write("x" * 65536)
         sys.stdout.flush()
+if mode == "verbose":
+    # >256KiB of well-formed protocol rows: progress chatter must not kill
+    # a run that still delivers its result.
+    for i in range(6000):
+        print(json.dumps({"protocol": 1, "session_id": SID, "type": "progress",
+                          "phase": "tool_ran", "tool": "bash",
+                          "label": "step %d" % i, "call_id": "c%d" % i}), flush=True)
 if mode == "chatty":
     print(json.dumps({"protocol": 1, "session_id": SID, "type": "progress",
                       "phase": "tool_ran", "tool": "bash", "label": "Bash",

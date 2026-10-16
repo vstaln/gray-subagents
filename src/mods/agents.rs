@@ -464,7 +464,7 @@ pub fn manifest_tools() -> Value {
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
             "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, agent?, name?, model?, effort?, context?}"},
-            "name": {"type": "string"}, "model": {"type": "string"},
+            "name": {"type": "string"}, "model": {"type": "string", "description": "model id, or provider/model to pin a provider (e.g. claude/claude-haiku-5-5); bare ids ride the session's own provider"},
             "effort": {"type": "string"},
             "context": {"type": "string", "description": "context ceiling passed as GRAY_COMPACT_AT: '90k', '300k', '1m', or 'auto'; above 200k a Claude model auto-uses its [1m] route — Haiku bills 5x past 100k"},
             "agent": {"type": "string", "description": "profile (scout|worker|oracle|reviewer)"},

@@ -954,8 +954,13 @@ def provider_catalog_ids():
 
 
 def configured_listing_key():
-    """The provider_models.json source key for the parent's own provider:
-    'plugin:<lock>:<id>' when config.provider_id is 'lock:id', else base_url."""
+    """The provider_models.json source key for the caller's own provider: the
+    session's exported GRAY_PROVIDER_ID ('plugin:<lock>:<id>') when present —
+    the saved config is last-writer-wins across sessions — else
+    config.provider_id in the same shape, else base_url."""
+    env_pid = os.environ.get("GRAY_PROVIDER_ID", "").strip()
+    if ":" in env_pid:
+        return "plugin:" + env_pid
     config = read_json_file(home() / "config.json")
     if not isinstance(config, dict):
         return None
@@ -2092,7 +2097,7 @@ def run_phase(rid, prompt, resume_sid, job):
         job = read_job(rid)
         job.update(child_pid=proc.pid, child_birth=identity(proc.pid))
         write_job(job)
-    raw, pending = bytearray(), b""
+    pending = b""
     st = {"sid": "", "activity": "", "result": "", "error_row": "", "plain": bytearray(),
           "tools": 0, "ok_tools": 0, "writes": 0, "calls": {}, "seq": 0}
     status, error = "failed", "supervisor did not finish"
@@ -2129,7 +2134,9 @@ def run_phase(rid, prompt, resume_sid, job):
             elif row.get("type") == "error":
                 st["error_row"] = row.get("message") or str(row.get("code") or "error")
         else:
-            st["plain"].extend(line + b"\n")
+            room = OUTPUT_LIMIT - len(st["plain"])
+            if room > 0:
+                st["plain"].extend((line + b"\n")[:room])
 
     try:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -2175,14 +2182,12 @@ def run_phase(rid, prompt, resume_sid, job):
                 events = selector.select(.05)
                 if events:
                     chunk = os.read(proc.stdout.fileno(), 65536)
-                    room = OUTPUT_LIMIT - len(raw)
-                    raw.extend(chunk[:room])
-                    if len(chunk) > room:
-                        status, error = "failed", "child exceeded output limit (256 KiB)"
-                        break
                     if not chunk:
                         selector.unregister(proc.stdout)
-                    pending += chunk[:room]
+                    pending += chunk
+                    if len(pending) > OUTPUT_LIMIT and b"\n" not in pending:
+                        status, error = "failed", "child exceeded output limit (256 KiB, unterminated line)"
+                        break
                     while b"\n" in pending:
                         line, pending = pending.split(b"\n", 1)
                         feed(line)
