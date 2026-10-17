@@ -1659,17 +1659,22 @@ fn sidecar() -> Result<()> {
                                 max_running: None,
                             }) => Ok(json!({"subagent_settings":"subagents"})),
                             Some(action) => execute(action, session.as_ref())
-                                .map(|v| json!({"text":present(&v)})),
+                                .map(|v| json!({"text":present(&v)}))
+                                .map_err(|e| (json!("invalid"), e.to_string())),
                             None => Ok(json!({"agent_picker":"subagents"})),
                         },
                     }
                 }
             }
-            _ => Err(anyhow::anyhow!("unsupported sidecar method")),
+            m => Err((
+                json!(-32601),
+                format!("method not found: {}", m.unwrap_or("")),
+            )),
         };
         let reply = match result {
             Ok(result) => json!({"id":req["id"],"result":result}),
-            Err(e) => json!({"id":req["id"],"error":e.to_string()}),
+            Err((code, msg)) => json!({"id":req["id"],"error":{
+                "code":code,"message":msg,"retryable":false,"terminal":true}}),
         };
         println!("{reply}");
         io::stdout().flush()?;
