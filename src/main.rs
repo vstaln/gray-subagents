@@ -343,6 +343,7 @@ pub(crate) struct Entry {
     pub session: String,
     /// Registry status verbatim; adopted workers are always "running".
     pub status: String,
+    pub owner: String,
     /// Registry runs accept steer/chat; raw `gray -p` workers do not.
     pub managed: bool,
     /// Creation time — `last` selects the newest run regardless of the
@@ -350,13 +351,9 @@ pub(crate) struct Entry {
     pub created: f64,
 }
 
-/// Every registered run plus adopted `gray -p` workers. Runs list globally —
-/// each row carries its owner in `session`, which is what the host's panel
-/// filters on — while worker *adoption* stays session-scoped in
-/// `foreign_scan` (`all` adopts everything). `include_stale` keeps finished
-/// runs past the widget's 30s fade — the menu selects old runs for
-/// `open`/`chat`.
 pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
+    let cwd = std::env::current_dir()?;
+    let my_sid = owner_session(None);
     let dir = home()?.join("subagents/runs");
     let mut managed_pids = std::collections::HashSet::new();
     let mut entries = Vec::new();
@@ -378,6 +375,7 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                 .as_f64()
                 .unwrap_or(0.0)
                 .total_cmp(&b["created"].as_f64().unwrap_or(0.0))
+                .then_with(|| a["run_id"].as_str().cmp(&b["run_id"].as_str()))
         });
         for job in jobs {
             let status = job["status"].as_str().unwrap_or("lost");
@@ -387,7 +385,6 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
             let live = active || status == "queued";
             // Any run whose child is still alive is managed, whatever its status:
             // a stopped or finished run can leave its child running for a while,
-            // and that child must never be adopted as a raw worker.
             if let Some(pid) = job["child_pid"].as_u64()
                 && match job["child_birth"].as_str() {
                     Some(birth) => {
@@ -397,6 +394,15 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                 }
             {
                 managed_pids.insert(pid);
+            }
+            let job_sid = job["session_id"].as_str().unwrap_or("");
+            let visible = if job_sid.is_empty() {
+                my_sid.is_none() && job["cwd"].as_str().map(PathBuf::from).as_ref() == Some(&cwd)
+            } else {
+                my_sid.as_deref() == Some(job_sid)
+            };
+            if !all && !visible {
+                continue;
             }
             // The widget fades finished runs quickly; the menu keeps them
             // selectable (that's where `open`/`chat` act on them).
@@ -475,6 +481,7 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                 target: job["run_id"].as_str().unwrap_or("").into(),
                 session: job["child_session"].as_str().unwrap_or("").into(),
                 status: status.into(),
+                owner: job["session_id"].as_str().unwrap_or("").into(),
                 managed: true,
                 created: job["created"].as_f64().unwrap_or(0.0),
             });
@@ -485,6 +492,7 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
             target: w.session.clone().unwrap_or_else(|| w.name.clone()),
             session: w.session.clone().unwrap_or_default(),
             status: "running".into(),
+            owner: String::new(),
             managed: false,
             created: now_epoch() - w.elapsed,
             row: AgentRow {
@@ -519,7 +527,12 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
 /// newest-first. Menu numbers follow this order.
 pub(crate) fn menu_order(mut entries: Vec<Entry>) -> Vec<Entry> {
     let live = |e: &Entry| matches!(e.row.state, AgentState::Running { .. } | AgentState::Queued);
-    entries.sort_by(|a, b| live(b).cmp(&live(a)).then(b.created.total_cmp(&a.created)));
+    entries.sort_by(|a, b| {
+        live(b)
+            .cmp(&live(a))
+            .then(b.created.total_cmp(&a.created))
+            .then(b.target.cmp(&a.target))
+    });
     entries
 }
 
@@ -1230,9 +1243,39 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>, scoped: bool) -> Vec<F
     workers
 }
 
-/// `stop <pid|name>` for an adopted worker: TERM, then KILL if it lingers.
-/// Only fires on workers in this session's tree — anything else falls
-/// through to the registry.
+fn managed_pids() -> std::collections::HashSet<u64> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(dir) = home().map(|h| h.join("subagents/runs")) else {
+        return out;
+    };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(job) = serde_json::from_slice::<Value>(&raw) else {
+            continue;
+        };
+        let Some(pid) = job["child_pid"].as_u64() else {
+            continue;
+        };
+        let owned = match job["child_birth"].as_str() {
+            Some(birth) => start_ticks(pid).map(|t| t.to_string()).as_deref() == Some(birth),
+            None => true,
+        };
+        if owned {
+            out.insert(pid);
+        }
+    }
+    out
+}
+
 /// Live descendants of root_pid via /proc ppid links. Scanned BEFORE the
 /// root is signalled — ppid links die with it, and orphaned plugin
 /// sidecars (a worker carries ~a dozen) would otherwise linger.
@@ -1271,7 +1314,7 @@ fn signal_proc_or_group(pid: u64, sig: &str) {
 }
 
 pub(crate) fn foreign_stop(rid: &str) -> Option<Value> {
-    let worker = foreign_scan(&std::collections::HashSet::new(), false)
+    let worker = foreign_scan(&managed_pids(), owner_session(None).is_some())
         .into_iter()
         .find(|w| w.name == rid || w.pid.to_string() == rid || w.session.as_deref() == Some(rid))?;
     let mut tree = descendants_of(worker.pid);
@@ -1369,6 +1412,7 @@ fn entries_json(all: bool) -> Result<Value> {
                 },
                 "activity": activity,
                 "session": e.session,
+                "owner": e.owner,
                 "target": e.target,
                 "managed": e.managed,
                 "running": running,
@@ -1615,17 +1659,22 @@ fn sidecar() -> Result<()> {
                                 max_running: None,
                             }) => Ok(json!({"subagent_settings":"subagents"})),
                             Some(action) => execute(action, session.as_ref())
-                                .map(|v| json!({"text":present(&v)})),
+                                .map(|v| json!({"text":present(&v)}))
+                                .map_err(|e| (json!("invalid"), e.to_string())),
                             None => Ok(json!({"agent_picker":"subagents"})),
                         },
                     }
                 }
             }
-            _ => Err(anyhow::anyhow!("unsupported sidecar method")),
+            m => Err((
+                json!(-32601),
+                format!("method not found: {}", m.unwrap_or("")),
+            )),
         };
         let reply = match result {
             Ok(result) => json!({"id":req["id"],"result":result}),
-            Err(e) => json!({"id":req["id"],"error":e.to_string()}),
+            Err((code, msg)) => json!({"id":req["id"],"error":{
+                "code":code,"message":msg,"retryable":false,"terminal":true}}),
         };
         println!("{reply}");
         io::stdout().flush()?;

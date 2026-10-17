@@ -599,6 +599,11 @@ class SidecarCase(unittest.TestCase):
         self.assertIn("output limit", st["error"])
         self.assertLessEqual(len(st["result"].encode()), 262144)
 
+    def test_output_volume_does_not_kill_run(self):
+        rid = self.spawn(env_extra={"FAKE_MODE": "verbose"})["run_id"]
+        st = self.wait_status(rid, "completed")
+        self.assertTrue(st["result"].strip())
+
     def test_parallel_batch_and_no_partial_launch_on_invalid_task(self):
         bad = self.sc.call("subagent", {"tasks": [{"task": "first"}, {"agent": "missing", "task": "second"}]})
         self.assertTrue(bad["is_error"])
@@ -860,13 +865,81 @@ class SidecarCase(unittest.TestCase):
         self.assertIn("worktree kept", st["content"])
         self.assertIn("steer", st["content"])
 
-    def test_failed_run_keeps_clean_worktree(self):
+    def test_failed_run_collects_empty_worktree(self):
         repo = self.git_repo()
+        # "fail" leaves no child session and nothing lands on the branch —
+        # nothing to inspect, so the tree and its empty ref are reclaimed.
         rid = self.spawn(task="boom", env_extra={"FAKE_MODE": "fail"},
                          args_extra={"isolation": "worktree"}, cwd=repo)["run_id"]
         st = self.wait_status(rid, "failed")
-        self.assertTrue(self.worktree_path(rid).is_dir())
+        self.assertFalse(self.worktree_path(rid).exists())
+        self.assertNotIn("worktree kept", st["content"])
+        branches = subprocess.run(["git", "-C", str(repo), "branch", "--list", "sub/*"],
+                                  capture_output=True, text=True).stdout
+        self.assertEqual(branches.strip(), "")
+
+    def test_timed_out_run_keeps_dirty_worktree(self):
+        repo = self.git_repo()
+        # slow sleeps through its timeout window — the run ends unresumable,
+        # but uncommitted changes in the tree are the thing to inspect.
+        rid = self.spawn(task="hang", env_extra={"FAKE_MODE": "slow", "FAKE_SLEEP": "30"},
+                         args_extra={"isolation": "worktree", "timeout": 1},
+                         cwd=repo)["run_id"]
+        (self.worktree_path(rid) / "leftover.txt").write_text("partial\n")
+        st = self.wait_status(rid, "timeout", tries=200)
+        self.assertTrue((self.worktree_path(rid) / "leftover.txt").is_file())
         self.assertIn("worktree kept", st["content"])
+
+    def test_merged_branch_sweeps_kept_worktree(self):
+        repo = self.git_repo()
+        # slow never prints a session before the timeout kills it — terminal
+        # and unresumable — but a commit lands on its branch during the run.
+        rid = self.spawn(task="hang", env_extra={"FAKE_MODE": "slow", "FAKE_SLEEP": "30"},
+                         args_extra={"isolation": "worktree", "timeout": 1},
+                         cwd=repo)["run_id"]
+        wt = self.worktree_path(rid)
+        branch = subprocess.run(["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()
+        self.assertTrue(branch.startswith("sub/"))
+        (wt / "work.txt").write_text("kept\n")
+        for argv in (["git", "add", "work.txt"], ["git", "commit", "-qm", "sub work"]):
+            subprocess.run(argv, cwd=wt, check=True, capture_output=True)
+        st = self.wait_status(rid, "timeout", tries=200)
+        self.assertTrue(wt.is_dir())
+        self.assertIn("unmerged", st["content"])
+        # Once the work merges, the next sweep reclaims both tree and ref.
+        subprocess.run(["git", "-C", str(repo), "merge", "--no-ff", "-qm", "merge", branch],
+                       check=True, capture_output=True)
+        stamp = self.home / "subagents" / "worktrees" / ".gc-stamp"
+        stamp.unlink(missing_ok=True)
+        self.sc.call("subagents_status", {})
+        self.assertFalse(wt.exists())
+        branches = subprocess.run(["git", "-C", str(repo), "branch", "--list", "sub/*"],
+                                  capture_output=True, text=True).stdout
+        self.assertEqual(branches.strip(), "")
+
+    def test_orphan_worktree_dir_is_collected(self):
+        repo = self.git_repo()
+        # No run record points here: a registered worktree on a collectible
+        # sub/* branch is litter — while a plain look-alike dir is not ours.
+        orphan = self.home / "subagents" / "worktrees" / "deadbeef-orphan"
+        orphan.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", str(orphan),
+                        "-b", "sub/stale-orphan"], check=True, capture_output=True)
+        # Backdate past the admission grace — a run that crashed mid-spawn
+        # leaves a dir this old, not a fresh one.
+        old_mtime = time.time() - 300
+        os.utime(orphan, (old_mtime, old_mtime))
+        stranger = self.home / "subagents" / "worktrees" / "gray-acp-bridge"
+        stranger.mkdir(exist_ok=True)
+        stamp = self.home / "subagents" / "worktrees" / ".gc-stamp"
+        stamp.unlink(missing_ok=True)
+        self.sc.call("subagents_status", {})
+        self.assertFalse(orphan.exists())
+        self.assertTrue(stranger.is_dir())
+        branches = subprocess.run(["git", "-C", str(repo), "branch", "--list", "sub/stale-orphan"],
+                                  capture_output=True, text=True).stdout
+        self.assertEqual(branches.strip(), "")
 
     def test_successful_run_removes_clean_worktree(self):
         repo = self.git_repo()

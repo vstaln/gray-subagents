@@ -25,6 +25,10 @@ GRAY_SUBAGENTS_DEPTH stamps each run's tree depth on the child env (bounded
 by GRAY_SUBAGENTS_MAX_DEPTH, default 4) so future nesting stays capped.
 GRAY_SESSION_ORIGIN=subagent marks child session files as auxiliary so they
 stay out of the parent's /resume picker while remaining steerable by id.
+Worktree isolation self-collects: on terminal runs a clean tree comes down
+and its sub/* ref dies once its tip is reachable from the repo HEAD — a
+throttled sweep (GRAY_SUBAGENTS_GC_SECS, 30) re-checks kept trees, unclaimed
+worktrees/ dirs and merged sub/* refs on every status call.
 """
 import contextlib
 import fcntl
@@ -197,6 +201,24 @@ EFFORT_SUFFIXES = frozenset({"off", "minimal", "low", "medium", "high", "xhigh",
 SUPERVISORS = []
 NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
 RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
+
+WRITE_TOOLS = frozenset({
+    "edit", "write", "notebook_edit", "multi_edit", "apply_patch", "patch",
+    "create_file", "delete_file", "move_file", "str_replace", "fs_write"})
+WRITE_DETAIL = re.compile(
+    r">>?(?!&)"
+    r"|\bsed\b[^\n|;&]*\s-i\b|\bperl\b[^\n|;&]*\s-i\b|\btee\b|\bpatch\b"
+    r"|\bgit\s+(?:-[a-zA-Z]\s*\S+\s+)*(?:add|am|apply|checkout|cherry-pick|clean|"
+    r"clone|commit|config|fetch|init|merge|mv|pull|push|rebase|reset|restore|"
+    r"revert|rm|stash|switch|tag|worktree)\b|\bgit\s+branch\s+-[dDmM]"
+    r"|\b(?:rm|mv|cp|mkdir|rmdir|touch|ln|chmod|chown|chgrp|truncate|dd|"
+    r"install|rsync|scp|shred|unzip)\b|\btar\b[^\n|;&]*[xzc]"
+    r"|\b(?:curl|wget)\b[^\n|;&]*\s-[oO]\b"
+    r"|\b(?:cargo|npm|pnpm|yarn|pip3?|apt(?:-get)?|brew|go|gem|mvn|gradle|"
+    r"composer)\s+(?:add|install|i|ci|build|test|publish|run|fix|fmt|clippy|"
+    r"generate|new|init|update|upgrade|remove|uninstall|exec|x)\b"
+    r"|\b(?:make|cmake|ninja|pytest|tox|rustfmt|gofmt|black|ruff\s+format|"
+    r"clang-format)\b")
 
 ADJ = ("amber", "brisk", "calm", "delta", "ember", "faint", "grand", "hazy",
        "ionic", "jade", "keen", "lunar", "misty", "nova", "opal", "prime",
@@ -581,6 +603,7 @@ def sweep():
             job.update(status="lost", error="supervisor exited before recording a result", finished=time.time())
             write_job(job)
             log_event(job["run_id"], "lost", reason="supervisor_exit")
+    gc_worktrees()
     start_queued()
 
 
@@ -931,8 +954,13 @@ def provider_catalog_ids():
 
 
 def configured_listing_key():
-    """The provider_models.json source key for the parent's own provider:
-    'plugin:<lock>:<id>' when config.provider_id is 'lock:id', else base_url."""
+    """The provider_models.json source key for the caller's own provider: the
+    session's exported GRAY_PROVIDER_ID ('plugin:<lock>:<id>') when present —
+    the saved config is last-writer-wins across sessions — else
+    config.provider_id in the same shape, else base_url."""
+    env_pid = os.environ.get("GRAY_PROVIDER_ID", "").strip()
+    if ":" in env_pid:
+        return "plugin:" + env_pid
     config = read_json_file(home() / "config.json")
     if not isinstance(config, dict):
         return None
@@ -1189,7 +1217,14 @@ def job_view(job):
     activity = f"\n{job.get('activity', '')}" if job["status"] in ACTIVE and job.get("activity") else ""
     dur = (job.get("finished") or time.time()) - job.get("created", time.time())
     tools = job.get("tool_count") or 0
-    stats = f" · {dur:.0f}s" + (f" · {tools} tool calls" if tools else "")
+    stats = f" · {dur:.0f}s"
+    if job["status"] in LIVE:
+        stats += f" · {tools} tool calls" if tools else ""
+    else:
+        stats += f" · ended: {tools} calls"
+        writes = job.get("write_count")
+        if writes is not None:
+            stats += ", no writes" if not writes else f", {writes} writes"
     head = " · ".join(x for x in (job.get("model", ""),
                                   f"ctx {job['context']}" if job.get("context") else "") if x)
     model = f" <{head}>" if head else ""
@@ -1201,6 +1236,15 @@ def job_view(job):
         result = f"(partial output — run did not finish{resume})\n{result}"
     view["content"] = limited(f"{run_handle(job)} [{job['status']}{queue}] {job['agent']}{model} · run {job['run_id']}{stats}{activity}\n{job.get('error', '')}\n{result}{wt}")
     return view
+
+
+def write_flag(job):
+    """' · no writes' on a terminal run — a corpse (read-only calls, no file
+    changes) reads differently from a finish that changed something."""
+    if job.get("status") in LIVE or "write_count" not in job:
+        return ""
+    writes = job.get("write_count") or 0
+    return f" · {writes} writes" if writes else " · no writes"
 
 
 def status_job(rid=None, sid="", all_runs=False):
@@ -1216,7 +1260,7 @@ def status_job(rid=None, sid="", all_runs=False):
     def line(j):
         head = " · ".join(x for x in (j.get("model", ""),
                                      f"ctx {j['context']}" if j.get("context") else "") if x)
-        return (f"{run_handle(j)} [{j['status']}] {j['agent']}"
+        return (f"{run_handle(j)} [{j['status']}{write_flag(j)}] {j['agent']}"
                 f"{f' <{head}>' if head else ''}: {j['task'][:100]}")
     keys = ("run_id", "name", "agent", "status", "created", "model", "effort", "context")
     # Session-less runs have no prompt/context hook to drain them: report
@@ -1331,44 +1375,170 @@ def make_worktree(cwd, rid, name):
     return str(path), branch
 
 
+def _git_ok(args, cwd, timeout=20):
+    """git subprocess that degrades to None on spawn/timeout failure."""
+    try:
+        return subprocess.run(["git", "-C", str(cwd)] + args,
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def branch_collectible(repo, branch):
+    """The ref's tip is reachable from the repo's HEAD — merged work or a
+    branch nothing ever landed on. False only when commits sit past the
+    merge base: deleting the ref there would strand them as dangling
+    objects."""
+    if not branch:
+        return True
+    tip = _git_ok(["rev-parse", "--verify", "--quiet", branch], repo, 15)
+    if tip is None or tip.returncode != 0:
+        return True
+    base = _git_ok(["merge-base", "HEAD", branch], repo, 15)
+    out = base.stdout.strip() if base is not None else ""
+    return bool(out) and out == tip.stdout.strip()
+
+
+def gc_branch(repo, branch):
+    if branch and branch_collectible(repo, branch):
+        _git_ok(["branch", "-D", branch], repo)
+
+
 def drop_worktree(cwd, path, branch):
-    subprocess.run(["git", "-C", cwd, "worktree", "remove", "--force", path],
-                   capture_output=True, timeout=20)
-    # The branch is the committed work — drop it only when nothing landed
-    # on it (tip still reachable from the default branch). A clean tree
-    # after a commit is finished work, not litter: deleting the ref there
-    # strands the commits as dangling objects.
-    tip = subprocess.run(["git", "-C", cwd, "rev-parse", "--verify", "--quiet", branch],
-                         capture_output=True, text=True, timeout=15)
-    if tip.returncode != 0:
-        return
-    base = subprocess.run(["git", "-C", cwd, "merge-base", "HEAD", branch],
-                          capture_output=True, text=True, timeout=15).stdout.strip()
-    if base and base != tip.stdout.strip():
-        return  # branch has commits past the merge base — keep it
-    subprocess.run(["git", "-C", cwd, "branch", "-D", branch],
-                   capture_output=True, timeout=20)
+    _git_ok(["worktree", "remove", "--force", str(path)], cwd)
+    gc_branch(cwd, branch)
 
 
 def cleanup_worktree(job):
-    """Clean worktrees are removed with their branch; dirty ones stay and
-    get a note so the merge decision lands on the caller, not the sweeper."""
+    """Terminal runs: clean trees come down, dirty ones stay for review; the
+    branch is collected only when its tip is reachable from the repo's HEAD
+    (merged, or never committed). Abnormal exits keep their tree while the
+    run is still resumable, or while its branch carries unmerged commits —
+    the merge decision lands on the caller, not the sweeper."""
     wt, branch, repo = job.get("worktree"), job.get("branch"), job.get("cwd", "")
-    if not wt or not branch:
+    if not wt and not branch:
         return ""
-    if job.get("status") not in ("completed", "stopped"):
+    if job.get("status") in LIVE:
         why = "steer/chat can still resume it" if job.get("child_session") \
             else "inspect it, then merge or remove it"
         return f"worktree kept: run {job.get('status')} in {wt} (branch {branch}) — {why}"
+    note = ""
+    if wt and Path(wt).is_dir():
+        proc = _git_ok(["status", "--porcelain"], wt, 15)
+        clean = proc is not None and proc.returncode == 0 and not proc.stdout.strip()
+        abnormal = job["status"] not in ("completed", "stopped")
+        ahead = bool(branch) and not branch_collectible(repo, branch)
+        if not clean:
+            note = f"worktree kept: changes in {wt} (branch {branch}) — merge or remove it"
+        elif abnormal and job.get("child_session"):
+            note = (f"worktree kept: {job['status']} run in {wt} can still be"
+                    f" steered back (branch {branch})")
+        elif abnormal and ahead:
+            note = (f"worktree kept: {job['status']} run left unmerged commits on"
+                    f" {branch} — inspect {wt}, then merge or remove it")
+        else:
+            gone = _git_ok(["worktree", "remove", "--force", wt], repo)
+            if gone is not None and gone.returncode == 0:
+                job["worktree"] = ""
+                log_event(job["run_id"], "worktree_collected", status=job["status"])
+            else:
+                note = f"worktree kept: cleanup failed for {wt} (branch {branch})"
+    elif wt:
+        job["worktree"] = ""  # dir deleted by hand — stop pointing at it
+    if not job.get("worktree") and branch:
+        # Collect a reachable ref whenever the tree is gone — including on a
+        # later sweep, after its commits merged into the default branch.
+        gc_branch(repo, branch)
+        job["branch"] = ""
+    return note
+
+
+GC_STAMP_AGE = float(os.environ.get("GRAY_SUBAGENTS_GC_SECS") or "30")
+
+
+def _claimed_dir(d):
+    """Orphan worktree dir → (repo, branch) when it is a registered git
+    worktree checked out on a sub/* branch; anything else is left alone."""
+    if not (d / ".git").is_file():
+        return None
+    head = _git_ok(["rev-parse", "--abbrev-ref", "HEAD"], d, 15)
+    if head is None or not head.stdout.strip().startswith("sub/"):
+        return None
+    common = _git_ok(["rev-parse", "--git-common-dir"], d, 15)
+    if common is None or not common.stdout.strip():
+        return None
+    return str(Path(common.stdout.strip()).resolve().parent), head.stdout.strip()
+
+
+def gc_worktrees():
+    """Second-chance pass behind cleanup_worktree: terminal runs' kept trees
+    get re-checked (a branch that merged since is no longer unmergeable),
+    worktrees/ dirs no run claims get the same provable-empty test, and
+    merged sub/* refs in repos runs touched are collected. Throttled by a
+    stamp file — each pass is one git probe per candidate."""
+    stamp = root() / "worktrees" / ".gc-stamp"
     try:
-        proc = subprocess.run(["git", "-C", wt, "status", "--porcelain"],
-                              capture_output=True, text=True, timeout=15)
-        if proc.returncode != 0 or proc.stdout.strip():
-            return f"worktree kept: changes in {wt} (branch {branch}) — merge or remove it"
-        drop_worktree(repo, wt, branch)
-        return ""
-    except (OSError, subprocess.TimeoutExpired):
-        return f"worktree kept: cleanup failed for {wt} (branch {branch})"
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < GC_STAMP_AGE:
+            return
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+    except OSError:
+        pass
+    jobs = all_jobs()
+    claimed_dirs = {str(Path(j["worktree"]).resolve()) for j in jobs if j.get("worktree")}
+    claimed_branches = {(str(Path(j.get("cwd") or "/").resolve()), j["branch"])
+                        for j in jobs if j.get("branch")}
+    repos = {str(Path(j["cwd"]).resolve()) for j in jobs if j.get("cwd")}
+    for job in jobs:
+        if job["status"] in LIVE or not (job.get("worktree") or job.get("branch")):
+            continue
+        before = (job.get("worktree"), job.get("branch"), job.get("worktree_note"))
+        try:
+            job["worktree_note"] = cleanup_worktree(job)
+        except Exception:
+            continue
+        if (job.get("worktree"), job.get("branch"), job.get("worktree_note")) != before:
+            write_job(job)
+    try:
+        orphans = [d for d in (root() / "worktrees").iterdir() if d.is_dir()]
+    except OSError:
+        orphans = []
+    for d in orphans:
+        if str(d.resolve()) in claimed_dirs:
+            continue
+        try:
+            # A spawn creates the tree before its run record lands — a dir
+            # younger than a minute may still be mid-admission, not orphaned.
+            if time.time() - d.stat().st_mtime < 60:
+                continue
+            hit = _claimed_dir(d)
+            if not hit:
+                continue
+            repo, branch = hit
+            proc = _git_ok(["status", "--porcelain"], d, 15)
+            clean = proc is not None and proc.returncode == 0 \
+                and not proc.stdout.strip()
+            if not clean or not branch_collectible(repo, branch):
+                continue
+            gone = _git_ok(["worktree", "remove", "--force", str(d)], repo)
+            if gone is not None and gone.returncode == 0:
+                _git_ok(["branch", "-D", branch], repo)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    for repo in repos:
+        refs = _git_ok(["for-each-ref", "refs/heads/sub",
+                        "--format=%(refname:short) %(creatordate:unix)"], repo, 15)
+        if refs is None or refs.returncode != 0:
+            continue
+        for line in refs.stdout.splitlines():
+            branch, _, created = line.rpartition(" ")
+            if (repo, branch) in claimed_branches:
+                continue
+            # Same admission race as the dir pass: a ref born seconds ago may
+            # belong to a run whose record has not been written yet.
+            if created.isdigit() and time.time() - int(created) < 60:
+                continue
+            gc_branch(repo, branch)
 
 
 def spawn_jobs(args, session):
@@ -1490,7 +1660,7 @@ def spawn_jobs(args, session):
                        tools=p["tools"] or "", narrow_env=p["narrow_env"],
                        narrow_note=p["narrow_note"], isolation=p["isolation"] or "",
                        worktree=p["worktree"], branch=p["branch"],
-                       tool_count=0, worktree_note="",
+                       tool_count=0, write_count=0, worktree_note="",
                        cwd=cwd, session_id=owner_session(session.get("id") or ""), binary=str(Path(binary).resolve()),
                        timeout=p["timeout"], max_phases=p["max_phases"], depth=depth,
                        created=time.time(),
@@ -1834,8 +2004,8 @@ def view_transcript(rid, lines=None):
         job = read_job(resolve_rid(rid))
         sid = job.get("child_session") or None
         tag = f" <{job['model']}>" if job.get("model") else ""
-        header = (f"{run_handle(job)} [{job['status']}] {job['agent']}{tag}"
-                  f" — {job['task'][:160]}")
+        header = (f"{run_handle(job)} [{job['status']}{write_flag(job)}]"
+                  f" {job['agent']}{tag} — {job['task'][:160]}")
     except ValueError:
         sid = foreign_session_id(rid)
         if sid:
@@ -1853,6 +2023,16 @@ def view_transcript(rid, lines=None):
     tail = "\n".join(body) or "(empty transcript)"
     note = f"session {sid} · last {lines} entries" if len(entries) > lines else f"session {sid}"
     return {"content": limited(f"{header}\n{tail}\n— {note}")}
+
+
+def is_write_call(name, detail):
+    """Tool-started/ran rows → whether the call plausibly writes files."""
+    name = (name or "").lower()
+    if name in WRITE_TOOLS:
+        return True
+    if name in ("bash", "exec", "shell", "sh"):
+        return bool(detail and WRITE_DETAIL.search(detail))
+    return False
 
 
 def describe_row(row):
@@ -1880,11 +2060,14 @@ def run_phase(rid, prompt, resume_sid, job):
 
     Protocol rows (protocol==1) yield the child session id, live activity and
     the final text; any other stdout is kept verbatim as the result fallback
-    so older/plain children still work. Returns (status, error, result, ok_tools)
-    where ok_tools counts tool calls that ran without an error marker — the
-    stall guard's progress evidence."""
+    so older/plain children still work. Returns (status, error, result,
+    ok_tools, writes); ok_tools counts tool calls that ran without an error
+    marker — the stall guard's progress evidence — and writes counts calls
+    that plausibly changed files (the empty-completion marker's evidence)."""
     binary, timeout = job["binary"], job["timeout"]
-    cwd = job.get("worktree") or job["cwd"]
+    cwd = job.get("worktree") or ""
+    if not cwd or not Path(cwd).is_dir():
+        cwd = job["cwd"]
     env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", GRAY_SESSION_ORIGIN="subagent",
                GRAY_SUBAGENTS_DEPTH=str(job.get("depth") or 1),
                NO_COLOR="1", TERM="dumb", GRAY_SHOW_REASONING="0")
@@ -1914,9 +2097,9 @@ def run_phase(rid, prompt, resume_sid, job):
         job = read_job(rid)
         job.update(child_pid=proc.pid, child_birth=identity(proc.pid))
         write_job(job)
-    raw, pending = bytearray(), b""
+    pending = b""
     st = {"sid": "", "activity": "", "result": "", "error_row": "", "plain": bytearray(),
-          "tools": 0, "ok_tools": 0}
+          "tools": 0, "ok_tools": 0, "writes": 0, "calls": {}, "seq": 0}
     status, error = "failed", "supervisor did not finish"
 
     def feed(line):
@@ -1929,18 +2112,31 @@ def run_phase(rid, prompt, resume_sid, job):
                 st["sid"] = row["session_id"]
             if row.get("type") == "progress":
                 st["activity"] = describe_row(row)
-                if row.get("phase") == "tool_started":
-                    st["tools"] += 1
-                elif row.get("phase") in ("tool_ran", "tool_finished") \
-                        and row.get("ok") is not False and not row.get("error") \
-                        and not row.get("is_error"):
-                    st["ok_tools"] += 1
+                if row.get("phase") in ("tool_started", "tool_ran", "tool_finished"):
+                    cid = row.get("call_id")
+                    if not cid:
+                        st["seq"] += 1
+                        cid = f"~{st['seq']}"
+                    call = st["calls"].setdefault(cid, [False, False])
+                    st["tools"] = len(st["calls"])
+                    if not call[0] and row.get("phase") in ("tool_ran", "tool_finished") \
+                            and row.get("ok") is not False and not row.get("error") \
+                            and not row.get("is_error"):
+                        call[0] = True
+                        st["ok_tools"] += 1
+                    if not call[1] and is_write_call(
+                            row.get("tool") or row.get("label") or "",
+                            row.get("detail") or ""):
+                        call[1] = True
+                        st["writes"] += 1
             elif row.get("type") == "result":
                 st["result"] = row.get("text") or ""
             elif row.get("type") == "error":
                 st["error_row"] = row.get("message") or str(row.get("code") or "error")
         else:
-            st["plain"].extend(line + b"\n")
+            room = OUTPUT_LIMIT - len(st["plain"])
+            if room > 0:
+                st["plain"].extend((line + b"\n")[:room])
 
     try:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -1959,6 +2155,11 @@ def run_phase(rid, prompt, resume_sid, job):
                         changed = True
                     if st["tools"] != job.get("tool_count"):
                         job["tool_count"] = st["tools"]
+                        changed = True
+                    writes = st["writes"] + sum(
+                        (p.get("writes") or 0) for p in job["phases"][:-1])
+                    if writes != job.get("write_count"):
+                        job["write_count"] = writes
                         changed = True
                     if changed:
                         write_job(job)
@@ -1981,14 +2182,12 @@ def run_phase(rid, prompt, resume_sid, job):
                 events = selector.select(.05)
                 if events:
                     chunk = os.read(proc.stdout.fileno(), 65536)
-                    room = OUTPUT_LIMIT - len(raw)
-                    raw.extend(chunk[:room])
-                    if len(chunk) > room:
-                        status, error = "failed", "child exceeded output limit (256 KiB)"
-                        break
                     if not chunk:
                         selector.unregister(proc.stdout)
-                    pending += chunk[:room]
+                    pending += chunk
+                    if len(pending) > OUTPUT_LIMIT and b"\n" not in pending:
+                        status, error = "failed", "child exceeded output limit (256 KiB, unterminated line)"
+                        break
                     while b"\n" in pending:
                         line, pending = pending.split(b"\n", 1)
                         feed(line)
@@ -2011,7 +2210,7 @@ def run_phase(rid, prompt, resume_sid, job):
             else:
                 status = "failed"
                 error = st["error_row"] or (f"child exited {code}" if code else "child returned empty output")
-        return status, error, result, st["ok_tools"]
+        return status, error, result, st["ok_tools"], st["writes"]
     finally:
         kill_tree(proc.pid)
         proc.wait()
@@ -2048,6 +2247,42 @@ def supervise(rid):
     guard and the max_phases budget can end it first."""
     final_status, final_error = "failed", "supervisor did not finish"
     final_reason = ""
+    settled = False
+
+    def settle(status, error, reason):
+        """Terminal write; the caller holds registry(). Settling inside the
+        hold that observed the terminal state keeps a raced steer — queued
+        while the record still read "running" — from being orphaned on a run
+        that already reported itself finished."""
+        nonlocal settled
+        job = read_job(rid)
+        if job["status"] == "stopping":
+            status, error = "stopped", "stopped by request"
+            if job.get("stop_note"):
+                error += f"; {job['stop_note']}"
+            reason = "cancelled"
+        job.update(status=status, error=error,
+                   finished=time.time(), noticed=False)
+        try:
+            job["worktree_note"] = cleanup_worktree(job)
+        except Exception:
+            pass
+        write_job(job)
+        log_event(rid, job["status"], reason=reason or None,
+                  error=dig(job.get("error")) if job.get("error") else None,
+                  phases=len(job.get("phases") or []))
+        try:
+            if notify_parent_inbox(job):
+                job["noticed"] = True
+                write_job(job)
+        except Exception:
+            pass
+        try:
+            start_queued()  # this run's slot is free: admit the next queued run
+        except Exception:
+            pass
+        settled = True
+
     try:
         while True:
             with registry():
@@ -2062,33 +2297,35 @@ def supervise(rid):
                 else:
                     queue = job.setdefault("steer_queue", [])
                     if not queue:
-                        final_status, final_error = "completed", ""
+                        settle("completed", "", "")
                         return
                     limit = job.get("max_phases") or DEFAULT_MAX_PHASES
                     if len(phases) >= limit:
-                        final_status = "failed"
-                        final_error = f"phase budget exhausted ({limit} phases)"
-                        final_reason = "max_phases"
+                        settle("failed", f"phase budget exhausted ({limit} phases)",
+                               "max_phases")
                         return
                     prompt = queue.pop(0)
                     resume_sid = job.get("child_session")
                     if not resume_sid:
-                        final_status, final_error = "failed", "child session unavailable for steering"
+                        settle("failed", "child session unavailable for steering", "")
                         return
                     kind = "steer"
                 phases.append({"kind": kind, "prompt": prompt[:2000],
                                "started": time.time(), "status": "running",
-                               "result": "", "error": "", "tools": 0})
+                               "result": "", "error": "", "tools": 0,
+                               "writes": 0})
                 job["activity"] = ""
                 write_job(job)
                 log_event(rid, "phase_started", n=len(phases), kind=kind,
                           prompt=dig(prompt), resume=bool(resume_sid))
-            pst, perr, ptext, ptools = run_phase(rid, prompt, resume_sid, job)
+            pst, perr, ptext, ptools, pwrites = run_phase(rid, prompt, resume_sid, job)
             with registry():
                 job = read_job(rid)
                 phase = job["phases"][-1]
                 phase.update(status=pst, error=perr, result=ptext,
-                             finished=time.time(), tools=ptools)
+                             finished=time.time(), tools=ptools, writes=pwrites)
+                job["write_count"] = sum(
+                    (p.get("writes") or 0) for p in job["phases"])
                 if ptext:
                     job["result"] = ptext
                 stopping = job["status"] == "stopping"
@@ -2097,52 +2334,25 @@ def supervise(rid):
                 else:
                     job["error"] = perr
                 write_job(job)
-                n_phases = len(job["phases"])
+                log_event(rid, "phase_ended", n=len(job["phases"]), status=pst,
+                          tools=ptools, error=dig(perr) if perr else None)
                 stall_code, stall_msg = ("", "") if stopping else stall_guard(job["phases"])
-            log_event(rid, "phase_ended", n=n_phases, status=pst, tools=ptools,
-                      error=dig(perr) if perr else None)
-            if stopping or pst == "stopped":
-                return
-            if stall_code:
-                final_status, final_error = "stalled", f"stalled: {stall_msg}"
-                final_reason = stall_code
-                return
-            if pst != "ok":
-                final_status, final_error = pst, perr
-                return
+                if stopping or pst == "stopped":
+                    settle("stopped", "stopped by request", "")
+                    return
+                if not job.get("steer_queue"):
+                    if stall_code:
+                        settle("stalled", f"stalled: {stall_msg}", stall_code)
+                        return
+                    if pst != "ok":
+                        settle(pst, perr, "")
+                        return
     except Exception as exc:
         final_status, final_error = "failed", f"supervisor failed: {type(exc).__name__}: {exc}"
     finally:
-        with registry():
-            job = read_job(rid)
-            if job["status"] == "stopping":
-                final_status, final_error = "stopped", "stopped by request"
-                if job.get("stop_note"):
-                    final_error += f"; {job['stop_note']}"
-                final_reason = "cancelled"
-            job.update(status=final_status, error=final_error,
-                       finished=time.time(), noticed=False)
-            try:
-                job["worktree_note"] = cleanup_worktree(job)
-            except Exception:
-                pass
-            write_job(job)
-            log_event(rid, job["status"], reason=final_reason or None,
-                      error=dig(job.get("error")) if job.get("error") else None,
-                      phases=len(job.get("phases") or []))
-            # Idle-parent wake: the inbox file is the delivery — a session
-            # without a live poller keeps it until next open (deferred),
-            # exactly like a bash-job notice.
-            try:
-                if notify_parent_inbox(job):
-                    job["noticed"] = True
-                    write_job(job)
-            except Exception:
-                pass
-            try:
-                start_queued()  # this run's slot is free: admit the next queued run
-            except Exception:
-                pass
+        if not settled:
+            with registry():
+                settle(final_status, final_error, final_reason)
 
 
 def wire_sid(params):

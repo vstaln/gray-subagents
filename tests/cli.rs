@@ -11,6 +11,7 @@ fn bin() -> Command {
             cmd.env_remove(key);
         }
     }
+    cmd.env("GRAY_SESSION_ID", "");
     cmd
 }
 
@@ -327,6 +328,60 @@ fn bare_status_is_the_menu_and_all_is_the_table() {
     let all = content(run(&["status", "--all"]));
     assert!(all.contains("menu-run"), "{all}");
     assert!(all.contains("[completed]"), "{all}");
+}
+
+#[test]
+fn entries_scope_runs_to_their_owner_session() {
+    let home = tempfile::tempdir().unwrap();
+    for i in 0..3 {
+        seed_job(
+            home.path(),
+            &format!("{:032x}", 0x1000 + i),
+            serde_json::json!({"name": format!("orphan-{i}")}),
+        );
+    }
+    seed_job(
+        home.path(),
+        &"a".repeat(32),
+        serde_json::json!({"name": "a-run", "session_id": "sess-a"}),
+    );
+    let names = |args: &[&str], sid: Option<&str>| {
+        let mut cmd = bin();
+        cmd.args(args).env("GRAY_HOME", home.path());
+        if let Some(sid) = sid {
+            cmd.env("GRAY_SESSION_ID", sid);
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    let seeded = ["orphan-0", "orphan-1", "orphan-2", "a-run"];
+    let other = names(&["entries"], Some("sess-b"));
+    assert!(
+        !seeded.iter().any(|n| other.iter().any(|e| e == n)),
+        "{other:?}"
+    );
+    let owned = names(&["entries"], Some("sess-a"));
+    assert_eq!(owned, ["a-run"], "{owned:?}");
+    let all = names(&["entries", "--all"], Some("sess-b"));
+    assert!(
+        seeded.iter().all(|n| all.iter().any(|e| e == n)),
+        "{all:?}"
+    );
+    let orphan_view = names(&["entries"], None);
+    assert!(
+        ["orphan-0", "orphan-1", "orphan-2"]
+            .iter()
+            .all(|n| orphan_view.iter().any(|e| e == n))
+            && !orphan_view.iter().any(|e| e == "a-run"),
+        "{orphan_view:?}"
+    );
 }
 
 #[test]
