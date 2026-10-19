@@ -91,6 +91,8 @@ fn widget_demo_uses_real_rust_renderer() {
     assert!(text.contains("searching"), "{text}");
 }
 
+// The child is a `#!/bin/sh` script exec'd via its mode bits — unix only.
+#[cfg(unix)]
 #[test]
 fn bash_cli_runs_child_with_selected_model_and_returns_status() {
     let home = tempfile::tempdir().unwrap();
@@ -174,6 +176,8 @@ fn run_rejects_invalid_effort_and_unknown_model() {
     assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("vendor/good-model"));
 }
 
+// Same `#!/bin/sh` child — unix only.
+#[cfg(unix)]
 #[test]
 fn run_joins_unquoted_task_words_and_keeps_flags() {
     let home = tempfile::tempdir().unwrap();
