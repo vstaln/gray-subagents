@@ -228,7 +228,7 @@ pub(crate) fn backend(
     use std::io::Write;
     file.write_all(include_bytes!("../mod"))?;
     file.persist(&runtime)?;
-    let mut cmd = Command::new("python3");
+    let mut cmd = Command::new(python_program());
     // gray-narrow is folded into this binary: default GRAY_NARROW_BIN to
     // ourselves so `run --tools` works without a separate install.
     if std::env::var_os("GRAY_NARROW_BIN").is_none() {
@@ -739,6 +739,41 @@ pub(crate) fn chat(target: &str, message: Vec<String>) -> Result<Value> {
         None,
         None,
     )
+}
+
+/// Interpreter for the bundled supervisor: `python3` on unix; elsewhere the
+/// first of python3/python/py on PATH (Windows has no python3 alias — `py`
+/// is the installed launcher), keeping "python3" as the fallback so the
+/// spawn error names what it looked for.
+fn python_program() -> &'static str {
+    #[cfg(unix)]
+    {
+        "python3"
+    }
+    #[cfg(not(unix))]
+    {
+        for cand in ["python3", "python", "py"] {
+            if on_path(cand) {
+                return cand;
+            }
+        }
+        "python3"
+    }
+}
+
+/// `name` executable resolvable on PATH, PATHEXT-aware on Windows.
+#[cfg(not(unix))]
+fn on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    std::env::split_paths(&paths).any(|d| {
+        d.join(name).is_file()
+            || pathext
+                .split(';')
+                .any(|e| !e.trim().is_empty() && d.join(format!("{name}{}", e.trim())).is_file())
+    })
 }
 
 /// /proc/<pid>/stat fields after the comm: index 1 is ppid, index 19 is the
