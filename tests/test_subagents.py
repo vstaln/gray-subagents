@@ -480,6 +480,18 @@ class SidecarCase(unittest.TestCase):
         r2 = self.sc.call("subagents_stop", {"run_id": rid})
         self.assertTrue(r2.get("is_error"))
 
+    def test_stop_all_is_session_local_and_global_flag_reaches_others(self):
+        slow = dict(FAKE_MODE="slow", FAKE_SLEEP="30")
+        other = self.spawn(task="theirs", env_extra=dict(slow, GRAY_SESSION_ID="sess-other"))["run_id"]
+        mine = self.spawn(task="mine", env_extra=slow)["run_id"]
+        self.wait_status(mine, "running")
+        self.sc.call("subagents_stop", {"run_id": "all"})
+        self.wait_status(mine, "stopped")
+        self.assertIn(self.sc.call("subagents_status", {"run_id": other})["status"],
+                      ("running", "queued"), "stop all must not touch another session's run")
+        self.sc.call("subagents_stop", {"run_id": "all", "global": True})
+        self.wait_status(other, "stopped")
+
     def test_run_id_prefix_and_last_resolution(self):
         rid = self.sc.call("subagent", {"agent": "scout", "task": "short me"})["run_id"]
         self.wait_status(rid, "completed")

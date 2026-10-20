@@ -113,10 +113,13 @@ enum Action {
         #[arg(long, default_value = "40")]
         lines: usize,
     },
-    /// Cancel a run by name/id, `all` for every running run, or bare for
-    /// just this session's runs.
+    /// Cancel a run by name/id, or bare / `all` for this session's runs.
+    /// `--global` stops every running run on this machine, other sessions included.
     Stop {
         run_id: Option<String>,
+        /// Stop runs owned by every session, not just this one.
+        #[arg(long)]
+        global: bool,
     },
     List,
     Widget {
@@ -203,7 +206,7 @@ pub(crate) fn backend(
         "if action=='run': result=ns['spawn_jobs'](args,args.get('session') or {'cwd':__import__('os').getcwd()})\n",
         "elif action=='status': result=ns['status_job'](args.get('run_id'),(args.get('session') or {}).get('id',''),bool(args.get('all')))\n",
         "elif action=='view': result=ns['view_transcript'](args.get('run_id'),args.get('lines'))\n",
-        "elif action=='stop': result=ns['stop_job'](args.get('run_id'),(args.get('session') or {}).get('id',''))\n",
+        "elif action=='stop': result=ns['stop_job'](args.get('run_id'),(args.get('session') or {}).get('id',''),bool(args.get('global')))\n",
         "elif action=='steer': result=ns['steer_job'](args['run_id'],args['message'])\n",
         "elif action=='context': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''))}\n",
         "elif action=='notices': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''),False)}\n",
@@ -602,7 +605,7 @@ fn menu() -> Result<Value> {
     let mut text = render_menu(&rows);
     text.push_str(&format!(
         "\n  N|NAME selects · open — enter a finished run's session · chat '…' — talk · view · steer{}",
-        if running > 0 { " · stop N|all|mine" } else { "" }
+        if running > 0 { " · stop N|all · stop all --global" } else { "" }
     ));
     Ok(json!({"content": text}))
 }
@@ -1524,7 +1527,7 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             None,
             None,
         ),
-        Action::Stop { run_id } => {
+        Action::Stop { run_id, global } => {
             let rid = run_id
                 .map(|t| menu_target(&t))
                 .unwrap_or_else(|| "mine".to_string());
@@ -1538,7 +1541,7 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
                         owner_session(session.and_then(|s| s["id"].as_str())).unwrap_or_default();
                     backend(
                         "stop",
-                        json!({"run_id": rid, "session": {"id": sid}}),
+                        json!({"run_id": rid, "global": global, "session": {"id": sid}}),
                         None,
                         None,
                     )

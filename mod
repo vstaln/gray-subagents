@@ -1273,18 +1273,20 @@ def status_job(rid=None, sid="", all_runs=False):
             "jobs": [{k: j.get(k, "") for k in keys} for j in jobs]}
 
 
-def stop_job(rid, sid=""):
+def stop_job(rid, sid="", everywhere=False):
     sid = owner_session(sid)
     with registry():
         sweep()
         if rid and rid not in ("all", "mine"):
             jobs = [read_job(resolve_rid(rid))]
-        elif rid == "all":
+        elif everywhere:
+            # Explicit `stop --global`: every live run on this machine,
+            # including runs owned by other sessions.
             jobs = [j for j in all_jobs() if j["status"] in LIVE]
         else:
-            # "mine" (bare stop): this session's runs. With no resolvable
-            # session it hits only session-less (manual) runs — never jobs
-            # owned by another session.
+            # "all" / "mine" / bare stop: this session's runs only. With no
+            # resolvable session it hits only session-less (manual) runs —
+            # never jobs owned by another session.
             cwd = str(Path(os.getcwd()).resolve())
             jobs = [j for j in all_jobs() if j["status"] in LIVE and visible_to(j, sid, cwd)]
         if not jobs:
@@ -2384,7 +2386,7 @@ def dispatch(method, params):
         if name == "subagents_view":
             return view_transcript(args.get("run_id"), args.get("lines"))
         if name == "subagents_stop":
-            return stop_job(args.get("run_id"), wire_sid(params))
+            return stop_job(args.get("run_id"), wire_sid(params), bool(args.get("global")))
         if name == "subagents_steer":
             return steer_job(args.get("run_id"), args.get("message"))
         if name == "subagents_list":
@@ -2407,11 +2409,14 @@ def dispatch(method, params):
             if len(argv) > 2 and argv[2] == "--lines" and len(argv) > 3:
                 lines = int(argv[3])
             return {"text": view_transcript(argv[1], lines)["content"]}
-        if argv[:1] == ["stop"] and len(argv) == 2:
-            return {"text": stop_job(argv[1], wire_sid(params))["content"]}
+        if argv[:1] == ["stop"] and len(argv) <= 3:
+            rest = [a for a in argv[1:] if a != "--global"]
+            if len(rest) <= 1:
+                return {"text": stop_job(rest[0] if rest else "mine", wire_sid(params),
+                                         "--global" in argv)["content"]}
         if argv[:1] == ["steer"] and len(argv) >= 3:
             return {"text": steer_job(argv[1], " ".join(argv[2:]))["content"]}
-        return {"text": "Usage: /subagents setup|list|status [RUN_ID]|view RUN_ID [--lines N]|stop RUN_ID|steer RUN_ID MESSAGE"}
+        return {"text": "Usage: /subagents setup|list|status [RUN_ID]|view RUN_ID [--lines N]|stop [RUN_ID|all] [--global]|steer RUN_ID MESSAGE"}
     raise ValueError(f"unknown method {method}")
 
 
