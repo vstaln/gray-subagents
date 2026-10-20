@@ -86,7 +86,7 @@ fn widget_demo_uses_real_rust_renderer() {
     let panel: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let text = panel["text"].as_str().unwrap();
     assert!(!text.contains("Agents\n"));
-    assert!(text.contains("\n   /subagents — open · chat · stop\n"));
+    assert!(text.contains("2 subagents"));
     assert!(text.contains("● auth-scout"));
     assert!(text.contains("searching"), "{text}");
 }

@@ -92,8 +92,7 @@ pub fn render_widget_spans(
         .iter()
         .filter(|a| matches!(a.state, AgentState::Queued))
         .count();
-    // Running rows lead, indented under a plain count header, so the panel
-    // so the panel reads as this turn's children, not as host tool rows.
+    // Running rows lead so the panel reads as this turn's children.
     let ordered: Vec<&AgentRow> = agents
         .iter()
         .filter(|a| is_running(a))
@@ -103,9 +102,7 @@ pub fn render_widget_spans(
                 .filter(|a| !is_running(a) && !matches!(a.state, AgentState::Queued)),
         )
         .collect();
-    let running = ordered.iter().filter(|a| is_running(a)).count();
-    let finished = ordered.len() - running;
-    // Body lines; header, overflow and affordance reserve the rest. The
+    // Body lines; overflow marker and affordance reserve the rest. The
     // host band caps to screen height itself, so a generous budget only ever
     // helps — eight running agents ≈ 16 body lines.
     let budget = 24;
@@ -137,26 +134,19 @@ pub fn render_widget_spans(
         .max()
         .unwrap_or(0);
 
-    let mut lines = vec![String::new()];
+    let mut lines: Vec<String> = vec![String::new()];
     let mut spans = Vec::new();
-    let mut counts = Vec::new();
-    for (n, label) in [(running, "running"), (queued, "queued"), (finished, "done")] {
-        if n > 0 {
-            counts.push(format!("{n} {label}"));
-        }
-    }
     let total = ordered.len() + queued;
     lines.push(format!(
-        "{total} subagent{} \u{b7} {}",
+        "{total} subagent{}",
         if total == 1 { "" } else { "s" },
-        counts.join(" \u{b7} ")
     ));
     if offset > 0 {
-        lines.push(format!("  \u{2191}{offset} above"));
+        lines.push(format!(" \u{2191}{offset} above"));
     }
     for a in shown.iter() {
         let name: String = clean(&a.name).chars().take(name_w).collect();
-        let mut line = format!("  {} {name:<name_w$}", state_icon(&a.state));
+        let mut line = format!(" {} {name:<name_w$}", state_icon(&a.state));
         if model_w > 0 {
             line.push_str(&format!("  {:<model_w$}", a.model));
         }
@@ -168,18 +158,16 @@ pub fn render_widget_spans(
             line.push_str(&format!("  {tail}"));
         }
         if is_running(a) {
-            spans.push((lines.len(), 2, 4 + name.chars().count()));
+            spans.push((lines.len(), 1, 3 + name.chars().count()));
         }
         lines.push(line.trim_end().to_string());
         if let Some(activity) = activity_of(a) {
-            lines.push(format!("      {activity}"));
+            lines.push(format!("     {activity}"));
         }
     }
     if hidden > 0 {
-        lines.push(format!("  +{hidden} more"));
+        lines.push(format!(" +{hidden} more"));
     }
-    lines.push(String::new());
-    lines.push("   /subagents \u{2014} open \u{b7} chat \u{b7} stop".to_string());
     lines.push(String::new());
     (lines.join("\n"), spans)
 }
@@ -322,17 +310,17 @@ mod tests {
         let (text, spans) = render_widget_spans(&rows, 0);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "");
-        assert_eq!(lines[1], "2 subagents \u{b7} 1 running \u{b7} 1 done");
+        assert_eq!(lines[1], "2 subagents");
         assert_eq!(
             lines[2],
-            "  \u{25cf} fan-count  Haiku 5.5  28s  What is 17*23?"
+            " \u{25cf} fan-count  Haiku 5.5  28s  What is 17*23?"
         );
-        assert_eq!(lines[3], "      $ ls src");
-        assert_eq!(lines[4], "  \u{2713} fan-math   Haiku 5.5  28s  391");
-        assert_eq!(lines[5], "");
-        assert!(lines[6].contains("/subagents \u{2014} open"));
-        assert_eq!(spans, vec![(2, 2, 13)]);
-        let shimmered: String = lines[2].chars().skip(2).take(11).collect();
+        assert_eq!(lines[3], "     $ ls src");
+        assert_eq!(lines[4], " \u{2713} fan-math   Haiku 5.5  28s  391");
+        assert_eq!(lines.len(), 5);
+        assert!(text.ends_with('\n'));
+        assert_eq!(spans, vec![(2, 1, 12)]);
+        let shimmered: String = lines[2].chars().skip(1).take(11).collect();
         assert_eq!(shimmered, "\u{25cf} fan-count");
     }
 
@@ -352,7 +340,7 @@ mod tests {
             .collect();
         let (text, _) = render_widget_spans(&rows, 0);
         assert!(!text.contains("more"), "{text}");
-        assert!(text.contains("/subagents"), "{text}");
+        assert!(text.contains("8 subagents"), "{text}");
         assert_eq!(text.matches("\u{25cf}").count(), 8);
     }
 
