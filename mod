@@ -1324,6 +1324,15 @@ def settings():
     raw = os.environ.get("GRAY_SUBAGENTS_TIMEOUT_SECS")
     ttl = None if raw is None else float(raw)  # unset: runs never time out
     cap = int(os.environ.get("GRAY_SUBAGENTS_MAX_RUNNING", "128"))
+    # The saved setting wins over the env snapshot: a long-lived supervisor
+    # inherited the cap of its launch, and `settings --max-running N` since
+    # then must still bind when it admits queued runs.
+    try:
+        saved = json.loads((root() / "settings.json").read_text()).get("max_running")
+        if isinstance(saved, int) and not isinstance(saved, bool):
+            cap = saved
+    except (OSError, ValueError, AttributeError):
+        pass
     if (ttl is not None and (not math.isfinite(ttl) or not 0 < ttl <= 86400)) \
             or not 1 <= cap <= 1024:
         raise ValueError("timeout must be >0 and <=86400 seconds; max running 1–1024")

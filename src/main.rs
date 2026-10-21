@@ -1593,10 +1593,12 @@ fn sidecar() -> Result<()> {
         }
         // Folded-in gray-narrow surface: its hooks/tools/commands go straight
         // to the narrow module's own dispatcher (it emits a full reply).
-        if matches!(
-            req["method"].as_str(),
-            Some("tool/before") | Some("tool/call")
-        ) || (req["method"].as_str() == Some("command/run")
+        // tool/call only owns narrow_delegate — any other name falls through
+        // to "method not found" instead of running a narrowed spawn.
+        if req["method"].as_str() == Some("tool/before")
+            || (req["method"].as_str() == Some("tool/call")
+                && req["params"]["name"].as_str() == Some("narrow_delegate"))
+            || (req["method"].as_str() == Some("command/run")
             && matches!(
                 req["params"]["name"].as_str(),
                 Some("/narrow") | Some("narrow")
@@ -1714,6 +1716,13 @@ mod tests {
     }
 }
 
+fn stdin_is_pipe() -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata("/proc/self/fd/0")
+        .map(|m| m.file_type().is_fifo() || m.file_type().is_socket())
+        .unwrap_or(true)
+}
+
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     // Folded-in gray-narrow argv surface:
@@ -1757,7 +1766,11 @@ fn main() -> Result<()> {
             return Ok(());
         }
     };
-    if let Some(action) = cli.command {
+    // Bare argv is ambiguous: the host spawns the sidecar with piped stdin,
+    // while `gray subagents` from a shell or the host's cli passthrough
+    // (stdin = tty or /dev/null) means "show the menu", per the README.
+    let action = cli.command.or_else(|| (!stdin_is_pipe()).then_some(Action::Menu));
+    if let Some(action) = action {
         println!("{}", serde_json::to_string_pretty(&execute(action, None)?)?);
         Ok(())
     } else {
