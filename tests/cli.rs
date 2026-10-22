@@ -352,7 +352,11 @@ fn entries_scope_runs_to_their_owner_session() {
             cmd.env("GRAY_SESSION_ID", sid);
         }
         let out = cmd.output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         v["entries"]
             .as_array()
@@ -370,10 +374,7 @@ fn entries_scope_runs_to_their_owner_session() {
     let owned = names(&["entries"], Some("sess-a"));
     assert_eq!(owned, ["a-run"], "{owned:?}");
     let all = names(&["entries", "--all"], Some("sess-b"));
-    assert!(
-        seeded.iter().all(|n| all.iter().any(|e| e == n)),
-        "{all:?}"
-    );
+    assert!(seeded.iter().all(|n| all.iter().any(|e| e == n)), "{all:?}");
     let orphan_view = names(&["entries"], None);
     assert!(
         ["orphan-0", "orphan-1", "orphan-2"]

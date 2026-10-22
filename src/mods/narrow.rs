@@ -476,7 +476,15 @@ fn do_run_narrow(
     if !session.is_empty() {
         env.push(("GRAY_SESSION_ID".into(), session.into()));
     }
-    let pid = spawn_child(&prompt, &env, cwd, &planned.run_id, &name, route.as_ref(), effort)?;
+    let pid = spawn_child(
+        &prompt,
+        &env,
+        cwd,
+        &planned.run_id,
+        &name,
+        route.as_ref(),
+        effort,
+    )?;
     let ev = grant_event(
         via,
         &planned.run_id,

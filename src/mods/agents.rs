@@ -102,9 +102,7 @@ fn batch_items(tasks: &[Value]) -> Vec<Value> {
                 None | Some(Value::Null) => true,
                 Some(task) => task.as_str() == Some(""),
             };
-            if task_missing
-                && let Some(prompt) = item.get("prompt").cloned()
-            {
+            if task_missing && let Some(prompt) = item.get("prompt").cloned() {
                 item["task"] = prompt;
             }
             item

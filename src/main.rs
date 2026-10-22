@@ -5,13 +5,14 @@ use gray_subagents::widget::{
 };
 use serde_json::{Value, json};
 
+#[path = "mods/agents.rs"]
+mod agents;
+mod model_catalog;
 #[path = "mods/narrow.rs"]
 mod narrow;
 #[path = "mods/narrow_lib.rs"]
 pub mod narrow_lib;
-#[path = "mods/agents.rs"]
-mod agents;
-mod model_catalog;
+mod panel;
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
@@ -22,7 +23,8 @@ use std::{
 #[command(
     name = "gray-subagents",
     version,
-    about = "Gray subagent plugin: Bash commands and an on-demand agents panel"
+    about = "Gray subagent plugin: Bash commands and an on-demand agents panel",
+    after_help = USAGE_DETAIL
 )]
 struct Cli {
     #[command(subcommand)]
@@ -137,7 +139,7 @@ pub(crate) fn home() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".gray")))
         .context("cannot resolve Gray home")
 }
-fn settings(
+pub(crate) fn settings(
     model: Option<String>,
     cap: Option<u32>,
     effort: Option<String>,
@@ -427,7 +429,11 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                             .and_then(session_activity)
                             .unwrap_or_else(|| job["activity"].as_str().unwrap_or("").into());
                         let a = a.strip_prefix("$ ").unwrap_or(&a);
-                        if a.is_empty() { "working…".into() } else { a.into() }
+                        if a.is_empty() {
+                            "working…".into()
+                        } else {
+                            a.into()
+                        }
                     },
                 },
                 "queued" => AgentState::Queued,
@@ -592,7 +598,7 @@ pub(crate) fn menu_target(target: &str) -> String {
 
 /// The interactive `/subagents` menu: same flat voice as the widget, each
 /// row numbered so one word selects it. Session-scoped like the widget.
-fn menu() -> Result<Value> {
+pub(crate) fn menu() -> Result<Value> {
     let entries = menu_order(collect_entries(true, false)?);
     if entries.is_empty() {
         return Ok(json!({"content": "  no runs yet — gray subagents run 'task' to start one"}));
@@ -1355,9 +1361,9 @@ pub(crate) fn check_context(value: &str) -> Result<String> {
     let digits = v.strip_suffix(['k', 'm']).unwrap_or(&v);
     let mut parts = digits.split('.');
     let number = matches!(parts.next(), Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        && parts
-            .next()
-            .map_or(true, |p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().map_or(true, |p| {
+            !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
+        })
         && parts.next().is_none();
     let positive = digits.parse::<f64>().is_ok_and(|n| n > 0.0);
     anyhow::ensure!(
@@ -1383,7 +1389,9 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] [--max-phases N] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--max-running N]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. A run is marked stalled after 2 consecutive phases with no successful tool call or the same error 3 times in a row; each run's phase budget (default 32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every transition is audited to runs/<id>.events.jsonl. Runs are detached — they keep going if this session ends. The subagent_spawn/subagent_check/subagent_message/subagent_stop/subagent_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
+const USAGE: &str = "Subagents: delegate from bash with `gray subagents run --name NAME [--agent PROFILE] [--isolation worktree] 'task'`, then `gray subagents status|view|steer|stop ID` (or load the subagent_* tools). Always pass a descriptive --name; use --isolation worktree when parallel runs edit the same repo. Runs are detached and outlive this session. `gray subagents --help` documents every option.";
+
+const USAGE_DETAIL: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] [--max-phases N] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--max-running N]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. A run is marked stalled after 2 consecutive phases with no successful tool call or the same error 3 times in a row; each run's phase budget (default 32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every transition is audited to runs/<id>.events.jsonl. Runs are detached — they keep going if this session ends. The subagent_spawn/subagent_check/subagent_message/subagent_stop/subagent_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
 
 /// JSON rows for the host's agents panel: the same entries the text menu
 /// numbers, plus the session/target fields its actions need.
@@ -1599,10 +1607,10 @@ fn sidecar() -> Result<()> {
             || (req["method"].as_str() == Some("tool/call")
                 && req["params"]["name"].as_str() == Some("narrow_delegate"))
             || (req["method"].as_str() == Some("command/run")
-            && matches!(
-                req["params"]["name"].as_str(),
-                Some("/narrow") | Some("narrow")
-            ))
+                && matches!(
+                    req["params"]["name"].as_str(),
+                    Some("/narrow") | Some("narrow")
+                ))
         {
             let (reply, _) = narrow::handle_narrow(&req);
             if let Some(reply) = reply {
@@ -1644,10 +1652,14 @@ fn sidecar() -> Result<()> {
                 let mut argv = vec!["gray-subagents".to_string()];
                 argv.extend(args.iter().filter_map(|v| v.as_str().map(str::to_owned)));
                 if argv.len() == 1 {
-                    // Bare `/subagents` opens the host's interactive panel:
-                    // rows/actions ride this CLI via `entries`/`open`/
-                    // `view`/`stop`/`chat`.
-                    Ok(json!({"agent_picker":"subagents"}))
+                    // Bare `/subagents` hands the terminal to this CLI's
+                    // own panel (`gray subagents panel`); rows/actions
+                    // ride `entries`/`view`/`stop`/`chat` in-process.
+                    let text = menu()
+                        .ok()
+                        .and_then(|v| v["content"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    Ok(json!({"terminal": ["panel"], "text": text}))
                 } else {
                     let session = req["params"].get("session").cloned();
                     match Cli::try_parse_from(preprocess(argv)) {
@@ -1662,11 +1674,17 @@ fn sidecar() -> Result<()> {
                                 effort: None,
                                 context: None,
                                 max_running: None,
-                            }) => Ok(json!({"subagent_settings":"subagents"})),
+                            }) => Ok(json!({"terminal": ["panel"]})),
                             Some(action) => execute(action, session.as_ref())
                                 .map(|v| json!({"text":present(&v)}))
                                 .map_err(|e| (json!("invalid"), e.to_string())),
-                            None => Ok(json!({"agent_picker":"subagents"})),
+                            None => {
+                                let text = menu()
+                                    .ok()
+                                    .and_then(|v| v["content"].as_str().map(str::to_string))
+                                    .unwrap_or_default();
+                                Ok(json!({"terminal": ["panel"], "text": text}))
+                            }
                         },
                     }
                 }
@@ -1706,11 +1724,15 @@ mod tests {
 
     #[test]
     fn context_parses_like_the_python_twin() {
-        for ok in ["auto", "AUTO", "90k", "90K", "300k", "1m", "1.5m", "90000", "0.5m"] {
+        for ok in [
+            "auto", "AUTO", "90k", "90K", "300k", "1m", "1.5m", "90000", "0.5m",
+        ] {
             assert!(check_context(ok).is_ok(), "{ok:?}");
         }
         assert_eq!(check_context(" 90K ").unwrap(), "90k");
-        for bad in ["", " ", "ctx", "90kk", "1.5x", "0", "-5", "1e5", ".5k", "1.2.3m"] {
+        for bad in [
+            "", " ", "ctx", "90kk", "1.5x", "0", "-5", "1e5", ".5k", "1.2.3m",
+        ] {
             assert!(check_context(bad).is_err(), "{bad:?}");
         }
     }
@@ -1731,6 +1753,9 @@ fn main() -> Result<()> {
     //   `bin sidecar`   — narrow-style spawn argv (sidecar_args)
     if argv.len() > 1 && argv[1] == "sidecar" {
         return sidecar();
+    }
+    if argv.len() > 1 && argv[1] == "panel" {
+        return panel::run();
     }
     if argv.len() > 1 && argv[1] == "rlm" {
         println!("{}", agents::cli(&argv[2..].to_vec()));
@@ -1769,7 +1794,9 @@ fn main() -> Result<()> {
     // Bare argv is ambiguous: the host spawns the sidecar with piped stdin,
     // while `gray subagents` from a shell or the host's cli passthrough
     // (stdin = tty or /dev/null) means "show the menu", per the README.
-    let action = cli.command.or_else(|| (!stdin_is_pipe()).then_some(Action::Menu));
+    let action = cli
+        .command
+        .or_else(|| (!stdin_is_pipe()).then_some(Action::Menu));
     if let Some(action) = action {
         println!("{}", serde_json::to_string_pretty(&execute(action, None)?)?);
         Ok(())
@@ -1793,7 +1820,10 @@ mod manifest_tests {
             let name = t["name"].as_str().unwrap_or("?");
             let label = t["label"].as_str().unwrap_or("").trim();
             assert!(!label.is_empty(), "tool {name} declares no label");
-            assert!(!label.contains('_'), "tool {name} label {label:?} is a wire name");
+            assert!(
+                !label.contains('_'),
+                "tool {name} label {label:?} is a wire name"
+            );
         }
     }
 
