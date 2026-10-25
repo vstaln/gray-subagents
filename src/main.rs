@@ -227,13 +227,13 @@ pub(crate) fn backend(
     use std::io::Write;
     file.write_all(include_bytes!("../mod"))?;
     file.persist(&runtime)?;
-    let mut cmd = Command::new("python3");
+    let mut cmd = Command::new(python_program());
     // gray-narrow is folded into this binary: default GRAY_NARROW_BIN to
     // ourselves so `run --tools` works without a separate install.
-    if std::env::var_os("GRAY_NARROW_BIN").is_none() {
-        if let Ok(me) = std::env::current_exe() {
-            cmd.env("GRAY_NARROW_BIN", me);
-        }
+    if std::env::var_os("GRAY_NARROW_BIN").is_none()
+        && let Ok(me) = std::env::current_exe()
+    {
+        cmd.env("GRAY_NARROW_BIN", me);
     }
     cmd.args(["-c", &script, include_str!("../mod"), &args.to_string()])
         .arg(runtime)
@@ -742,6 +742,41 @@ pub(crate) fn chat(target: &str, message: Vec<String>) -> Result<Value> {
         None,
         None,
     )
+}
+
+/// Interpreter for the bundled supervisor: `python3` on unix; elsewhere the
+/// first of python3/python/py on PATH (Windows has no python3 alias — `py`
+/// is the installed launcher), keeping "python3" as the fallback so the
+/// spawn error names what it looked for.
+fn python_program() -> &'static str {
+    #[cfg(unix)]
+    {
+        "python3"
+    }
+    #[cfg(not(unix))]
+    {
+        for cand in ["python3", "python", "py"] {
+            if on_path(cand) {
+                return cand;
+            }
+        }
+        "python3"
+    }
+}
+
+/// `name` executable resolvable on PATH, PATHEXT-aware on Windows.
+#[cfg(not(unix))]
+fn on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    std::env::split_paths(&paths).any(|d| {
+        d.join(name).is_file()
+            || pathext
+                .split(';')
+                .any(|e| !e.trim().is_empty() && d.join(format!("{name}{}", e.trim())).is_file())
+    })
 }
 
 /// /proc/<pid>/stat fields after the comm: index 1 is ppid, index 19 is the
@@ -1355,9 +1390,9 @@ pub(crate) fn check_context(value: &str) -> Result<String> {
     let digits = v.strip_suffix(['k', 'm']).unwrap_or(&v);
     let mut parts = digits.split('.');
     let number = matches!(parts.next(), Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        && parts.next().map_or(true, |p| {
-            !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
-        })
+        && parts
+            .next()
+            .is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
         && parts.next().is_none();
     let positive = digits.parse::<f64>().is_ok_and(|n| n > 0.0);
     anyhow::ensure!(
@@ -1625,13 +1660,12 @@ fn sidecar() -> Result<()> {
                             .unwrap_or_default();
                     let mut text = format!("{USAGE}\n{notices}");
                     let nreq = json!({"id":0,"method":"prompt/context","params":req["params"]});
-                    if let (Some(r), _) = narrow::handle_narrow(&nreq) {
-                        if let Some(t) = r.pointer("/result/text").and_then(Value::as_str) {
-                            if !t.is_empty() {
-                                text.push_str("\n");
-                                text.push_str(t);
-                            }
-                        }
+                    if let (Some(r), _) = narrow::handle_narrow(&nreq)
+                        && let Some(t) = r.pointer("/result/text").and_then(Value::as_str)
+                        && !t.is_empty()
+                    {
+                        text.push('\n');
+                        text.push_str(t);
                     }
                     Ok(json!({"text":text}))
                 }
@@ -1749,7 +1783,7 @@ fn main() -> Result<()> {
         return panel::run();
     }
     if argv.len() > 1 && argv[1] == "rlm" {
-        println!("{}", agents::cli(&argv[2..].to_vec()));
+        println!("{}", agents::cli(&argv[2..]));
         return Ok(());
     }
     if argv.len() > 1 && (argv[1] == "narrow" || argv[1] == "plan") {

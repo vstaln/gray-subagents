@@ -522,10 +522,10 @@ fn provider_catalog_ids(home: &Path) -> BTreeMap<String, BTreeMap<String, String
 /// `plugin:<lock>:<id>` when config.provider_id is `lock:id`, else base_url.
 fn configured_listing_key(home: &Path) -> Option<String> {
     let config = read_json(&home.join("config.json"))?;
-    if let Some(pid) = config.get("provider_id").and_then(Value::as_str) {
-        if pid.contains(':') {
-            return Some(format!("plugin:{pid}"));
-        }
+    if let Some(pid) = config.get("provider_id").and_then(Value::as_str)
+        && pid.contains(':')
+    {
+        return Some(format!("plugin:{pid}"));
     }
     config
         .get("base_url")
@@ -594,14 +594,14 @@ pub(crate) fn resolve_route(value: &str, home: &Path) -> Result<Route> {
     let resolved = resolve_model(spec, home)?;
     let want = resolved.to_lowercase();
     let catalogs = provider_catalog_ids(home);
-    if let Some(own) = configured_listing_key(home) {
-        if catalogs.get(&own).is_some_and(|t| t.contains_key(&want)) {
-            return Ok(Route {
-                model: resolved,
-                env: Vec::new(),
-                label: String::new(),
-            });
-        }
+    if let Some(own) = configured_listing_key(home)
+        && catalogs.get(&own).is_some_and(|t| t.contains_key(&want))
+    {
+        return Ok(Route {
+            model: resolved,
+            env: Vec::new(),
+            label: String::new(),
+        });
     }
     let provs = plugin_providers(home);
     let hits: Vec<(&PluginProvider, String)> = provs

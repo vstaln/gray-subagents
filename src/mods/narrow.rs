@@ -15,7 +15,6 @@
 //!   ledger  tail ~/.gray/narrow-ledger.jsonl
 //!   status  list narrow-spawned runs
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use crate::narrow_lib::*;
@@ -337,8 +336,6 @@ fn run_record(run_id: &str, name: &str, task: &str, cwd: &str, grant: &[String],
     let _ = std::fs::write(runs_dir().join(format!("{run_id}.json")), rec.to_string());
 }
 
-#[allow(clippy::too_many_arguments)]
-
 /// Fallback run label: first words of the task slugified, suffixed with a
 /// short run-id for uniqueness — "e2e-smoke-7f3a" beats "run-7f3a1b2c".
 fn name_from_task(task: &str, run_id: &str) -> String {
@@ -373,6 +370,7 @@ fn name_from_task(task: &str, run_id: &str) -> String {
     format!("{slug}-{}", &run_id[..4])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_run_narrow(
     task: &str,
     tools: Option<&str>,
@@ -598,6 +596,37 @@ fn do_grants_narrow() -> String {
     s
 }
 
+/// Stored-pid liveness for the `status` table: /proc on unix (macOS has
+/// none, so rows read "no" there), OpenProcess on Windows.
+fn pid_alive(pid: u64) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        std::path::PathBuf::from(format!("/proc/{pid}")).exists()
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+            if h.is_null() {
+                return false;
+            }
+            CloseHandle(h);
+            true
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
 fn do_status_narrow() -> String {
     let mut rows = vec!["run_id     name                 pid      alive  grant".to_string()];
     let mut found = false;
@@ -616,7 +645,7 @@ fn do_status_narrow() -> String {
             };
             found = true;
             let pid = rec["pid"].as_u64().unwrap_or(0);
-            let alive = pid > 0 && PathBuf::from(format!("/proc/{pid}")).exists();
+            let alive = pid_alive(pid);
             rows.push(format!(
                 "{:<10} {:<20} {:<8} {:<5} {}",
                 &rec["run_id"].as_str().unwrap_or("")

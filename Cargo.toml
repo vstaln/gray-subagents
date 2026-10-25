@@ -1,6 +1,6 @@
 [package]
 name = "gray-subagents"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 license = "MIT"
 description = "Subagent plugin for Gray"
@@ -17,6 +17,9 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [profile.release]
 strip = true

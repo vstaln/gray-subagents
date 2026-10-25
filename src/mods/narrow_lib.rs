@@ -129,10 +129,10 @@ pub fn parse_capability_list(csv: &str) -> Result<Vec<String>, String> {
             continue;
         }
         let mut cap = normalise_capability(raw);
-        if let Some(prefix) = cap.strip_suffix(":*").map(str::to_string) {
-            if cap != WILDCARD {
-                cap = prefix;
-            }
+        if let Some(prefix) = cap.strip_suffix(":*").map(str::to_string)
+            && cap != WILDCARD
+        {
+            cap = prefix;
         }
         let retired = matches!(raw.split_once(':'), Some(("agent", _)));
         if retired || !is_safe_capability(&cap) {
@@ -190,7 +190,7 @@ pub fn tool_pattern(cap: &str) -> Option<(&str, Option<&str>)> {
 
 /// The argument a pattern constrains: the tool's primary subject — command
 /// for bash, path for file tools, url/query for web — else the compact args.
-pub fn primary_arg<'a>(name: &str, args: &'a Value) -> String {
+pub fn primary_arg(name: &str, args: &Value) -> String {
     const KEYS: &[&str] = &[
         "command",
         "path",
@@ -416,7 +416,7 @@ pub fn resolve(input: &ResolveInput) -> ResolveOutput {
         .collect();
     let gated_blocked: Vec<String> = requested
         .iter()
-        .filter(|c| covered(c) && ceiling.map_or(true, |ceil| ceil.contains(*c)))
+        .filter(|c| covered(c) && ceiling.is_none_or(|ceil| ceil.contains(*c)))
         .filter(|c| is_gated(c, &input.gated, &input.approved))
         .cloned()
         .collect();

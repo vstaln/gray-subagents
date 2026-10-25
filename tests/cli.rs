@@ -91,6 +91,8 @@ fn widget_demo_uses_real_rust_renderer() {
     assert!(text.contains("searching"), "{text}");
 }
 
+// The child is a `#!/bin/sh` script exec'd via its mode bits — unix only.
+#[cfg(unix)]
 #[test]
 fn bash_cli_runs_child_with_selected_model_and_returns_status() {
     let home = tempfile::tempdir().unwrap();
@@ -174,6 +176,8 @@ fn run_rejects_invalid_effort_and_unknown_model() {
     assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("vendor/good-model"));
 }
 
+// Same `#!/bin/sh` child — unix only.
+#[cfg(unix)]
 #[test]
 fn run_joins_unquoted_task_words_and_keeps_flags() {
     let home = tempfile::tempdir().unwrap();
@@ -265,12 +269,12 @@ fn menu_numbers_rows_and_open_selects_them() {
     let home = tempfile::tempdir().unwrap();
     seed_job(
         home.path(),
-        &format!("{}", "a".repeat(32)),
+        &"a".repeat(32),
         serde_json::json!({"name": "done-survey", "child_session": "tidal-quark-photon"}),
     );
     seed_job(
         home.path(),
-        &format!("{}", "b".repeat(32)),
+        &"b".repeat(32),
         serde_json::json!({"name": "bad-que", "status": "failed", "error": "turn failed"}),
     );
     std::fs::create_dir_all(home.path().join("sessions")).unwrap();
@@ -311,7 +315,7 @@ fn bare_status_is_the_menu_and_all_is_the_table() {
     let home = tempfile::tempdir().unwrap();
     seed_job(
         home.path(),
-        &format!("{}", "c".repeat(32)),
+        &"c".repeat(32),
         serde_json::json!({"name": "menu-run"}),
     );
     let run = |args: &[&str]| {
