@@ -1347,6 +1347,7 @@ fn descendants_of(root_pid: u64) -> Vec<u64> {
 
 /// Signal a pid's process group first, the lone pid when it leads no
 /// group — the supervisor's kill_tree semantics for unmanaged workers.
+#[cfg(unix)]
 fn signal_proc_or_group(pid: u64, sig: &str) {
     let grouped = Command::new("kill")
         .args([sig, &format!("-{pid}")])
@@ -1356,6 +1357,14 @@ fn signal_proc_or_group(pid: u64, sig: &str) {
     if !grouped {
         let _ = Command::new("kill").args([sig, &pid.to_string()]).status();
     }
+}
+
+#[cfg(windows)]
+fn signal_proc_or_group(pid: u64, _sig: &str) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID"])
+        .arg(pid.to_string())
+        .status();
 }
 
 pub(crate) fn foreign_stop(rid: &str) -> Option<Value> {

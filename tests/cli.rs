@@ -143,6 +143,110 @@ fn bash_cli_runs_child_with_selected_model_and_returns_status() {
     panic!("child never completed");
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_cli_runs_child_with_selected_model_and_returns_status() {
+    let home = tempfile::tempdir().unwrap();
+    let child = home.path().join("gray-child.cmd");
+    std::fs::write(&child, "@echo child model=%GRAY_MODEL%\r\n").unwrap();
+    let out = bin()
+        .args(["run", "Inspect", "--model", "test/selected"])
+        .env("GRAY_HOME", home.path())
+        .env("GRAY_SUBAGENTS_BIN", &child)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = result["run_id"].as_str().unwrap();
+    for _ in 0..50 {
+        let out = bin()
+            .args(["status", id])
+            .env("GRAY_HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if status["status"] == "completed" {
+            assert!(
+                status["result"]
+                    .as_str()
+                    .unwrap()
+                    .contains("child model=test/selected")
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("child never completed");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_stop_terminates_ping_child() {
+    let home = tempfile::tempdir().unwrap();
+    let child = home.path().join("gray-child.cmd");
+    std::fs::write(&child, "@ping -n 30 127.0.0.1 >nul\r\n").unwrap();
+    let out = bin()
+        .args(["run", "Wait"])
+        .env("GRAY_HOME", home.path())
+        .env("GRAY_SUBAGENTS_BIN", &child)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = result["run_id"].as_str().unwrap();
+    let mut running = false;
+    for _ in 0..100 {
+        let out = bin()
+            .args(["status", id])
+            .env("GRAY_HOME", home.path())
+            .output()
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if status["status"] == "running" {
+            running = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(running, "child never reached running status");
+    let out = bin()
+        .args(["stop", id])
+        .env("GRAY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for _ in 0..150 {
+        let out = bin()
+            .args(["status", id])
+            .env("GRAY_HOME", home.path())
+            .output()
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if status["status"] == "stopped" {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("run never stopped");
+}
+
 #[test]
 fn run_rejects_invalid_effort_and_unknown_model() {
     let home = tempfile::tempdir().unwrap();

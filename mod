@@ -10,7 +10,8 @@ Job state lives in $GRAY_HOME/subagents/runs/<run_id>.json. A detached
 supervisor records completion even after the sidecar exits. Steering queues a
 follow-up on the run; the supervisor delivers it as a `--session` resume turn
 in the same child session between phases. Runs past GRAY_SUBAGENTS_MAX_RUNNING
-queue (status "queued") and start FIFO as slots free. Linux is required.
+queue (status "queued") and start FIFO as slots free. Linux, macOS, and Windows
+are supported.
 Env: GRAY_SUBAGENTS_BIN (default `gray`), GRAY_SUBAGENTS_TIMEOUT_SECS (unset: no cap),
 GRAY_SUBAGENTS_MAX_RUNNING (128), GRAY_SUBAGENTS_MAX_PHASES (32 — the task turn
 plus each steered follow-up). The stall guard ends a run `stalled` after 2
@@ -31,20 +32,29 @@ throttled sweep (GRAY_SUBAGENTS_GC_SECS, 30) re-checks kept trees, unclaimed
 worktrees/ dirs and merged sub/* refs on every status call.
 """
 import contextlib
-import fcntl
 import hashlib
 import json
 import math
 import os
+import queue
 import re
-import selectors
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
+
+WINDOWS = os.name == "nt"
+
+if WINDOWS:
+    import ctypes
+    import ctypes.wintypes
+    import msvcrt
+else:
+    import fcntl
 
 MODEL_CATALOG_LIMIT = 4
 EFFORTS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh", "max"})
@@ -250,7 +260,52 @@ def proc_argv(pid):
     return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
 
 
+def _process_table():
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.wintypes.DWORD),
+            ("cntUsage", ctypes.wintypes.DWORD),
+            ("th32ProcessID", ctypes.wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", ctypes.wintypes.DWORD),
+            ("cntThreads", ctypes.wintypes.DWORD),
+            ("th32ParentProcessID", ctypes.wintypes.DWORD),
+            ("pcPriClassBase", ctypes.wintypes.LONG),
+            ("dwFlags", ctypes.wintypes.DWORD),
+            ("szExeFile", ctypes.wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = (ctypes.wintypes.DWORD, ctypes.wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = (
+        ctypes.wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+    kernel32.Process32FirstW.restype = ctypes.wintypes.BOOL
+    kernel32.Process32NextW.argtypes = (
+        ctypes.wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+    kernel32.Process32NextW.restype = ctypes.wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        return {}
+    table = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                table[entry.th32ProcessID] = entry.th32ParentProcessID
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return table
+
+
 def ppid_of(pid):
+    if WINDOWS:
+        return _process_table().get(pid)
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
@@ -369,6 +424,24 @@ def log_event(rid, event, **fields):
 @contextlib.contextmanager
 def registry():
     runs_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    if WINDOWS:
+        fd = os.open(runs_dir() / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            while True:
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.02)
+            try:
+                yield
+            finally:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            os.close(fd)
+        return
     with (runs_dir() / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
@@ -420,7 +493,18 @@ def write_job(job):
         os.chmod(tmp, 0o600)
         json.dump(job, stream, ensure_ascii=True)
         stream.write("\n")
-    tmp.replace(path)
+    if not WINDOWS:
+        tmp.replace(path)
+        return
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            os.replace(tmp, path)
+            break
+        except PermissionError:
+            if not WINDOWS or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def all_jobs():
@@ -429,7 +513,43 @@ def all_jobs():
 
 
 def identity(pid):
-    """Linux process birth tick; zombies and missing processes are not alive."""
+    if WINDOWS:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
+        kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (
+            ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = ctypes.wintypes.BOOL
+        kernel32.GetProcessTimes.argtypes = (
+            ctypes.wintypes.HANDLE,
+            ctypes.POINTER(ctypes.wintypes.FILETIME),
+            ctypes.POINTER(ctypes.wintypes.FILETIME),
+            ctypes.POINTER(ctypes.wintypes.FILETIME),
+            ctypes.POINTER(ctypes.wintypes.FILETIME),
+        )
+        kernel32.GetProcessTimes.restype = ctypes.wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            code = ctypes.wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
+                return None
+            creation = ctypes.wintypes.FILETIME()
+            exit_time = ctypes.wintypes.FILETIME()
+            kernel_time = ctypes.wintypes.FILETIME()
+            user_time = ctypes.wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                    handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                    ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                return None
+            ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            return str(ticks)
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
         return fields[19] if fields[0] != "Z" else None
@@ -438,7 +558,32 @@ def identity(pid):
 
 
 def descendants(root_pid):
-    """Live descendants of root_pid via /proc ppid links (Linux)."""
+    if WINDOWS:
+        children = {}
+        for pid, ppid in _process_table().items():
+            children.setdefault(ppid, []).append(pid)
+        births = {}
+
+        def birth(pid):
+            if pid not in births:
+                births[pid] = identity(pid)
+            return births[pid]
+
+        root_birth = birth(root_pid)
+        out, stack, seen = [], [(root_pid, root_birth)], {root_pid}
+        while stack:
+            parent, parent_birth = stack.pop()
+            if parent_birth is None:
+                continue
+            for child in children.get(parent, ()):
+                child_birth = birth(child)
+                if child in seen or child_birth is None \
+                        or int(child_birth) < int(parent_birth):
+                    continue
+                seen.add(child)
+                out.append(child)
+                stack.append((child, child_birth))
+        return out
     children = {}
     try:
         for ent in Path("/proc").iterdir():
@@ -472,6 +617,10 @@ def kill_tree(pid):
     file ~80s after stop reported success. Descendants are scanned BEFORE
     killing the child so ppid links are still intact."""
     kids = descendants(pid)
+    if WINDOWS:
+        for target in [pid, *kids]:
+            _terminate(target)
+        return
     for target in [pid, *kids]:
         try:
             os.killpg(target, signal.SIGKILL)
@@ -485,8 +634,30 @@ def kill_tree(pid):
 STOP_GRACE = 3.0  # seconds between SIGTERM and SIGKILL when a run is stopped
 
 
+if WINDOWS:
+    def _terminate(pid):
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
+        kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+        kernel32.TerminateProcess.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.UINT)
+        kernel32.TerminateProcess.restype = ctypes.wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+        handle = kernel32.OpenProcess(0x0001, False, pid)
+        if not handle:
+            return
+        try:
+            kernel32.TerminateProcess(handle, 1)
+        finally:
+            kernel32.CloseHandle(handle)
+
+
 def signal_group(pid, sig):
     """Signal pid's process group, or pid alone when it leads none (kill_tree's semantics)."""
+    if WINDOWS:
+        _terminate(pid)
+        return
     try:
         os.killpg(pid, sig)
     except (ProcessLookupError, PermissionError):
@@ -526,13 +697,19 @@ def terminate_tree(proc, grace=STOP_GRACE):
                 signal_group(p, sig)
 
     note_members()
-    send(signal.SIGTERM)
-    deadline = time.monotonic() + grace
-    while live() and time.monotonic() < deadline:
-        time.sleep(0.05)
+    if WINDOWS:
+        send(None)
+    else:
+        send(signal.SIGTERM)
+        deadline = time.monotonic() + grace
+        while live() and time.monotonic() < deadline:
+            time.sleep(0.05)
     if live():
         note_members()
-        send(signal.SIGKILL)
+        if WINDOWS:
+            send(None)
+        else:
+            send(signal.SIGKILL)
         end = time.monotonic() + 1.0
         while live() and time.monotonic() < end:
             time.sleep(0.05)
@@ -546,6 +723,16 @@ def kill_orphan(job):
         kill_tree(pid)
 
 
+def _spawn_kwargs(supervisor=False):
+    if not WINDOWS:
+        return {"start_new_session": True}
+    if supervisor:
+        return {"creationflags": (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_BREAKAWAY_FROM_JOB)}
+    return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+
+
 def spawn_supervisor(rid, admitted=None):
     """Detached supervisor process + its /proc birth tick. The tick read can
     race a fresh fork, so retry briefly; a None birth disables orphan checks
@@ -557,10 +744,18 @@ def spawn_supervisor(rid, admitted=None):
         for key in ADMISSION_ENV:
             env.pop(key, None)
         env.update(admitted)
-    proc = subprocess.Popen([sys.executable, mod, "--supervise", rid],
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, start_new_session=True,
-                            env=env)
+    kwargs = _spawn_kwargs(supervisor=True)
+    try:
+        proc = subprocess.Popen([sys.executable, mod, "--supervise", rid],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=env, **kwargs)
+    except OSError:
+        if not WINDOWS:
+            raise
+        kwargs["creationflags"] &= ~subprocess.CREATE_BREAKAWAY_FROM_JOB
+        proc = subprocess.Popen([sys.executable, mod, "--supervise", rid],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=env, **kwargs)
     birth = identity(proc.pid)
     birth = identity(proc.pid)
     for _ in range(50):
@@ -1991,7 +2186,7 @@ def run_phase(rid, prompt, resume_sid, job):
     argv += ["--max-requests", os.environ.get("GRAY_SUBAGENTS_MAX_REQUESTS") or "256"]
     proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            start_new_session=True)
+                            **_spawn_kwargs())
     with registry():
         job = read_job(rid)
         job.update(child_pid=proc.pid, child_birth=identity(proc.pid))
@@ -2000,6 +2195,9 @@ def run_phase(rid, prompt, resume_sid, job):
     st = {"sid": "", "activity": "", "result": "", "error_row": "", "plain": bytearray(),
           "tools": 0, "ok_tools": 0, "writes": 0, "calls": {}, "seq": 0}
     status, error = "failed", "supervisor did not finish"
+    output = queue.Queue(maxsize=1)
+    eof = object()
+    reader_stop = threading.Event()
 
     def feed(line):
         try:
@@ -2039,65 +2237,92 @@ def run_phase(rid, prompt, resume_sid, job):
 
     try:
         deadline = None if timeout is None else time.monotonic() + timeout
-        with selectors.DefaultSelector() as selector:
-            selector.register(proc.stdout, selectors.EVENT_READ)
-            while True:
-                with registry():
-                    job = read_job(rid)
-                    stopping = job["status"] == "stopping"
-                    changed = False
-                    if st["sid"] and job.get("child_session") != st["sid"]:
-                        job["child_session"] = st["sid"]
-                        changed = True
-                    if st["activity"] and job.get("activity") != st["activity"]:
-                        job["activity"] = st["activity"]
-                        changed = True
-                    if st["tools"] != job.get("tool_count"):
-                        job["tool_count"] = st["tools"]
-                        changed = True
-                    writes = st["writes"] + sum(
-                        (p.get("writes") or 0) for p in job["phases"][:-1])
-                    if writes != job.get("write_count"):
-                        job["write_count"] = writes
-                        changed = True
-                    if changed:
-                        write_job(job)
-                if stopping:
-                    # The run reads as stopped only once its tree is gone: TERM,
-                    # then KILL after STOP_GRACE. A survivor is named, not hidden.
-                    survivors = terminate_tree(proc)
-                    if survivors:
-                        log_event(rid, "stop_incomplete", survivors=survivors)
-                        with registry():
-                            job = read_job(rid)
-                            job["stop_note"] = ("process " + ", ".join(map(str, survivors))
-                                                + " survived SIGKILL")
-                            write_job(job)
-                    status, error = "stopped", "stopped by request"
-                    break
-                if deadline is not None and time.monotonic() >= deadline:
-                    status, error = "timeout", f"timed out after {timeout:g}s; side effects may already have occurred"
-                    break
-                events = selector.select(.05)
-                if events:
-                    chunk = os.read(proc.stdout.fileno(), 65536)
+
+        def publish(item):
+            while not reader_stop.is_set():
+                try:
+                    output.put(item, timeout=.05)
+                    return True
+                except queue.Full:
+                    pass
+            return False
+
+        def read_output():
+            try:
+                while not reader_stop.is_set():
+                    try:
+                        chunk = os.read(proc.stdout.fileno(), 65536)
+                    except OSError:
+                        break
                     if not chunk:
-                        selector.unregister(proc.stdout)
-                    pending += chunk
-                    if len(pending) > OUTPUT_LIMIT and b"\n" not in pending:
-                        status, error = "failed", "child exceeded output limit (256 KiB, unterminated line)"
                         break
-                    while b"\n" in pending:
-                        line, pending = pending.split(b"\n", 1)
-                        feed(line)
-                code = proc.poll()
-                if code is not None:
-                    # Don't let a surviving descendant keep stdout open forever.
-                    kill_tree(proc.pid)
-                    if not selector.get_map():
-                        if status == "failed" and error == "supervisor did not finish":
-                            status = "exited"
+                    if not publish(chunk):
                         break
+            finally:
+                if not reader_stop.is_set():
+                    publish(eof)
+
+        threading.Thread(target=read_output, daemon=True).start()
+        stdout_eof = False
+        while True:
+            with registry():
+                job = read_job(rid)
+                stopping = job["status"] == "stopping"
+                changed = False
+                if st["sid"] and job.get("child_session") != st["sid"]:
+                    job["child_session"] = st["sid"]
+                    changed = True
+                if st["activity"] and job.get("activity") != st["activity"]:
+                    job["activity"] = st["activity"]
+                    changed = True
+                if st["tools"] != job.get("tool_count"):
+                    job["tool_count"] = st["tools"]
+                    changed = True
+                writes = st["writes"] + sum(
+                    (p.get("writes") or 0) for p in job["phases"][:-1])
+                if writes != job.get("write_count"):
+                    job["write_count"] = writes
+                    changed = True
+                if changed:
+                    write_job(job)
+            if stopping:
+                # The run reads as stopped only once its tree is gone: TERM,
+                # then KILL after STOP_GRACE. A survivor is named, not hidden.
+                survivors = terminate_tree(proc)
+                if survivors:
+                    log_event(rid, "stop_incomplete", survivors=survivors)
+                    with registry():
+                        job = read_job(rid)
+                        job["stop_note"] = ("process " + ", ".join(map(str, survivors))
+                                            + " survived SIGKILL")
+                        write_job(job)
+                status, error = "stopped", "stopped by request"
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                status, error = "timeout", f"timed out after {timeout:g}s; side effects may already have occurred"
+                break
+            try:
+                chunk = output.get(timeout=.05)
+            except queue.Empty:
+                chunk = None
+            if chunk is eof:
+                stdout_eof = True
+            elif chunk is not None:
+                pending += chunk
+                if len(pending) > OUTPUT_LIMIT and b"\n" not in pending:
+                    status, error = "failed", "child exceeded output limit (256 KiB, unterminated line)"
+                    break
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    feed(line)
+            code = proc.poll()
+            if code is not None:
+                # Don't let a surviving descendant keep stdout open forever.
+                kill_tree(proc.pid)
+                if stdout_eof:
+                    if status == "failed" and error == "supervisor did not finish":
+                        status = "exited"
+                    break
         if pending.strip():
             feed(pending)
         result = st["result"].strip() or re.sub(
@@ -2113,6 +2338,7 @@ def run_phase(rid, prompt, resume_sid, job):
     finally:
         kill_tree(proc.pid)
         proc.wait()
+        reader_stop.set()
         proc.stdout.close()
 
 
