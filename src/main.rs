@@ -16,7 +16,7 @@ mod panel;
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
 };
 
 #[derive(Parser)]
@@ -200,7 +200,7 @@ pub(crate) fn backend(
 ) -> Result<Value> {
     let cfg = settings(None, None, None, None)?;
     let script = concat!(
-        "import sys,json\nns={'__name__':'gray_subagents_backend','__file__':sys.argv[3]}\nexec(sys.argv[1],ns)\nargs=json.loads(sys.argv[2])\naction=sys.argv[4]\n",
+        "import sys,json\nns={'__name__':'gray_subagents_backend','__file__':sys.argv[1]}\nexec(compile(open(sys.argv[1],encoding='utf-8').read(),sys.argv[1],'exec'),ns)\nargs=json.load(sys.stdin)\naction=sys.argv[2]\n",
         "if action=='run': result=ns['spawn_jobs'](args,args.get('session') or {'cwd':__import__('os').getcwd()})\n",
         "elif action=='status': result=ns['status_job'](args.get('run_id'),(args.get('session') or {}).get('id',''),bool(args.get('all')))\n",
         "elif action=='view': result=ns['view_transcript'](args.get('run_id'),args.get('lines'))\n",
@@ -235,9 +235,7 @@ pub(crate) fn backend(
     {
         cmd.env("GRAY_NARROW_BIN", me);
     }
-    cmd.args(["-c", &script, include_str!("../mod"), &args.to_string()])
-        .arg(runtime)
-        .arg(action);
+    cmd.arg("-c").arg(&script).arg(&runtime).arg(action);
     if let Some(cap) = cfg["max_running"].as_u64() {
         cmd.env("GRAY_SUBAGENTS_MAX_RUNNING", cap.to_string());
     }
@@ -263,9 +261,18 @@ pub(crate) fn backend(
     if let Some(sid) = args["session"]["id"].as_str().filter(|s| !s.is_empty()) {
         cmd.env("GRAY_SESSION_ID", sid);
     }
-    let out = cmd
-        .output()
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("Python 3 is required for the process supervisor")?;
+    child
+        .stdin
+        .take()
+        .context("Python 3 stdin was not piped")?
+        .write_all(args.to_string().as_bytes())?;
+    let out = child.wait_with_output()?;
     anyhow::ensure!(
         out.status.success(),
         "{}",
