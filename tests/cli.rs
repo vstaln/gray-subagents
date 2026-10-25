@@ -86,8 +86,8 @@ fn widget_demo_uses_real_rust_renderer() {
     let panel: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let text = panel["text"].as_str().unwrap();
     assert!(!text.contains("Agents\n"));
-    assert!(text.contains("\n   /subagents — open · chat · stop\n"));
-    assert!(text.contains("● auth-scout"));
+    assert!(text.contains("2 subagents"));
+    assert!(text.contains("● auth-survey"));
     assert!(text.contains("searching"), "{text}");
 }
 
@@ -143,6 +143,110 @@ fn bash_cli_runs_child_with_selected_model_and_returns_status() {
     panic!("child never completed");
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_cli_runs_child_with_selected_model_and_returns_status() {
+    let home = tempfile::tempdir().unwrap();
+    let child = home.path().join("gray-child.cmd");
+    std::fs::write(&child, "@echo child model=%GRAY_MODEL%\r\n").unwrap();
+    let out = bin()
+        .args(["run", "Inspect", "--model", "test/selected"])
+        .env("GRAY_HOME", home.path())
+        .env("GRAY_SUBAGENTS_BIN", &child)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = result["run_id"].as_str().unwrap();
+    for _ in 0..50 {
+        let out = bin()
+            .args(["status", id])
+            .env("GRAY_HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if status["status"] == "completed" {
+            assert!(
+                status["result"]
+                    .as_str()
+                    .unwrap()
+                    .contains("child model=test/selected")
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("child never completed");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_stop_terminates_ping_child() {
+    let home = tempfile::tempdir().unwrap();
+    let child = home.path().join("gray-child.cmd");
+    std::fs::write(&child, "@ping -n 30 127.0.0.1 >nul\r\n").unwrap();
+    let out = bin()
+        .args(["run", "Wait"])
+        .env("GRAY_HOME", home.path())
+        .env("GRAY_SUBAGENTS_BIN", &child)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = result["run_id"].as_str().unwrap();
+    let mut running = false;
+    for _ in 0..100 {
+        let out = bin()
+            .args(["status", id])
+            .env("GRAY_HOME", home.path())
+            .output()
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if status["status"] == "running" {
+            running = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(running, "child never reached running status");
+    let out = bin()
+        .args(["stop", id])
+        .env("GRAY_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for _ in 0..150 {
+        let out = bin()
+            .args(["status", id])
+            .env("GRAY_HOME", home.path())
+            .output()
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if status["status"] == "stopped" {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("run never stopped");
+}
+
 #[test]
 fn run_rejects_invalid_effort_and_unknown_model() {
     let home = tempfile::tempdir().unwrap();
@@ -186,7 +290,7 @@ fn run_joins_unquoted_task_words_and_keeps_flags() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = bin()
-        .args(["run", "Inspect", "the", "codebase", "--agent", "reviewer"])
+        .args(["run", "Inspect", "the", "codebase", "--name", "inspect-run"])
         .env("GRAY_HOME", home.path())
         .env("GRAY_SUBAGENTS_BIN", &child)
         .output()
@@ -208,7 +312,6 @@ fn run_joins_unquoted_task_words_and_keeps_flags() {
         if status["status"] == "completed" {
             let result = status["result"].as_str().unwrap();
             assert!(result.contains("Inspect the codebase"), "{result}");
-            assert!(result.contains("'reviewer'"), "{result}");
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -238,7 +341,7 @@ fn seed_job(home: &std::path::Path, rid: &str, fields: serde_json::Value) {
     let dir = home.join("subagents/runs");
     std::fs::create_dir_all(&dir).unwrap();
     let mut job = serde_json::json!({
-        "run_id": rid, "name": "", "agent": "scout", "task": "t",
+        "run_id": rid, "name": "", "task": "t",
         "status": "completed", "created": 100.0, "finished": 150.0,
         "error": "", "model": "", "session_id": "", "child_session": "",
         "activity": "", "cwd": std::env::current_dir().unwrap(),
@@ -270,12 +373,12 @@ fn menu_numbers_rows_and_open_selects_them() {
     let home = tempfile::tempdir().unwrap();
     seed_job(
         home.path(),
-        &format!("{}", "a".repeat(32)),
-        serde_json::json!({"name": "done-scout", "child_session": "tidal-quark-photon"}),
+        &"a".repeat(32),
+        serde_json::json!({"name": "done-survey", "child_session": "tidal-quark-photon"}),
     );
     seed_job(
         home.path(),
-        &format!("{}", "b".repeat(32)),
+        &"b".repeat(32),
         serde_json::json!({"name": "bad-que", "status": "failed", "error": "turn failed"}),
     );
     std::fs::create_dir_all(home.path().join("sessions")).unwrap();
@@ -295,11 +398,11 @@ fn menu_numbers_rows_and_open_selects_them() {
     let menu = content(run(&["menu"]));
     assert!(menu.starts_with("1 \u{2717} bad-que"), "{menu}");
     assert!(!menu.contains("\u{2b22} Agents"), "{menu}");
-    assert!(menu.contains("2 \u{2713} done-scout"), "{menu}");
+    assert!(menu.contains("2 \u{2713} done-survey"), "{menu}");
     assert!(menu.contains("N|NAME selects"), "{menu}");
 
     // Bare word and `open` agree; finished runs hand over /resume.
-    let one = content(run(&["done-scout"]));
+    let one = content(run(&["done-survey"]));
     let two = content(run(&["open", "2"]));
     let resume = "/resume tidal-quark-photon";
     assert!(one.contains(resume), "{one}");
@@ -316,7 +419,7 @@ fn bare_status_is_the_menu_and_all_is_the_table() {
     let home = tempfile::tempdir().unwrap();
     seed_job(
         home.path(),
-        &format!("{}", "c".repeat(32)),
+        &"c".repeat(32),
         serde_json::json!({"name": "menu-run"}),
     );
     let run = |args: &[&str]| {
@@ -356,7 +459,11 @@ fn entries_scope_runs_to_their_owner_session() {
             cmd.env("GRAY_SESSION_ID", sid);
         }
         let out = cmd.output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         v["entries"]
             .as_array()
@@ -374,10 +481,7 @@ fn entries_scope_runs_to_their_owner_session() {
     let owned = names(&["entries"], Some("sess-a"));
     assert_eq!(owned, ["a-run"], "{owned:?}");
     let all = names(&["entries", "--all"], Some("sess-b"));
-    assert!(
-        seeded.iter().all(|n| all.iter().any(|e| e == n)),
-        "{all:?}"
-    );
+    assert!(seeded.iter().all(|n| all.iter().any(|e| e == n)), "{all:?}");
     let orphan_view = names(&["entries"], None);
     assert!(
         ["orphan-0", "orphan-1", "orphan-2"]

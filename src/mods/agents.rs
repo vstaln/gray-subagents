@@ -102,9 +102,7 @@ fn batch_items(tasks: &[Value]) -> Vec<Value> {
                 None | Some(Value::Null) => true,
                 Some(task) => task.as_str() == Some(""),
             };
-            if task_missing
-                && let Some(prompt) = item.get("prompt").cloned()
-            {
+            if task_missing && let Some(prompt) = item.get("prompt").cloned() {
                 item["task"] = prompt;
             }
             item
@@ -114,7 +112,7 @@ fn batch_items(tasks: &[Value]) -> Vec<Value> {
 
 /// `subagent_spawn` — admit a supervised child, return a handle immediately.
 /// `prompt` (or `task`) is required; `tasks: [...]` fans out 1–8 in one
-/// admission (prime's batch spawn), each item taking name/agent/model/etc.
+/// admission (prime's batch spawn), each item taking name/model/etc.
 fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
     if std::env::var_os("GRAY_SUBAGENTS_ACTIVE").is_some() {
         return Err(DEPTH_MSG.into());
@@ -139,18 +137,10 @@ fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
         run["tasks"] = Value::Array(batch_items(tasks));
     } else {
         run["task"] = args["prompt"].as_str().or(args["task"].as_str()).into();
-        for (k, t) in [
-            ("agent", "agent"),
-            ("name", "name"),
-            ("tools", "tools"),
-            ("approve", "approve"),
-        ] {
+        for (k, t) in [("name", "name"), ("tools", "tools"), ("approve", "approve")] {
             if let Some(v) = args[t].as_str().filter(|s| !s.is_empty()) {
                 run[k] = json!(v);
             }
-        }
-        if run["agent"].is_null() {
-            run["agent"] = json!("scout");
         }
         if let Some(m) = args["model"].as_str().filter(|s| !s.is_empty()) {
             run["model"] = json!(crate::resolve_model(m).map_err(|e| e.to_string())?);
@@ -463,11 +453,10 @@ pub fn manifest_tools() -> Value {
          "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 128) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
-            "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, agent?, name?, model?, effort?, context?}"},
+            "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, name?, model?, effort?, context?}"},
             "name": {"type": "string"}, "model": {"type": "string", "description": "model id, or provider/model to pin a provider (e.g. claude/claude-haiku-5-5); bare ids ride the session's own provider"},
             "effort": {"type": "string"},
             "context": {"type": "string", "description": "context ceiling passed as GRAY_COMPACT_AT: '90k', '300k', '1m', or 'auto'; above 200k a Claude model auto-uses its [1m] route — Haiku bills 5x past 100k"},
-            "agent": {"type": "string", "description": "profile (scout|worker|oracle|reviewer)"},
             "tools": {"type": "string"}, "approve": {"type": "string"},
             "isolation": {"type": "string", "description": "e.g. worktree"}}}},
         {"name": "subagent_check",

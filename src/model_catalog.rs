@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use serde_json::Value;
 
 /// Candidates named in an error, newest first.
@@ -217,10 +217,8 @@ fn family_members(cat: &Catalog, spec: &str) -> Vec<String> {
 /// The newest of several matches. An unversioned best match, or a tie that
 /// no tie-break separates, is an error that lists the newest candidates first.
 fn pick_newest(spec: &str, candidates: Vec<String>, cat: &Catalog) -> Result<String> {
-    let mut ranked: Vec<(Rank, String)> = candidates
-        .into_iter()
-        .map(|m| (rank(&m, cat), m))
-        .collect();
+    let mut ranked: Vec<(Rank, String)> =
+        candidates.into_iter().map(|m| (rank(&m, cat), m)).collect();
     ranked.sort_by(|a, b| b.cmp(a));
     let shown = ranked
         .iter()
@@ -331,7 +329,6 @@ pub(crate) fn resolve_model(value: &str, home: &Path) -> Result<String> {
     bail!("unknown model '{spec}' (no catalog match)");
 }
 
-
 /// One enabled plugin provider from `plugins/lock.json` + `<key>-manifest.json`.
 struct PluginProvider {
     key: String,
@@ -361,7 +358,11 @@ fn plugin_providers(home: &Path) -> Vec<PluginProvider> {
         return out;
     };
     for (key, entry) in plugins {
-        if !entry.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+        if !entry
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             continue;
         }
         if !key
@@ -370,8 +371,7 @@ fn plugin_providers(home: &Path) -> Vec<PluginProvider> {
         {
             continue;
         }
-        let Some(manifest) =
-            read_json(&home.join("plugins").join(format!("{key}-manifest.json")))
+        let Some(manifest) = read_json(&home.join("plugins").join(format!("{key}-manifest.json")))
         else {
             continue;
         };
@@ -426,10 +426,7 @@ fn provider_idents(p: &PluginProvider) -> [String; 3] {
 /// provider id or display name, exactly or as a unique prefix (`devin`);
 /// `name:auth` picks a non-default auth method. `Ok(None)` → no enabled
 /// plugin provider matches; the spec is a plain model reference.
-fn find_provider(
-    provs: &[PluginProvider],
-    head: &str,
-) -> Result<Option<(usize, Option<String>)>> {
+fn find_provider(provs: &[PluginProvider], head: &str) -> Result<Option<(usize, Option<String>)>> {
     let segs: Vec<&str> = head.split(':').collect();
     let mut found: Option<usize> = None;
     let mut auth: Option<String> = None;
@@ -525,10 +522,10 @@ fn provider_catalog_ids(home: &Path) -> BTreeMap<String, BTreeMap<String, String
 /// `plugin:<lock>:<id>` when config.provider_id is `lock:id`, else base_url.
 fn configured_listing_key(home: &Path) -> Option<String> {
     let config = read_json(&home.join("config.json"))?;
-    if let Some(pid) = config.get("provider_id").and_then(Value::as_str) {
-        if pid.contains(':') {
-            return Some(format!("plugin:{pid}"));
-        }
+    if let Some(pid) = config.get("provider_id").and_then(Value::as_str)
+        && pid.contains(':')
+    {
+        return Some(format!("plugin:{pid}"));
     }
     config
         .get("base_url")
@@ -597,14 +594,14 @@ pub(crate) fn resolve_route(value: &str, home: &Path) -> Result<Route> {
     let resolved = resolve_model(spec, home)?;
     let want = resolved.to_lowercase();
     let catalogs = provider_catalog_ids(home);
-    if let Some(own) = configured_listing_key(home) {
-        if catalogs.get(&own).is_some_and(|t| t.contains_key(&want)) {
-            return Ok(Route {
-                model: resolved,
-                env: Vec::new(),
-                label: String::new(),
-            });
-        }
+    if let Some(own) = configured_listing_key(home)
+        && catalogs.get(&own).is_some_and(|t| t.contains_key(&want))
+    {
+        return Ok(Route {
+            model: resolved,
+            env: Vec::new(),
+            label: String::new(),
+        });
     }
     let provs = plugin_providers(home);
     let hits: Vec<(&PluginProvider, String)> = provs
@@ -632,8 +629,7 @@ pub(crate) fn resolve_route(value: &str, home: &Path) -> Result<Route> {
             })
         }
         _ => {
-            let choices: Vec<String> =
-                hits.iter().map(|(p, s)| format!("{}/{s}", p.id)).collect();
+            let choices: Vec<String> = hits.iter().map(|(p, s)| format!("{}/{s}", p.id)).collect();
             bail!(
                 "model '{spec}' is ambiguous across providers — give provider/model: {}",
                 choices.join(", ")
@@ -748,10 +744,30 @@ mod tests {
         )
         .unwrap();
         for (key, pid, name, auth) in [
-            ("devin-sub", "devin-subscription", "Devin subscription", "devin-login"),
-            ("claude", "claude-subscription", "Claude subscription", "claude-login"),
-            ("other-sub", "other-subscription", "Other subscription", "other-login"),
-            ("dead-sub", "dead-subscription", "Dead subscription", "dead-login"),
+            (
+                "devin-sub",
+                "devin-subscription",
+                "Devin subscription",
+                "devin-login",
+            ),
+            (
+                "claude",
+                "claude-subscription",
+                "Claude subscription",
+                "claude-login",
+            ),
+            (
+                "other-sub",
+                "other-subscription",
+                "Other subscription",
+                "other-login",
+            ),
+            (
+                "dead-sub",
+                "dead-subscription",
+                "Dead subscription",
+                "dead-login",
+            ),
         ] {
             fs::write(
                 plugins.join(format!("{key}-manifest.json")),
@@ -810,8 +826,7 @@ mod tests {
         assert_eq!(route.model, "swe-2-max");
         assert_eq!(route.env[0].1, "devin-sub:devin-subscription");
         let route =
-            resolve_route("devin-sub:devin-subscription:devin-login/swe-2", dir.path())
-                .unwrap();
+            resolve_route("devin-sub:devin-subscription:devin-login/swe-2", dir.path()).unwrap();
         assert_eq!(route.model, "swe-2");
         assert_eq!(
             route.env[1].1,

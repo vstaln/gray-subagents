@@ -5,24 +5,26 @@ use gray_subagents::widget::{
 };
 use serde_json::{Value, json};
 
+#[path = "mods/agents.rs"]
+mod agents;
+mod model_catalog;
 #[path = "mods/narrow.rs"]
 mod narrow;
 #[path = "mods/narrow_lib.rs"]
 pub mod narrow_lib;
-#[path = "mods/agents.rs"]
-mod agents;
-mod model_catalog;
+mod panel;
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
 };
 
 #[derive(Parser)]
 #[command(
     name = "gray-subagents",
     version,
-    about = "Gray subagent plugin: Bash commands and an on-demand agents panel"
+    about = "Gray subagent plugin: Bash commands and an on-demand agents panel",
+    after_help = USAGE_DETAIL
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,12 +44,9 @@ enum Action {
         #[arg(long)]
         max_running: Option<u32>,
     },
-    Setup,
     Run {
         #[arg(required = true, num_args = 1..)]
         task: Vec<String>,
-        #[arg(long, default_value = "scout")]
-        agent: String,
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
@@ -113,12 +112,14 @@ enum Action {
         #[arg(long, default_value = "40")]
         lines: usize,
     },
-    /// Cancel a run by name/id, `all` for every running run, or bare for
-    /// just this session's runs.
+    /// Cancel a run by name/id, or bare / `all` for this session's runs.
+    /// `--global` stops every running run on this machine, other sessions included.
     Stop {
         run_id: Option<String>,
+        /// Stop runs owned by every session, not just this one.
+        #[arg(long)]
+        global: bool,
     },
-    List,
     Widget {
         #[arg(long)]
         demo: bool,
@@ -134,7 +135,7 @@ pub(crate) fn home() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".gray")))
         .context("cannot resolve Gray home")
 }
-fn settings(
+pub(crate) fn settings(
     model: Option<String>,
     cap: Option<u32>,
     effort: Option<String>,
@@ -199,16 +200,14 @@ pub(crate) fn backend(
 ) -> Result<Value> {
     let cfg = settings(None, None, None, None)?;
     let script = concat!(
-        "import sys,json\nns={'__name__':'gray_subagents_backend','__file__':sys.argv[3]}\nexec(sys.argv[1],ns)\nargs=json.loads(sys.argv[2])\naction=sys.argv[4]\n",
+        "import sys,json\nns={'__name__':'gray_subagents_backend','__file__':sys.argv[1]}\nexec(compile(open(sys.argv[1],encoding='utf-8').read(),sys.argv[1],'exec'),ns)\nargs=json.load(sys.stdin)\naction=sys.argv[2]\n",
         "if action=='run': result=ns['spawn_jobs'](args,args.get('session') or {'cwd':__import__('os').getcwd()})\n",
         "elif action=='status': result=ns['status_job'](args.get('run_id'),(args.get('session') or {}).get('id',''),bool(args.get('all')))\n",
         "elif action=='view': result=ns['view_transcript'](args.get('run_id'),args.get('lines'))\n",
-        "elif action=='stop': result=ns['stop_job'](args.get('run_id'),(args.get('session') or {}).get('id',''))\n",
+        "elif action=='stop': result=ns['stop_job'](args.get('run_id'),(args.get('session') or {}).get('id',''),bool(args.get('global')))\n",
         "elif action=='steer': result=ns['steer_job'](args['run_id'],args['message'])\n",
         "elif action=='context': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''))}\n",
-        "elif action=='notices': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''),False)}\n",
-        "elif action=='setup': result={'content':ns['setup_profiles']()}\n",
-        "elif action=='list': result=ns['list_profiles']()\n",
+        "elif action=='notices': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''))}\n",
         "print(json.dumps(result))\n"
     );
     // ValueError is the supervisor's user-facing refusal ("unknown run",
@@ -231,14 +230,12 @@ pub(crate) fn backend(
     let mut cmd = Command::new(python_program());
     // gray-narrow is folded into this binary: default GRAY_NARROW_BIN to
     // ourselves so `run --tools` works without a separate install.
-    if std::env::var_os("GRAY_NARROW_BIN").is_none() {
-        if let Ok(me) = std::env::current_exe() {
-            cmd.env("GRAY_NARROW_BIN", me);
-        }
+    if std::env::var_os("GRAY_NARROW_BIN").is_none()
+        && let Ok(me) = std::env::current_exe()
+    {
+        cmd.env("GRAY_NARROW_BIN", me);
     }
-    cmd.args(["-c", &script, include_str!("../mod"), &args.to_string()])
-        .arg(runtime)
-        .arg(action);
+    cmd.arg("-c").arg(&script).arg(&runtime).arg(action);
     if let Some(cap) = cfg["max_running"].as_u64() {
         cmd.env("GRAY_SUBAGENTS_MAX_RUNNING", cap.to_string());
     }
@@ -264,9 +261,18 @@ pub(crate) fn backend(
     if let Some(sid) = args["session"]["id"].as_str().filter(|s| !s.is_empty()) {
         cmd.env("GRAY_SESSION_ID", sid);
     }
-    let out = cmd
-        .output()
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("Python 3 is required for the process supervisor")?;
+    child
+        .stdin
+        .take()
+        .context("Python 3 stdin was not piped")?
+        .write_all(args.to_string().as_bytes())?;
+    let out = child.wait_with_output()?;
     anyhow::ensure!(
         out.status.success(),
         "{}",
@@ -275,7 +281,7 @@ pub(crate) fn backend(
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 fn manifest() -> Value {
-    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","setup","run","status","view","stop","steer","list","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"],"turn_local":{"/subagents":["","status","view","list","open"]}});
+    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","run","status","view","stop","steer","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"],"turn_local":{"/subagents":["","status","view","open"]}});
     // Folded-in surfaces ride this manifest too: gray-narrow's tools
     // (narrow_delegate) plus the subagent_* model-facing tools.
     let mut tools: Vec<Value> = narrow::manifest_narrow()
@@ -296,7 +302,7 @@ fn widget(demo: bool, offset: usize) -> Result<Value> {
     let mut rows = Vec::new();
     if demo {
         rows.push(AgentRow {
-            name: "auth-scout".into(),
+            name: "auth-survey".into(),
             description: "Find authentication entry points".into(),
             stats: "14.2s".into(),
             model: "Haiku 5.5".into(),
@@ -306,7 +312,7 @@ fn widget(demo: bool, offset: usize) -> Result<Value> {
             },
         });
         rows.push(AgentRow {
-            name: "Reviewer".into(),
+            name: "session-check".into(),
             description: "Check session handling".into(),
             stats: "38.4s".into(),
             model: "Haiku 5.5".into(),
@@ -424,7 +430,11 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                             .and_then(session_activity)
                             .unwrap_or_else(|| job["activity"].as_str().unwrap_or("").into());
                         let a = a.strip_prefix("$ ").unwrap_or(&a);
-                        if a.is_empty() { "working…".into() } else { a.into() }
+                        if a.is_empty() {
+                            "working…".into()
+                        } else {
+                            a.into()
+                        }
                     },
                 },
                 "queued" => AgentState::Queued,
@@ -438,8 +448,8 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                 row: AgentRow {
                     name: job["name"]
                         .as_str()
-                        .or_else(|| job["agent"].as_str())
-                        .unwrap_or("agent")
+                        .or_else(|| job["run_id"].as_str().and_then(|r| r.get(..8)))
+                        .unwrap_or("run")
                         .into(),
                     description: {
                         let t: String = job["task"]
@@ -589,7 +599,7 @@ pub(crate) fn menu_target(target: &str) -> String {
 
 /// The interactive `/subagents` menu: same flat voice as the widget, each
 /// row numbered so one word selects it. Session-scoped like the widget.
-fn menu() -> Result<Value> {
+pub(crate) fn menu() -> Result<Value> {
     let entries = menu_order(collect_entries(true, false)?);
     if entries.is_empty() {
         return Ok(json!({"content": "  no runs yet — gray subagents run 'task' to start one"}));
@@ -602,7 +612,7 @@ fn menu() -> Result<Value> {
     let mut text = render_menu(&rows);
     text.push_str(&format!(
         "\n  N|NAME selects · open — enter a finished run's session · chat '…' — talk · view · steer{}",
-        if running > 0 { " · stop N|all|mine" } else { "" }
+        if running > 0 { " · stop N|all · stop all --global" } else { "" }
     ));
     Ok(json!({"content": text}))
 }
@@ -1337,6 +1347,7 @@ fn descendants_of(root_pid: u64) -> Vec<u64> {
 
 /// Signal a pid's process group first, the lone pid when it leads no
 /// group — the supervisor's kill_tree semantics for unmanaged workers.
+#[cfg(unix)]
 fn signal_proc_or_group(pid: u64, sig: &str) {
     let grouped = Command::new("kill")
         .args([sig, &format!("-{pid}")])
@@ -1346,6 +1357,14 @@ fn signal_proc_or_group(pid: u64, sig: &str) {
     if !grouped {
         let _ = Command::new("kill").args([sig, &pid.to_string()]).status();
     }
+}
+
+#[cfg(windows)]
+fn signal_proc_or_group(pid: u64, _sig: &str) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID"])
+        .arg(pid.to_string())
+        .status();
 }
 
 pub(crate) fn foreign_stop(rid: &str) -> Option<Value> {
@@ -1389,7 +1408,7 @@ pub(crate) fn check_context(value: &str) -> Result<String> {
     let number = matches!(parts.next(), Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
         && parts
             .next()
-            .map_or(true, |p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
         && parts.next().is_none();
     let positive = digits.parse::<f64>().is_ok_and(|n| n > 0.0);
     anyhow::ensure!(
@@ -1415,7 +1434,9 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] [--max-phases N] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--max-running N]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. A run is marked stalled after 2 consecutive phases with no successful tool call or the same error 3 times in a row; each run's phase budget (default 32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every transition is audited to runs/<id>.events.jsonl. Runs are detached — they keep going if this session ends. The subagent_spawn/subagent_check/subagent_message/subagent_stop/subagent_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
+const USAGE: &str = "Subagents: delegate from bash with `gray subagents run --name NAME [--model PROVIDER/MODEL] [--isolation worktree] 'task'`, then `gray subagents status|view|steer|stop ID` (or load the subagent_* tools). Always pass a descriptive --name; use --isolation worktree when parallel runs edit the same repo. Runs are detached and outlive this session. `gray subagents --help` documents every option.";
+
+const USAGE_DETAIL: &str = include_str!("../AGENTS.md");
 
 /// JSON rows for the host's agents panel: the same entries the text menu
 /// numbers, plus the session/target fields its actions need.
@@ -1467,10 +1488,8 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             context,
             max_running,
         } => settings(model, max_running, effort, context),
-        Action::Setup => backend("setup", json!({}), None, None),
         Action::Run {
             task,
-            agent,
             model,
             effort,
             context,
@@ -1480,7 +1499,7 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             isolation,
             max_phases,
         } => {
-            let mut args = json!({"task":task.join(" "),"agent":agent});
+            let mut args = json!({"task":task.join(" ")});
             if let Some(tools) = tools {
                 args["tools"] = json!(tools);
             }
@@ -1559,7 +1578,7 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             None,
             None,
         ),
-        Action::Stop { run_id } => {
+        Action::Stop { run_id, global } => {
             let rid = run_id
                 .map(|t| menu_target(&t))
                 .unwrap_or_else(|| "mine".to_string());
@@ -1573,14 +1592,13 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
                         owner_session(session.and_then(|s| s["id"].as_str())).unwrap_or_default();
                     backend(
                         "stop",
-                        json!({"run_id": rid, "session": {"id": sid}}),
+                        json!({"run_id": rid, "global": global, "session": {"id": sid}}),
                         None,
                         None,
                     )
                 }
             }
         }
-        Action::List => backend("list", json!({}), None, None),
         Action::Widget { demo, offset } => widget(demo, offset),
         Action::Manifest => Ok(manifest()),
     }
@@ -1625,14 +1643,16 @@ fn sidecar() -> Result<()> {
         }
         // Folded-in gray-narrow surface: its hooks/tools/commands go straight
         // to the narrow module's own dispatcher (it emits a full reply).
-        if matches!(
-            req["method"].as_str(),
-            Some("tool/before") | Some("tool/call")
-        ) || (req["method"].as_str() == Some("command/run")
-            && matches!(
-                req["params"]["name"].as_str(),
-                Some("/narrow") | Some("narrow")
-            ))
+        // tool/call only owns narrow_delegate — any other name falls through
+        // to "method not found" instead of running a narrowed spawn.
+        if req["method"].as_str() == Some("tool/before")
+            || (req["method"].as_str() == Some("tool/call")
+                && req["params"]["name"].as_str() == Some("narrow_delegate"))
+            || (req["method"].as_str() == Some("command/run")
+                && matches!(
+                    req["params"]["name"].as_str(),
+                    Some("/narrow") | Some("narrow")
+                ))
         {
             let (reply, _) = narrow::handle_narrow(&req);
             if let Some(reply) = reply {
@@ -1656,13 +1676,12 @@ fn sidecar() -> Result<()> {
                             .unwrap_or_default();
                     let mut text = format!("{USAGE}\n{notices}");
                     let nreq = json!({"id":0,"method":"prompt/context","params":req["params"]});
-                    if let (Some(r), _) = narrow::handle_narrow(&nreq) {
-                        if let Some(t) = r.pointer("/result/text").and_then(Value::as_str) {
-                            if !t.is_empty() {
-                                text.push_str("\n");
-                                text.push_str(t);
-                            }
-                        }
+                    if let (Some(r), _) = narrow::handle_narrow(&nreq)
+                        && let Some(t) = r.pointer("/result/text").and_then(Value::as_str)
+                        && !t.is_empty()
+                    {
+                        text.push('\n');
+                        text.push_str(t);
                     }
                     Ok(json!({"text":text}))
                 }
@@ -1674,10 +1693,14 @@ fn sidecar() -> Result<()> {
                 let mut argv = vec!["gray-subagents".to_string()];
                 argv.extend(args.iter().filter_map(|v| v.as_str().map(str::to_owned)));
                 if argv.len() == 1 {
-                    // Bare `/subagents` opens the host's interactive panel:
-                    // rows/actions ride this CLI via `entries`/`open`/
-                    // `view`/`stop`/`chat`.
-                    Ok(json!({"agent_picker":"subagents"}))
+                    // Bare `/subagents` hands the terminal to this CLI's
+                    // own panel (`gray subagents panel`); rows/actions
+                    // ride `entries`/`view`/`stop`/`chat` in-process.
+                    let text = menu()
+                        .ok()
+                        .and_then(|v| v["content"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    Ok(json!({"terminal": ["panel"], "text": text}))
                 } else {
                     let session = req["params"].get("session").cloned();
                     match Cli::try_parse_from(preprocess(argv)) {
@@ -1692,11 +1715,17 @@ fn sidecar() -> Result<()> {
                                 effort: None,
                                 context: None,
                                 max_running: None,
-                            }) => Ok(json!({"subagent_settings":"subagents"})),
+                            }) => Ok(json!({"terminal": ["panel"]})),
                             Some(action) => execute(action, session.as_ref())
                                 .map(|v| json!({"text":present(&v)}))
                                 .map_err(|e| (json!("invalid"), e.to_string())),
-                            None => Ok(json!({"agent_picker":"subagents"})),
+                            None => {
+                                let text = menu()
+                                    .ok()
+                                    .and_then(|v| v["content"].as_str().map(str::to_string))
+                                    .unwrap_or_default();
+                                Ok(json!({"terminal": ["panel"], "text": text}))
+                            }
                         },
                     }
                 }
@@ -1721,8 +1750,8 @@ fn sidecar() -> Result<()> {
 /// the sidecar argv alike.
 fn preprocess(mut argv: Vec<String>) -> Vec<String> {
     const VERBS: &[&str] = &[
-        "settings", "setup", "run", "steer", "status", "view", "stop", "list", "widget",
-        "manifest", "menu", "open", "chat", "entries", "help",
+        "settings", "run", "steer", "status", "view", "stop", "widget", "manifest", "menu", "open",
+        "chat", "entries", "help",
     ];
     if argv.len() == 2 && !argv[1].starts_with('-') && !VERBS.contains(&argv[1].as_str()) {
         argv.insert(1, "open".to_string());
@@ -1736,14 +1765,38 @@ mod tests {
 
     #[test]
     fn context_parses_like_the_python_twin() {
-        for ok in ["auto", "AUTO", "90k", "90K", "300k", "1m", "1.5m", "90000", "0.5m"] {
+        for ok in [
+            "auto", "AUTO", "90k", "90K", "300k", "1m", "1.5m", "90000", "0.5m",
+        ] {
             assert!(check_context(ok).is_ok(), "{ok:?}");
         }
         assert_eq!(check_context(" 90K ").unwrap(), "90k");
-        for bad in ["", " ", "ctx", "90kk", "1.5x", "0", "-5", "1e5", ".5k", "1.2.3m"] {
+        for bad in [
+            "", " ", "ctx", "90kk", "1.5x", "0", "-5", "1e5", ".5k", "1.2.3m",
+        ] {
             assert!(check_context(bad).is_err(), "{bad:?}");
         }
     }
+}
+
+#[cfg(unix)]
+fn stdin_is_pipe() -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata("/dev/fd/0")
+        .map(|m| m.file_type().is_fifo() || m.file_type().is_socket())
+        .unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn stdin_is_pipe() -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+    unsafe { GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stdin_is_pipe() -> bool {
+    true
 }
 
 fn main() -> Result<()> {
@@ -1755,8 +1808,11 @@ fn main() -> Result<()> {
     if argv.len() > 1 && argv[1] == "sidecar" {
         return sidecar();
     }
+    if argv.len() > 1 && argv[1] == "panel" {
+        return panel::run();
+    }
     if argv.len() > 1 && argv[1] == "rlm" {
-        println!("{}", agents::cli(&argv[2..].to_vec()));
+        println!("{}", agents::cli(&argv[2..]));
         return Ok(());
     }
     if argv.len() > 1 && (argv[1] == "narrow" || argv[1] == "plan") {
@@ -1789,7 +1845,13 @@ fn main() -> Result<()> {
             return Ok(());
         }
     };
-    if let Some(action) = cli.command {
+    // Bare argv is ambiguous: the host spawns the sidecar with piped stdin,
+    // while `gray subagents` from a shell or the host's cli passthrough
+    // (stdin = tty or /dev/null) means "show the menu", per the README.
+    let action = cli
+        .command
+        .or_else(|| (!stdin_is_pipe()).then_some(Action::Menu));
+    if let Some(action) = action {
         println!("{}", serde_json::to_string_pretty(&execute(action, None)?)?);
         Ok(())
     } else {
@@ -1812,7 +1874,10 @@ mod manifest_tests {
             let name = t["name"].as_str().unwrap_or("?");
             let label = t["label"].as_str().unwrap_or("").trim();
             assert!(!label.is_empty(), "tool {name} declares no label");
-            assert!(!label.contains('_'), "tool {name} label {label:?} is a wire name");
+            assert!(
+                !label.contains('_'),
+                "tool {name} label {label:?} is a wire name"
+            );
         }
     }
 
