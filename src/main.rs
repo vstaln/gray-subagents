@@ -44,12 +44,9 @@ enum Action {
         #[arg(long)]
         max_running: Option<u32>,
     },
-    Setup,
     Run {
         #[arg(required = true, num_args = 1..)]
         task: Vec<String>,
-        #[arg(long, default_value = "scout")]
-        agent: String,
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
@@ -123,7 +120,6 @@ enum Action {
         #[arg(long)]
         global: bool,
     },
-    List,
     Widget {
         #[arg(long)]
         demo: bool,
@@ -211,9 +207,7 @@ pub(crate) fn backend(
         "elif action=='stop': result=ns['stop_job'](args.get('run_id'),(args.get('session') or {}).get('id',''),bool(args.get('global')))\n",
         "elif action=='steer': result=ns['steer_job'](args['run_id'],args['message'])\n",
         "elif action=='context': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''))}\n",
-        "elif action=='notices': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''),False)}\n",
-        "elif action=='setup': result={'content':ns['setup_profiles']()}\n",
-        "elif action=='list': result=ns['list_profiles']()\n",
+        "elif action=='notices': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''))}\n",
         "print(json.dumps(result))\n"
     );
     // ValueError is the supervisor's user-facing refusal ("unknown run",
@@ -280,7 +274,7 @@ pub(crate) fn backend(
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 fn manifest() -> Value {
-    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","setup","run","status","view","stop","steer","list","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"],"turn_local":{"/subagents":["","status","view","list","open"]}});
+    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","run","status","view","stop","steer","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"],"turn_local":{"/subagents":["","status","view","open"]}});
     // Folded-in surfaces ride this manifest too: gray-narrow's tools
     // (narrow_delegate) plus the subagent_* model-facing tools.
     let mut tools: Vec<Value> = narrow::manifest_narrow()
@@ -301,7 +295,7 @@ fn widget(demo: bool, offset: usize) -> Result<Value> {
     let mut rows = Vec::new();
     if demo {
         rows.push(AgentRow {
-            name: "auth-scout".into(),
+            name: "auth-survey".into(),
             description: "Find authentication entry points".into(),
             stats: "14.2s".into(),
             model: "Haiku 5.5".into(),
@@ -311,7 +305,7 @@ fn widget(demo: bool, offset: usize) -> Result<Value> {
             },
         });
         rows.push(AgentRow {
-            name: "Reviewer".into(),
+            name: "session-check".into(),
             description: "Check session handling".into(),
             stats: "38.4s".into(),
             model: "Haiku 5.5".into(),
@@ -447,8 +441,8 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                 row: AgentRow {
                     name: job["name"]
                         .as_str()
-                        .or_else(|| job["agent"].as_str())
-                        .unwrap_or("agent")
+                        .or_else(|| job["run_id"].as_str().and_then(|r| r.get(..8)))
+                        .unwrap_or("run")
                         .into(),
                     description: {
                         let t: String = job["task"]
@@ -1389,9 +1383,9 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents: delegate from bash with `gray subagents run --name NAME [--agent PROFILE] [--isolation worktree] 'task'`, then `gray subagents status|view|steer|stop ID` (or load the subagent_* tools). Always pass a descriptive --name; use --isolation worktree when parallel runs edit the same repo. Runs are detached and outlive this session. `gray subagents --help` documents every option.";
+const USAGE: &str = "Subagents: delegate from bash with `gray subagents run --name NAME [--model PROVIDER/MODEL] [--isolation worktree] 'task'`, then `gray subagents status|view|steer|stop ID` (or load the subagent_* tools). Always pass a descriptive --name; use --isolation worktree when parallel runs edit the same repo. Runs are detached and outlive this session. `gray subagents --help` documents every option.";
 
-const USAGE_DETAIL: &str = "Subagents are managed through Bash: gray subagents run [--name NAME] [--agent scout] [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS] [--isolation worktree] [--max-phases N] 'task'; gray subagents status [ID]; gray subagents view [ID] [--lines N]; gray subagents steer ID 'follow-up'; gray subagents stop ID; gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL] [--context CTX] [--max-running N]. Always pass a descriptive --name — it labels the run in the Agents view. Per-run --model/--effort/--context override profile frontmatter and the global setting (`context` becomes the child's GRAY_COMPACT_AT; above 200k a Claude model uses its [1m] route — Haiku bills 5x past 100k); profiles in ~/.gray/subagents/agents/*.md may open with a `---` block carrying `model:`/`effort:`/`tools:`/`context:` defaults (`tools:` narrows the child's grant via gray-narrow — a child can never exceed its parent's set). Every run gets a readable name (or use --name); ID accepts a name, unique hex prefix, a menu number from `gray subagents status`, or 'last'. open NAME prints the /resume line that enters a finished run's own session; chat NAME 'msg' talks into it (steer alias). Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name (and are shown with their session slug otherwise); view/stop also accept worker names and session slugs. --isolation worktree gives the child its own git worktree — required when parallel runs edit the same repo. Runs have no time cap unless `timeout` (seconds) is passed to the subagent tool or GRAY_SUBAGENTS_TIMEOUT_SECS is set; a run that times out reports partial output and stays steerable. Children cannot spawn subagents. A run is marked stalled after 2 consecutive phases with no successful tool call or the same error 3 times in a row; each run's phase budget (default 32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every transition is audited to runs/<id>.events.jsonl. Runs are detached — they keep going if this session ends. The subagent_spawn/subagent_check/subagent_message/subagent_stop/subagent_note tools expose the same supervisor programmatically (handles + typed snapshots; ≤32 spawns per session). Do not invent other subagent tools.";
+const USAGE_DETAIL: &str = include_str!("../AGENTS.md");
 
 /// JSON rows for the host's agents panel: the same entries the text menu
 /// numbers, plus the session/target fields its actions need.
@@ -1443,10 +1437,8 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             context,
             max_running,
         } => settings(model, max_running, effort, context),
-        Action::Setup => backend("setup", json!({}), None, None),
         Action::Run {
             task,
-            agent,
             model,
             effort,
             context,
@@ -1456,7 +1448,7 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             isolation,
             max_phases,
         } => {
-            let mut args = json!({"task":task.join(" "),"agent":agent});
+            let mut args = json!({"task":task.join(" ")});
             if let Some(tools) = tools {
                 args["tools"] = json!(tools);
             }
@@ -1556,7 +1548,6 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
                 }
             }
         }
-        Action::List => backend("list", json!({}), None, None),
         Action::Widget { demo, offset } => widget(demo, offset),
         Action::Manifest => Ok(manifest()),
     }
@@ -1709,8 +1700,8 @@ fn sidecar() -> Result<()> {
 /// the sidecar argv alike.
 fn preprocess(mut argv: Vec<String>) -> Vec<String> {
     const VERBS: &[&str] = &[
-        "settings", "setup", "run", "steer", "status", "view", "stop", "list", "widget",
-        "manifest", "menu", "open", "chat", "entries", "help",
+        "settings", "run", "steer", "status", "view", "stop", "widget", "manifest", "menu", "open",
+        "chat", "entries", "help",
     ];
     if argv.len() == 2 && !argv[1].starts_with('-') && !VERBS.contains(&argv[1].as_str()) {
         argv.insert(1, "open".to_string());

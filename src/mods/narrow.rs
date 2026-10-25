@@ -25,14 +25,14 @@ use serde_json::{Value, json};
 const USAGE: &str = "\
 gray-narrow — capability narrowing for delegated children.
 
-  gray narrow run [--tools CSV] [--agent PROFILE] [--approve CSV] 'task'
+  gray narrow run [--tools CSV] [--approve CSV] 'task'
   gray narrow plan --request 'read,grep,bash:*'   (integration seam)
   gray narrow grants | status | ledger [--lines N]
   /narrow grants|ledger|help                     (in-session)
 
 Grants only ever narrow: a child can never exceed its parent's set. Tool
 patterns: 'read' = tool read, 'bash:git*' = bash calls whose command starts
-'git', 'agent:scout' = may spawn the scout profile, '*' = everything.";
+'git', '*' = everything.";
 
 // ---------------------------------------------------------------------------
 // manifest / wire
@@ -54,8 +54,7 @@ pub fn manifest_narrow() -> Value {
                 "properties": {
                     "task": {"type": "string", "description": "the child's assignment"},
                     "tools": {"type": "string", "description": "comma-separated capability allowlist, e.g. 'read,grep,bash:git*'; omit to inherit"},
-                    "agent": {"type": "string", "description": "agent profile name from ~/.gray/subagents/agents/<name>.md"},
-                    "name": {"type": "string", "description": "short descriptive run label like 'auth-scout' or 'fix-flaky-test' [a-zA-Z0-9][a-zA-Z0-9_-]* — shown in the Agents panel; always pass a meaningful name so runs are identifiable (a task-derived slug is used when omitted)"},
+                    "name": {"type": "string", "description": "short descriptive run label like 'auth-survey' or 'fix-flaky-test' [a-zA-Z0-9][a-zA-Z0-9_-]* — shown in the Agents panel; always pass a meaningful name so runs are identifiable (a task-derived slug is used when omitted)"},
                     "approve": {"type": "string", "description": "comma-separated gated capabilities to approve, e.g. 'tool:bash'"}
                 },
                 "required": ["task"]
@@ -128,7 +127,6 @@ struct Planned {
 /// propagate the message to the user and do NOT spawn.
 fn plan(
     request_csv: Option<&str>,
-    agent: Option<&str>,
     approve_csv: Option<&str>,
     via: &str,
     cwd: &str,
@@ -151,13 +149,6 @@ fn plan(
         None => parent.clone(),
         Some(csv) => parse_capability_list(csv)?,
     };
-    if let Some(a) = agent {
-        // Spawning a named profile consumes agent authority; it is checked
-        // against the parent grant but not carried into the child's grant.
-        if !may_spawn_agent(&parent, a) {
-            return Err(format!("this session's grant does not cover agent:{a}"));
-        }
-    }
     let approved = match approve_csv {
         Some(csv) => parse_capability_list(csv)?,
         None => Vec::new(),
@@ -184,7 +175,6 @@ fn plan(
         let ev = grant_event(
             via,
             &run_id,
-            agent,
             cwd,
             depth + 1,
             max_depth,
@@ -203,7 +193,6 @@ fn plan(
         let ev = grant_event(
             via,
             &run_id,
-            agent,
             cwd,
             depth + 1,
             max_depth,
@@ -223,7 +212,6 @@ fn plan(
         let ev = grant_event(
             via,
             &run_id,
-            agent,
             cwd,
             depth + 1,
             max_depth,
@@ -258,64 +246,19 @@ fn plan(
 // run: spawn a detached `gray -p` child under the resolved grant
 // ---------------------------------------------------------------------------
 
-fn load_profile(name: &str) -> Result<(String, Value), String> {
-    if !name
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        || name.len() > 64
-    {
-        return Err(format!("invalid agent name '{name}'"));
-    }
-    let path = crate::narrow_lib::gray_home()
-        .join("subagents/agents")
-        .join(format!("{name}.md"));
-    let text = std::fs::read_to_string(&path)
-        .map_err(|_| format!("unknown agent '{name}' (no {})", path.display()))?;
-    // Same `---` frontmatter convention as gray-subagents: model/effort/tools.
-    let mut meta = json!({});
-    let body = if let Some(rest) = text.strip_prefix("---\n") {
-        match rest.find("\n---") {
-            Some(end) => {
-                for line in rest[..end].lines() {
-                    if let Some((k, v)) = line.split_once(':') {
-                        meta[k.trim().to_lowercase()] = json!(v.trim());
-                    }
-                }
-                rest[end + 4..].trim_start_matches('\n').to_string()
-            }
-            None => text.trim().to_string(),
-        }
-    } else {
-        text.trim().to_string()
-    };
-    if body.is_empty() {
-        return Err(format!("profile '{name}' has an empty body"));
-    }
-    Ok((body, meta))
-}
-
 fn gray_binary() -> String {
     std::env::var("GRAY_SUBAGENTS_BIN")
         .or_else(|_| std::env::var("GRAY_BIN"))
         .unwrap_or_else(|_| "gray".to_string())
 }
 
-fn child_prompt(agent: Option<&str>, task: &str, grant_csv: &str) -> String {
-    let profile = agent
-        .and_then(|a| load_profile(a).ok())
-        .map(|(body, _)| format!("{body}\n\n"))
-        .unwrap_or_default();
-    let who = agent.unwrap_or("worker");
+fn child_prompt(task: &str, grant_csv: &str) -> String {
     format!(
-        "You are the '{who}' subagent of a parent Gray session, delegated under a \
+        "You are a subagent of a parent Gray session, delegated under a \
          NARROWED TOOL GRANT: {grant_csv}.\n\n\
-         {profile}# Task\n\n{task}\n\n\
+         # Task\n\n{task}\n\n\
          Tool calls outside your grant are denied and logged; do not try to widen it. \
-         Work only on this assignment. Do not spawn more agents unless your grant allows it. \
+         Work only on this assignment. Do not spawn more agents. \
          If blocked, report the blocker; do not guess unapproved decisions. \
          Return findings, changed paths, and verification in your final answer."
     )
@@ -382,17 +325,9 @@ fn spawn_child(
         .map_err(|e| format!("could not spawn {}: {e}", gray_binary()))
 }
 
-fn run_record(
-    run_id: &str,
-    name: &str,
-    agent: Option<&str>,
-    task: &str,
-    cwd: &str,
-    grant: &[String],
-    pid: u32,
-) {
+fn run_record(run_id: &str, name: &str, task: &str, cwd: &str, grant: &[String], pid: u32) {
     let rec = json!({
-        "run_id": run_id, "name": name, "agent": agent.unwrap_or(""),
+        "run_id": run_id, "name": name,
         "task": task, "cwd": cwd, "pid": pid,
         "grant": grant, "status": "running",
         "created": std::time::SystemTime::now()
@@ -441,7 +376,6 @@ fn name_from_task(task: &str, run_id: &str) -> String {
 fn do_run_narrow(
     task: &str,
     tools: Option<&str>,
-    agent: Option<&str>,
     name: Option<&str>,
     approve: Option<&str>,
     model: Option<&str>,
@@ -450,9 +384,9 @@ fn do_run_narrow(
     via: &str,
     session: &str,
 ) -> Result<String, String> {
-    let planned = plan(tools, agent, approve, via, cwd, None)?;
+    let planned = plan(tools, approve, via, cwd, None)?;
     let grant_csv = grant_env_value(&planned.out.effective)?;
-    let prompt = child_prompt(agent, task, &grant_csv);
+    let prompt = child_prompt(task, &grant_csv);
     let name = name
         .map(str::to_string)
         .unwrap_or_else(|| name_from_task(task, &planned.run_id));
@@ -488,7 +422,6 @@ fn do_run_narrow(
     let ev = grant_event(
         via,
         &planned.run_id,
-        agent,
         cwd,
         planned.depth + 1,
         planned.max_depth,
@@ -501,7 +434,6 @@ fn do_run_narrow(
     run_record(
         &planned.run_id,
         &name,
-        agent,
         task,
         cwd,
         &planned.out.effective,
@@ -545,12 +477,9 @@ enum NarrowCmd {
     Run {
         #[arg(required = true, num_args = 1..)]
         task: Vec<String>,
-        /// Comma-separated allowlist: read,grep,bash:git*,agent:scout,*
+        /// Comma-separated allowlist: read,grep,bash:git*,*
         #[arg(long)]
         tools: Option<String>,
-        /// Agent profile (~/.gray/subagents/agents/<name>.md)
-        #[arg(long)]
-        agent: Option<String>,
         #[arg(long)]
         name: Option<String>,
         /// Approve gated capabilities (e.g. 'tool:bash')
@@ -571,8 +500,6 @@ enum NarrowCmd {
         /// Requested capabilities CSV; omit to inherit the full grant.
         #[arg(long)]
         request: Option<String>,
-        #[arg(long)]
-        agent: Option<String>,
         #[arg(long)]
         approve: Option<String>,
         /// Label for the ledger's `via` field (e.g. subagents)
@@ -604,7 +531,6 @@ fn do_plan_narrow(args: NarrowPlanArgs) -> Result<Value, String> {
         .unwrap_or_default();
     let planned = plan(
         args.request.as_deref(),
-        args.agent.as_deref(),
         args.approve.as_deref(),
         &args.via,
         &cwd,
@@ -613,7 +539,6 @@ fn do_plan_narrow(args: NarrowPlanArgs) -> Result<Value, String> {
     let ev = grant_event(
         &args.via,
         &planned.run_id,
-        args.agent.as_deref(),
         &cwd,
         planned.depth + 1,
         planned.max_depth,
@@ -644,7 +569,6 @@ fn do_plan_narrow(args: NarrowPlanArgs) -> Result<Value, String> {
 
 struct NarrowPlanArgs {
     request: Option<String>,
-    agent: Option<String>,
     approve: Option<String>,
     via: String,
     run_id: Option<String>,
@@ -746,7 +670,6 @@ fn run_command_narrow(argv: &[&str]) -> String {
                     NarrowCmd::Run {
                         task,
                         tools,
-                        agent,
                         name,
                         approve,
                         model,
@@ -761,7 +684,6 @@ fn run_command_narrow(argv: &[&str]) -> String {
                         do_run_narrow(
                             &task.join(" "),
                             tools.as_deref(),
-                            agent.as_deref(),
                             name.as_deref(),
                             approve.as_deref(),
                             model.as_deref(),
@@ -774,14 +696,12 @@ fn run_command_narrow(argv: &[&str]) -> String {
                     }
                     NarrowCmd::Plan {
                         request,
-                        agent,
                         approve,
                         via,
                         run_id,
                     } => {
                         match do_plan_narrow(NarrowPlanArgs {
                             request,
-                            agent,
                             approve,
                             via,
                             run_id,
@@ -818,7 +738,6 @@ fn tool_call_narrow(params: &Value) -> Value {
     match do_run_narrow(
         task,
         args["tools"].as_str(),
-        args["agent"].as_str(),
         args["name"].as_str(),
         args["approve"].as_str(),
         None,
@@ -877,7 +796,6 @@ pub fn narrow_cli(args: Vec<String>) -> Result<String, String> {
         NarrowCmd::Run {
             task,
             tools,
-            agent,
             name,
             approve,
             model,
@@ -886,7 +804,6 @@ pub fn narrow_cli(args: Vec<String>) -> Result<String, String> {
         } => do_run_narrow(
             &task.join(" "),
             tools.as_deref(),
-            agent.as_deref(),
             name.as_deref(),
             approve.as_deref(),
             model.as_deref(),
@@ -897,13 +814,11 @@ pub fn narrow_cli(args: Vec<String>) -> Result<String, String> {
         ),
         NarrowCmd::Plan {
             request,
-            agent,
             approve,
             via,
             run_id,
         } => do_plan_narrow(NarrowPlanArgs {
             request,
-            agent,
             approve,
             via,
             run_id,

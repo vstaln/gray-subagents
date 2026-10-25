@@ -87,7 +87,7 @@ fn widget_demo_uses_real_rust_renderer() {
     let text = panel["text"].as_str().unwrap();
     assert!(!text.contains("Agents\n"));
     assert!(text.contains("2 subagents"));
-    assert!(text.contains("● auth-scout"));
+    assert!(text.contains("● auth-survey"));
     assert!(text.contains("searching"), "{text}");
 }
 
@@ -182,7 +182,7 @@ fn run_joins_unquoted_task_words_and_keeps_flags() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = bin()
-        .args(["run", "Inspect", "the", "codebase", "--agent", "reviewer"])
+        .args(["run", "Inspect", "the", "codebase", "--name", "inspect-run"])
         .env("GRAY_HOME", home.path())
         .env("GRAY_SUBAGENTS_BIN", &child)
         .output()
@@ -204,7 +204,6 @@ fn run_joins_unquoted_task_words_and_keeps_flags() {
         if status["status"] == "completed" {
             let result = status["result"].as_str().unwrap();
             assert!(result.contains("Inspect the codebase"), "{result}");
-            assert!(result.contains("'reviewer'"), "{result}");
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -234,7 +233,7 @@ fn seed_job(home: &std::path::Path, rid: &str, fields: serde_json::Value) {
     let dir = home.join("subagents/runs");
     std::fs::create_dir_all(&dir).unwrap();
     let mut job = serde_json::json!({
-        "run_id": rid, "name": "", "agent": "scout", "task": "t",
+        "run_id": rid, "name": "", "task": "t",
         "status": "completed", "created": 100.0, "finished": 150.0,
         "error": "", "model": "", "session_id": "", "child_session": "",
         "activity": "", "cwd": std::env::current_dir().unwrap(),
@@ -267,7 +266,7 @@ fn menu_numbers_rows_and_open_selects_them() {
     seed_job(
         home.path(),
         &format!("{}", "a".repeat(32)),
-        serde_json::json!({"name": "done-scout", "child_session": "tidal-quark-photon"}),
+        serde_json::json!({"name": "done-survey", "child_session": "tidal-quark-photon"}),
     );
     seed_job(
         home.path(),
@@ -291,11 +290,11 @@ fn menu_numbers_rows_and_open_selects_them() {
     let menu = content(run(&["menu"]));
     assert!(menu.starts_with("1 \u{2717} bad-que"), "{menu}");
     assert!(!menu.contains("\u{2b22} Agents"), "{menu}");
-    assert!(menu.contains("2 \u{2713} done-scout"), "{menu}");
+    assert!(menu.contains("2 \u{2713} done-survey"), "{menu}");
     assert!(menu.contains("N|NAME selects"), "{menu}");
 
     // Bare word and `open` agree; finished runs hand over /resume.
-    let one = content(run(&["done-scout"]));
+    let one = content(run(&["done-survey"]));
     let two = content(run(&["open", "2"]));
     let resume = "/resume tidal-quark-photon";
     assert!(one.contains(resume), "{one}");

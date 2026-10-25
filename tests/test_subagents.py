@@ -94,12 +94,12 @@ class SidecarCase(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"run {rid} never reached {want}: {st}")
 
-    def spawn(self, task="do work", agent="scout", env_extra=None, args_extra=None, cwd=None):
+    def spawn(self, task="do work", env_extra=None, args_extra=None, cwd=None):
         env = dict(self.env)
         env.update(env_extra or {})
         proc = Sidecar(env)
         self.addCleanup(proc.close)
-        args = {"agent": agent, "task": task}
+        args = {"task": task}
         args.update(args_extra or {})
         params = {"name": "subagent", "args": args}
         if cwd is not None:
@@ -134,29 +134,22 @@ class SidecarCase(unittest.TestCase):
         self.assertIn("subagent", names)
         self.assertIn("subagents_status", names)
         self.assertIn("subagents_stop", names)
-        self.assertIn("subagents_list", names)
         self.assertIn("/subagents", r["commands"])
         self.assertIn("prompt/context", r["hooks"])
 
     # -- delegation ----------------------------------------------------------
     def test_subagent_spawns_job_and_completes(self):
-        r = self.sc.call("subagent", {"agent": "scout", "task": "find auth code"})
+        r = self.sc.call("subagent", {"task": "find auth code"})
         self.assertNotIn("is_error", r)
         rid = r["run_id"]
         st = self.wait_status(rid, "completed")
         self.assertTrue(st["result"])
         payload = json.loads(st["result"])
-        self.assertIn("# Scout", payload["prompt"])
         self.assertIn("find auth code", payload["prompt"])
         self.assertEqual(payload["active"], "1")
 
-    def test_subagent_unknown_agent_is_tool_error(self):
-        r = self.sc.call("subagent", {"agent": "nope", "task": "x"})
-        self.assertTrue(r.get("is_error"))
-        self.assertIn("nope", r["content"])
-
     def test_subagent_empty_task_is_tool_error(self):
-        r = self.sc.call("subagent", {"agent": "scout", "task": "   "})
+        r = self.sc.call("subagent", {"task": "   "})
         self.assertTrue(r.get("is_error"))
 
     def test_recursion_guard_blocks_child_from_spawning(self):
@@ -203,7 +196,7 @@ class SidecarCase(unittest.TestCase):
 
     def test_batch_items_accept_prompt_as_task(self):
         r = self.sc.call("subagent", {"tasks": [{"prompt": "alpha work"},
-                                                {"prompt": "beta work", "agent": "oracle"}]})
+                                                {"prompt": "beta work"}]})
         self.assertNotIn("is_error", r)
         prompts = [json.loads(self.wait_status(rid, "completed")["result"])["prompt"]
                    for rid in r["run_ids"]]
@@ -212,10 +205,10 @@ class SidecarCase(unittest.TestCase):
 
     def test_batch_error_names_the_item_and_its_keys(self):
         bad = self.sc.call("subagent", {"tasks": [{"prompt": "fine"},
-                                                  {"agent": "scout", "note": "no task here"}]})
+                                                  {"name": "x1", "note": "no task here"}]})
         self.assertTrue(bad["is_error"])
         self.assertIn("tasks[1]", bad["content"])
-        self.assertIn("item keys: agent, note", bad["content"])
+        self.assertIn("item keys: name, note", bad["content"])
         self.assertEqual(self.sc.call("subagents_status", {})["jobs"], [])
 
     def write_caches(self, listings=None, provider_cache=None, config=None):
@@ -392,16 +385,6 @@ class SidecarCase(unittest.TestCase):
         r = self.spawn()
         self.assertIsNone(self.ctx_payload(r)["compact_at"])
 
-    def test_context_profile_beats_env_and_param_beats_profile(self):
-        agents = self.home / "subagents" / "agents"
-        agents.mkdir(parents=True, exist_ok=True)
-        (agents / "ctxy.md").write_text("---\ncontext: 500k\n---\n# Ctx\n\nDo it.\n")
-        r = self.spawn(agent="ctxy", env_extra={"GRAY_COMPACT_AT": "300k"})
-        self.assertEqual(self.ctx_payload(r)["compact_at"], "500k")
-        r = self.spawn(agent="ctxy", env_extra={"GRAY_COMPACT_AT": "300k"},
-                       args_extra={"context": "90k"})
-        self.assertEqual(self.ctx_payload(r)["compact_at"], "90k")
-
     def test_context_above_200k_on_claude_takes_the_1m_route(self):
         self.write_ctx_home()
         r = self.spawn(args_extra={"model": "haiku", "context": "300k"})
@@ -425,9 +408,9 @@ class SidecarCase(unittest.TestCase):
 
     # -- status --------------------------------------------------------------
     def test_status_lists_all_jobs_most_recent_first(self):
-        a = self.sc.call("subagent", {"agent": "scout", "task": "alpha"})["run_id"]
+        a = self.sc.call("subagent", {"task": "alpha"})["run_id"]
         time.sleep(0.05)
-        b = self.sc.call("subagent", {"agent": "scout", "task": "beta"})["run_id"]
+        b = self.sc.call("subagent", {"task": "beta"})["run_id"]
         jobs = self.sc.call("subagents_status", {})["jobs"]
         self.assertEqual([j["run_id"] for j in jobs[:2]], [b, a])
 
@@ -444,7 +427,7 @@ class SidecarCase(unittest.TestCase):
             return reply["result"]
         cwd = os.getcwd()
         a, b = {"id": "sess-a", "cwd": cwd}, {"id": "sess-b", "cwd": cwd}
-        rid = tool("subagent", {"agent": "scout", "task": "owned by a"}, a, 10)["run_id"]
+        rid = tool("subagent", {"task": "owned by a"}, a, 10)["run_id"]
         for _ in range(100):
             if tool("subagents_status", {"run_id": rid}, a, 11)["status"] == "completed":
                 break
@@ -493,7 +476,7 @@ class SidecarCase(unittest.TestCase):
         self.wait_status(other, "stopped")
 
     def test_run_id_prefix_and_last_resolution(self):
-        rid = self.sc.call("subagent", {"agent": "scout", "task": "short me"})["run_id"]
+        rid = self.sc.call("subagent", {"task": "short me"})["run_id"]
         self.wait_status(rid, "completed")
         st = self.sc.call("subagents_status", {"run_id": rid[:8]})
         self.assertEqual(st["run_id"], rid)
@@ -503,7 +486,7 @@ class SidecarCase(unittest.TestCase):
         self.assertTrue(r.get("is_error"))
 
     def test_run_names_generated_and_resolvable(self):
-        r = self.sc.call("subagent", {"agent": "scout", "task": "named work"})
+        r = self.sc.call("subagent", {"task": "named work"})
         rid, name = r["run_id"], r["names"][0]
         self.assertRegex(name, r"^[a-z]+-[a-z]+(-\d+)?$")
         self.wait_status(rid, "completed")
@@ -518,7 +501,7 @@ class SidecarCase(unittest.TestCase):
         self.wait_status(rid, "completed")
 
     def test_custom_name_and_reserved_names(self):
-        r = self.sc.call("subagent", {"agent": "scout", "task": "t", "name": "bobby"})
+        r = self.sc.call("subagent", {"task": "t", "name": "bobby"})
         rid = r["run_id"]
         self.assertEqual(r["names"], ["bobby"])
         self.wait_status(rid, "completed")
@@ -542,7 +525,7 @@ class SidecarCase(unittest.TestCase):
 
     # -- completion notices via prompt/context --------------------------------
     def test_prompt_context_reports_finished_jobs_once(self):
-        rid = self.sc.call("subagent", {"agent": "scout", "task": "report"})["run_id"]
+        rid = self.sc.call("subagent", {"task": "report"})["run_id"]
         self.wait_status(rid, "completed")
         c1 = self.sc.rpc("prompt/context", {"cwd": os.getcwd()}, rid=5)["result"]["text"]
         self.assertIn(rid, c1)
@@ -552,7 +535,7 @@ class SidecarCase(unittest.TestCase):
     def test_prompt_context_quiet_when_no_jobs(self):
         r = self.sc.rpc("prompt/context", {"cwd": os.getcwd()}, rid=5)["result"]
         self.assertNotIn("Subagent results", r["text"])
-        self.assertIn("Profiles:", r["text"])
+        self.assertEqual(r["text"], "")
 
     # -- crash recovery -------------------------------------------------------
     def test_orphaned_run_is_marked_lost_on_next_status(self):
@@ -562,25 +545,6 @@ class SidecarCase(unittest.TestCase):
         job = json.loads(job_path.read_text())
         os.kill(job["supervisor_pid"], signal.SIGKILL)
         self.wait_status(rid, "lost")
-
-    # -- profiles -------------------------------------------------------------
-    def test_setup_creates_builtins_and_preserves_edits(self):
-        agents = self.home / "subagents" / "agents"
-        out1 = self.sc.rpc("command/run", {"name": "/subagents", "argv": ["setup"]}, rid=1)
-        self.assertNotIn("is_error", out1["result"])
-        self.assertTrue((agents / "scout.md").exists())
-        (agents / "scout.md").write_text("CUSTOM\n")
-        self.sc.rpc("command/run", {"name": "/subagents", "argv": ["setup"]}, rid=2)
-        self.assertEqual((agents / "scout.md").read_text(), "CUSTOM\n")
-
-    def test_list_reflects_user_profiles(self):
-        self.sc.rpc("command/run", {"name": "/subagents", "argv": ["setup"]}, rid=1)
-        agents = self.home / "subagents" / "agents"
-        agents.mkdir(parents=True, exist_ok=True)
-        (agents / "auditor.md").write_text("# Auditor\n\nCheck things.\n")
-        out = self.sc.call("subagents_list", {})["content"]
-        self.assertIn("scout", out)
-        self.assertIn("auditor", out)
 
     def test_timeout_reaps_stuck_child(self):
         env = dict(FAKE_MODE="slow", FAKE_SLEEP="30", GRAY_SUBAGENTS_TIMEOUT_SECS="1")
@@ -617,10 +581,10 @@ class SidecarCase(unittest.TestCase):
         self.assertTrue(st["result"].strip())
 
     def test_parallel_batch_and_no_partial_launch_on_invalid_task(self):
-        bad = self.sc.call("subagent", {"tasks": [{"task": "first"}, {"agent": "missing", "task": "second"}]})
+        bad = self.sc.call("subagent", {"tasks": [{"task": "first"}, {"task": "   "}]})
         self.assertTrue(bad["is_error"])
         self.assertEqual(self.sc.call("subagents_status", {})["jobs"], [])
-        result = self.sc.call("subagent", {"tasks": [{"task": "alpha"}, {"agent": "oracle", "task": "beta"}]})
+        result = self.sc.call("subagent", {"tasks": [{"task": "alpha"}, {"task": "beta"}]})
         self.assertEqual(len(set(result["run_ids"])), 2)
         for rid in result["run_ids"]:
             self.wait_status(rid, "completed")
@@ -640,7 +604,7 @@ class SidecarCase(unittest.TestCase):
         self.assertIn(rid, self.sc.rpc("prompt/context", {})["result"]["text"])
 
     def test_invalid_arguments_are_tool_errors_not_protocol_errors(self):
-        for args in ([], {"task": 4}, {"task": "ok", "agent": "../escape"},
+        for args in ([], {"task": 4}, {"task": "ok", "name": "../escape"},
                      {"tasks": []}, {"tasks": [{"task": "a"}], "task": "b"}):
             with self.subTest(args=args):
                 self.assertTrue(self.sc.call("subagent", args)["is_error"])
@@ -658,7 +622,7 @@ class SidecarCase(unittest.TestCase):
 
     # -- steering -------------------------------------------------------------
     def test_steer_after_completion_resumes_child_session(self):
-        rid = self.sc.call("subagent", {"agent": "scout", "task": "first"})["run_id"]
+        rid = self.sc.call("subagent", {"task": "first"})["run_id"]
         self.wait_status(rid, "completed")
         r = self.sc.call("subagents_steer", {"run_id": rid, "message": "now do this"})
         self.assertNotIn("is_error", r)
@@ -741,7 +705,7 @@ class SidecarCase(unittest.TestCase):
         # FAKE_MODE must ride on it so the revived phase stays tool-less.
         sc = Sidecar(dict(self.env, FAKE_MODE="quiet"))
         self.addCleanup(sc.close)
-        rid = sc.call("subagent", {"agent": "scout", "task": "do work"})["run_id"]
+        rid = sc.call("subagent", {"task": "do work"})["run_id"]
         self.wait_status(rid, "completed")
         sc.call("subagents_steer", {"run_id": rid, "message": "continue"})
         st = self.wait_status(rid, "stalled")
@@ -750,7 +714,7 @@ class SidecarCase(unittest.TestCase):
     def test_same_error_three_times_marks_stalled(self):
         sc = Sidecar(dict(self.env, FAKE_MODE="sessfail"))
         self.addCleanup(sc.close)
-        rid = sc.call("subagent", {"agent": "scout", "task": "do work"})["run_id"]
+        rid = sc.call("subagent", {"task": "do work"})["run_id"]
         self.wait_status(rid, "failed")
         sc.call("subagents_steer", {"run_id": rid, "message": "retry"})
         self.wait_status(rid, "failed")
@@ -789,27 +753,6 @@ class SidecarCase(unittest.TestCase):
             got[json.loads(st["result"])["model"]] = json.loads(st["result"])["effort"]
         self.assertEqual(got, {"vendor/a": None, "vendor/b": "high"})
 
-    def test_profile_frontmatter_sets_model_default(self):
-        agents = self.home / "subagents" / "agents"
-        agents.mkdir(parents=True)
-        (agents / "cheap.md").write_text(
-            "---\nmodel: vendor/cheap-model\neffort: minimal\n---\n\n# Cheap\n\nDo it fast.\n")
-        rid = self.sc.call("subagent", {"agent": "cheap", "task": "go"})["run_id"]
-        st = self.wait_status(rid, "completed")
-        payload = json.loads(st["result"])
-        self.assertEqual(payload["model"], "vendor/cheap-model")
-        self.assertEqual(payload["effort"], "minimal")
-        self.assertNotIn("vendor/cheap-model", payload["prompt"])
-
-    def test_run_arg_model_beats_profile_default(self):
-        agents = self.home / "subagents" / "agents"
-        agents.mkdir(parents=True)
-        (agents / "cheap.md").write_text("---\nmodel: vendor/cheap\n---\n# Cheap\n\nDo it.\n")
-        rid = self.sc.call("subagent", {"agent": "cheap", "task": "go",
-                                        "model": "vendor/strong"})["run_id"]
-        st = self.wait_status(rid, "completed")
-        self.assertEqual(json.loads(st["result"])["model"], "vendor/strong")
-
     def test_invalid_model_and_effort_are_tool_errors(self):
         for args in ({"task": "x", "model": ""}, {"task": "x", "effort": "ludicrous"},
                      {"task": "x", "model": 42}, {"task": "x", "model": "a" * 300}):
@@ -847,7 +790,7 @@ class SidecarCase(unittest.TestCase):
         env.update(FAKE_MODE="slow", FAKE_SLEEP="0.5")
         runner = Sidecar(env)
         self.addCleanup(runner.close)
-        rid = runner.call("subagent", {"agent": "scout", "task": "uncapped"})["run_id"]
+        rid = runner.call("subagent", {"task": "uncapped"})["run_id"]
         job = json.loads((self.run_dir / f"{rid}.json").read_text())
         self.assertIsNone(job["timeout"])
         self.wait_status(rid, "completed")

@@ -15,7 +15,6 @@
 //!   tool:<name-glob>            the named tool(s), any arguments
 //!   tool:<name-glob>:<arg-glob> the tool(s) whose primary argument matches
 //!   tool:*                      every tool (wildcard; root-equivalent)
-//!   agent:<name> | agent:*      permission to spawn that agent profile
 //! Bare words normalise to `tool:<word>`. Globs use `*`/`?`.
 
 use std::io::Write;
@@ -32,7 +31,6 @@ pub const ENV_LEDGER: &str = "GRAY_NARROW_LEDGER";
 pub const ENV_BIN: &str = "GRAY_NARROW_BIN";
 
 pub const WILDCARD: &str = "tool:*";
-pub const AGENT_WILDCARD: &str = "agent:*";
 /// pi-daddy's default delegation bound.
 pub const DEFAULT_MAX_DEPTH: u32 = 2;
 
@@ -87,7 +85,7 @@ pub fn is_well_formed_capability(id: &str) -> bool {
     !id.is_empty() && !id.contains([',', '\r', '\n', '\0']) && id.trim() == id
 }
 
-/// Strict grammar on the *generation* path (`--tools`, frontmatter, plan).
+/// Strict grammar on the *generation* path (`--tools`, plan).
 /// Fail loud: a malformed id is refused, never silently dropped.
 pub fn is_safe_capability(id: &str) -> bool {
     fn name_glob(s: &str) -> bool {
@@ -106,25 +104,14 @@ pub fn is_safe_capability(id: &str) -> bool {
             Some((n, a)) => name_glob(n) && arg_glob(a),
             None => name_glob(tail),
         },
-        Some(("agent", tail)) => {
-            tail == "*"
-                || (tail.len() <= 64
-                    && tail
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphanumeric())
-                    && tail
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-        }
         _ => false,
     }
 }
 
-/// `read` → `tool:read`; `tool:x`/`agent:x` pass through.
+/// `read` → `tool:read`; `tool:x` passes through.
 pub fn normalise_capability(raw: &str) -> String {
     let v = raw.trim();
-    if v.starts_with("tool:") || v.starts_with("agent:") {
+    if v.starts_with("tool:") {
         v.to_string()
     } else {
         format!("tool:{v}")
@@ -143,13 +130,14 @@ pub fn parse_capability_list(csv: &str) -> Result<Vec<String>, String> {
         }
         let mut cap = normalise_capability(raw);
         if let Some(prefix) = cap.strip_suffix(":*").map(str::to_string) {
-            if cap != WILDCARD && cap != AGENT_WILDCARD {
+            if cap != WILDCARD {
                 cap = prefix;
             }
         }
-        if !is_safe_capability(&cap) {
+        let retired = matches!(raw.split_once(':'), Some(("agent", _)));
+        if retired || !is_safe_capability(&cap) {
             return Err(format!(
-                "'{raw}' is not a capability id (expected tool:<name>[:<args>], agent:<name>, or bare tool name)"
+                "'{raw}' is not a capability id (expected tool:<name>[:<args>] or bare tool name)"
             ));
         }
         if !out.contains(&cap) {
@@ -355,7 +343,7 @@ pub fn expand_subsumed(grant: &[String]) -> Vec<String> {
 }
 
 /// Parent-side coverage: does `parent` (already subsumption-expanded) confer
-/// capability `c`? `tool:*` covers any capability; `agent:*` covers `agent:x`;
+/// capability `c`? `tool:*` covers any capability;
 /// a `tool:<glob>` parent entry covers `tool:<name>` when the glob matches;
 /// arg-constrained parent entries cover only an identical arg constraint.
 fn parent_covers(parent: &[String], c: &str) -> bool {
@@ -373,20 +361,7 @@ fn parent_covers(parent: &[String], c: &str) -> bool {
             None => false,
         });
     }
-    if c.starts_with("agent:") && parent.iter().any(|p| p == AGENT_WILDCARD) {
-        return true;
-    }
     false
-}
-
-/// May this grant spawn agent profile `name`? (pi-daddy `maySpawnDefinition` —
-/// `tool:*` or `agent:*` or `agent:<name>`; the wildcard is honoured explicitly
-/// because resolve() is exact-match and nothing enumerates definitions.)
-pub fn may_spawn_agent(parent_grant: &[String], name: &str) -> bool {
-    let cap = format!("agent:{name}");
-    parent_grant
-        .iter()
-        .any(|g| g == WILDCARD || g == AGENT_WILDCARD || *g == cap)
 }
 
 fn is_gated(c: &str, gated: &[String], approved: &[String]) -> bool {
@@ -498,7 +473,6 @@ pub fn append_ledger(event: &Value) -> std::io::Result<()> {
 pub fn grant_event(
     via: &str,
     run_id: &str,
-    agent: Option<&str>,
     cwd: &str,
     depth: u32,
     max_depth: u32,
@@ -518,7 +492,6 @@ pub fn grant_event(
         "run_id": run_id,
         "parent_run": std::env::var(ENV_RUN).unwrap_or_default(),
         "via": via,
-        "agent": agent.unwrap_or(""),
         "cwd": cwd,
         "depth": depth,
         "max_depth": max_depth,
@@ -601,10 +574,6 @@ mod tests {
             parse_capability_list("bash:*").unwrap(),
             grant_of(&["tool:bash"])
         );
-        assert_eq!(
-            parse_capability_list("agent:scout").unwrap(),
-            grant_of(&["agent:scout"])
-        );
         assert_eq!(parse_capability_list("*").unwrap(), grant_of(&["tool:*"]));
         assert!(parse_capability_list("tool:bash:git*").is_ok());
         assert!(parse_capability_list("tool:read").is_ok());
@@ -620,7 +589,6 @@ mod tests {
             parse_capability_list("workspace:prod").unwrap(),
             grant_of(&["tool:workspace:prod"])
         );
-        assert!(parse_capability_list("agent:not ok").is_err());
         assert!(parse_capability_list("tool:").is_err());
     }
 
@@ -679,14 +647,6 @@ mod tests {
         // Identical constraint is covered.
         let out = resolve_with(&["tool:bash:git*"], "bash:git*", &["tool:bash"]);
         assert_eq!(out.effective, grant_of(&["tool:bash:git*"]));
-    }
-
-    #[test]
-    fn may_spawn_agent_rules() {
-        assert!(may_spawn_agent(&grant_of(&["tool:*"]), "scout"));
-        assert!(may_spawn_agent(&grant_of(&["agent:*"]), "scout"));
-        assert!(may_spawn_agent(&grant_of(&["agent:scout"]), "scout"));
-        assert!(!may_spawn_agent(&grant_of(&["tool:read"]), "scout"));
     }
 
     #[test]

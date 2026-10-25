@@ -30,11 +30,10 @@ any later session can inspect, steer, or stop them.
   and bounded overflow. No persistent above-editor block.
 - Read-only status and transcript views can run while Gray is mid-turn.
 - Bash-only model interface: the installed plugin advertises **zero tools**.
-- CLI launch/status/stop/steer/list/settings.
+- CLI launch/status/stop/steer/settings.
 - Per-delegation model & effort: `run --model PROVIDER/MODEL --effort LEVEL`,
-  per-item `model`/`effort` in batch tasks, and `model:`/`effort:` frontmatter
-  defaults inside agent profiles. Precedence: task field → run flag → profile →
-  `settings --model/--effort` → inherited env. Model specs resolve against
+  and per-item `model`/`effort` in batch tasks. Precedence: task field → run
+  flag → `settings --model/--effort` → inherited env. Model specs resolve against
   the model caches under `$GRAY_HOME` (`models.json` plus the live provider
   lists in `provider_models.json` and `plugins/provider-cache.json`): exact id
   → exact `provider/id` → unique prefix → unique substring. A family word such
@@ -49,8 +48,7 @@ any later session can inspect, steer, or stop them.
   when parallel runs edit the same repo. Clean worktrees are removed with
   their branch; dirty ones stay and report a "worktree kept" note.
 - A timed-out run reports marked partial output and stays steerable —
-  `steer NAME 'continue'` resumes where it stopped. `isolation:` frontmatter
-  works too.
+  `steer NAME 'continue'` resumes where it stopped.
 - `view [NAME]` prints a run's transcript tail; bare `view` shows the latest run.
 - Reports arrive framed as untrusted output: indented lines, an explicit
   not-the-user authority notice, and an instruction-shaped-content flag.
@@ -64,13 +62,12 @@ any later session can inspect, steer, or stop them.
 ## Build and install locally
 
 The host pieces this needs (plugin `subcommands`, the native Agents picker,
-`prompt/context`) are merged in current gray — three commands set it up:
+`prompt/context`) are merged in current gray — two commands set it up:
 
 ```sh
 cd ~/grayplugins/gray-subagents
 cargo build --release
 gray plugin install "$PWD/target/release/gray-subagents"
-gray subagents setup   # seed ~/.gray/subagents/agents/*.md
 ```
 
 Registration references the built binary: keep it at a stable path. This is
@@ -86,14 +83,12 @@ persistent widget.
 ## Commands (callable by the parent through Bash)
 
 ```sh
-gray subagents setup
-gray subagents list
 gray subagents settings
 gray subagents settings --max-running 4
 gray subagents settings --model provider/model [--effort LEVEL]
-gray subagents run --agent scout "Find authentication entry points"
-gray subagents run --name fix-auth --agent reviewer "Review the diff"
-gray subagents run --agent scout --model xai/grok-code-fast --effort low "Survey the API"
+gray subagents run --name auth-entry "Find authentication entry points"
+gray subagents run --name fix-auth "Review the diff"
+gray subagents run --name api-survey --model xai/grok-code-fast --effort low "Survey the API"
 gray subagents run unquoted words also work   # task = joined args
 gray subagents                       # the selectable Agents menu (numbered rows)
 gray subagents status                # same menu; `status --all` for every session's runs
@@ -175,15 +170,14 @@ rows for the session id, live `activity` (last tool/detail — shown by
 `status` and the picker), and the final `result` text. Children with no
 `--json` support still work: unparsed stdout becomes the result.
 
-`setup` creates editable plain Markdown profiles in
-`$GRAY_HOME/subagents/agents` without overwriting edits. Builtins work before
-setup: scout, worker, reviewer, oracle. Parent agents can change settings with
-the same commands and edit profile files through Bash.
+A run is just a task plus optional per-run flags; every default comes from
+`gray subagents settings`. Parent agents can change settings with the same
+commands through Bash.
 
 Inside Gray there is one slash command: `/subagents` (bare = status).
-`/subagents run --name x --agent scout words…`, `/subagents steer <name>
+`/subagents run --name x words…`, `/subagents steer <name>
 words…`, `/subagents status`, `/subagents view <name> [--lines N]`,
-`/subagents stop <name>`, `/subagents list`,
+`/subagents stop <name>`,
 `/subagents settings [--max-running N] [--model provider/model]`. Multi-word
 arguments join, so quoting is optional. Output is plain text, not JSON.
 
@@ -191,10 +185,10 @@ arguments join, so quoting is optional. Output is plain text, not JSON.
 
 ```text
 ⬢ Agents
-├─ ✓ Worker  Add regression tests · 42.1s
-├─ ⬡ Scout  Find authentication entry points · 14.2s
+├─ ✓ add-tests  Add regression tests · 42.1s
+├─ ⬡ auth-survey  Find authentication entry points · 14.2s
 │    ⎿  working…
-└─ ⬡ Reviewer  Check session handling · 38.4s
+└─ ⬡ session-check  Check session handling · 38.4s
      ⎿  working…
 ```
 
@@ -222,10 +216,10 @@ a host widget.
 - Steering lands between phases, never mid-token — interrupt with `stop`
   first when the current turn must die.
 - No model picker, effort picker, automatic model policy, worktree management,
-  enforced read-only permissions, or per-profile structured model configuration.
+  or enforced read-only permissions.
 - Child output is captured stdout/stderr, not structured live tool events.
 - Children have your OS permissions and share the supplied working directory.
-  Read-only profile wording and recursion environment flags are not sandboxes.
+  Prompt wording and recursion environment flags are not sandboxes.
 - Timeout/cancellation do not undo side effects. Default timeout: 600 seconds;
   default concurrency: 4 (launches past it queue); combined output ceiling:
   256 KiB.
@@ -264,30 +258,6 @@ was not changed for this feature. Do not claim a clean workspace-wide result.
 The tree layout and grouping logic are adapted under MIT from
 @gotgenes/pi-subagents — see THIRD_PARTY_NOTICES.md and LICENSE.
 
-## Agent profiles with model defaults
-
-Profiles live in `~/.gray/subagents/agents/<name>.md`. An optional `---`
-frontmatter block at the top pins a default model and/or effort for that
-profile — handy for routing cheap scouts and expensive workers:
-
-```markdown
----
-model: deepseek/deepseek-v4
-effort: low
-tools: read,grep,bash:*
-isolation: worktree
----
-
-# Cheap Scout
-
-Inspect the codebase without editing files...
-```
-
-The block is stripped before the profile text reaches the child prompt. An
-explicit `--model`/`--effort`/`--isolation` flag (or a
-per-task field) always beats the profile default. `gray subagents status` shows the resolved model per run and
-the row stats carry the model basename.
-
 ## Folded in: subagent tools
 
 The `subagent_*` tools (`src/mods/agents.rs`) give the model a programmatic surface
@@ -295,7 +265,7 @@ over this same supervisor — a mechanics port of
 [prime-agent](https://github.com/PrimeIntellect-ai/prime-agent)'s recursive
 subagent API (MIT-licensed; no prime-agent code is copied):
 
-- `subagent_spawn {prompt, name?, agent?, model?, effort?, isolation?}` — admit a
+- `subagent_spawn {prompt, name?, model?, effort?, isolation?}` — admit a
   child, return a handle immediately, never the answer. `tasks: [...]` fans
   out 1–8 in one admission. Depth-1 is enforced by the supervisor itself;
   the per-session budget is 32 spawns.
