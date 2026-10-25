@@ -1763,11 +1763,24 @@ mod tests {
     }
 }
 
+#[cfg(unix)]
 fn stdin_is_pipe() -> bool {
     use std::os::unix::fs::FileTypeExt;
-    std::fs::metadata("/proc/self/fd/0")
+    std::fs::metadata("/dev/fd/0")
         .map(|m| m.file_type().is_fifo() || m.file_type().is_socket())
         .unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn stdin_is_pipe() -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+    unsafe { GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_PIPE }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stdin_is_pipe() -> bool {
+    true
 }
 
 fn main() -> Result<()> {
