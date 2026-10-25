@@ -16,10 +16,8 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::json;
 
+use crate::{Entry, backend, chat, collect_entries, home, menu_order, owner_session, settings};
 use gray_subagents::widget::{AgentRow, AgentState};
-use crate::{
-    Entry, backend, chat, collect_entries, home, menu_order, owner_session, settings,
-};
 
 struct Panel {
     entries: Vec<Entry>,
@@ -46,7 +44,10 @@ struct Settings {
 fn load_settings() -> Settings {
     let v = settings(None, None, None, None).unwrap_or_else(|_| json!({}));
     let get = |k: &str| v[k].as_str().unwrap_or("").to_string();
-    let cap = v["max_running"].as_u64().map(|n| n.to_string()).unwrap_or_default();
+    let cap = v["max_running"]
+        .as_u64()
+        .map(|n| n.to_string())
+        .unwrap_or_default();
     Settings {
         fields: vec![
             ("model".into(), get("model")),
@@ -125,7 +126,12 @@ impl Panel {
             None,
             None,
         ) {
-            Ok(v) => self.status = v["content"].as_str().map(|t| t.lines().next().unwrap_or(t).to_string()).or(Some("stopped".into())),
+            Ok(v) => {
+                self.status = v["content"]
+                    .as_str()
+                    .map(|t| t.lines().next().unwrap_or(t).to_string())
+                    .or(Some("stopped".into()))
+            }
             Err(e) => self.status = Some(format!("stop: {e:#}")),
         }
         self.reload();
@@ -185,7 +191,9 @@ impl Panel {
     }
 
     fn submit_chat(&mut self) {
-        let Some((target, msg)) = self.chat_box.take() else { return };
+        let Some((target, msg)) = self.chat_box.take() else {
+            return;
+        };
         let msg = msg.trim().to_string();
         if msg.is_empty() {
             return;
@@ -201,7 +209,9 @@ impl Panel {
     }
 
     fn apply_settings(&mut self) {
-        let Some(s) = self.settings.take() else { return };
+        let Some(s) = self.settings.take() else {
+            return;
+        };
         let get = |k: &str| {
             s.fields
                 .iter()
@@ -230,7 +240,10 @@ enum OpenOutcome {
 /// `gray subagents panel` — the TUI verb behind `{"terminal": ["panel"]}`.
 pub fn run() -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        println!("{}", crate::menu()?["content"].as_str().unwrap_or("no runs"));
+        println!(
+            "{}",
+            crate::menu()?["content"].as_str().unwrap_or("no runs")
+        );
         return Ok(());
     }
     let mut panel = Panel::load();
@@ -279,7 +292,11 @@ fn tui(panel: &mut Panel) -> Result<()> {
     let backend_t = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend_t)?;
     let restore = |term: &mut Terminal<CrosstermBackend<std::io::Stdout>>| {
-        let _ = execute!(term.backend_mut(), cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            term.backend_mut(),
+            cursor::Show,
+            terminal::LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
     };
 
@@ -295,7 +312,9 @@ fn tui(panel: &mut Panel) -> Result<()> {
             let area = frame.area();
             if let Some((title, lines, scroll)) = &panel.view {
                 // Fullscreen transcript pager.
-                let block = Block::default().borders(Borders::ALL).title(format!(" {title} — j/k scroll · q back "));
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {title} — j/k scroll · q back "));
                 let inner = block.inner(area);
                 frame.render_widget(block, area);
                 let visible: Vec<Line> = lines
@@ -345,7 +364,8 @@ fn tui(panel: &mut Panel) -> Result<()> {
                     Style::default().fg(ACCENT),
                 )));
             } else if let Some(s) = &panel.settings {
-                let mut line = String::from("settings — j/k pick · enter edit/apply · esc close   ");
+                let mut line =
+                    String::from("settings — j/k pick · enter edit/apply · esc close   ");
                 for (i, (k, v)) in s.fields.iter().enumerate() {
                     if i == s.sel {
                         line.push_str(&format!("[{k}:{v}▌] "));
@@ -416,9 +436,7 @@ fn tui(panel: &mut Panel) -> Result<()> {
         if let Some(s) = &mut panel.settings {
             match code {
                 KeyCode::Esc => panel.settings = None,
-                KeyCode::Up | KeyCode::Char('k') if !s.editing => {
-                    s.sel = s.sel.saturating_sub(1)
-                }
+                KeyCode::Up | KeyCode::Char('k') if !s.editing => s.sel = s.sel.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') if !s.editing => {
                     s.sel = (s.sel + 1).min(s.fields.len().saturating_sub(1))
                 }
