@@ -1694,8 +1694,13 @@ def spawn_jobs(args, session):
                 raise ValueError(f"name '{name}' is reserved")
         context = clean_context(first_set(item.get("context"), args.get("context"),
                                           os.environ.get("GRAY_COMPACT_AT")))
+        # The settings default (`gray subagents settings --model`) arrives as
+        # GRAY_MODEL in our env. It must route like an explicit --model: left
+        # in the inherited env, a 'plugin:auth/model' spec reached the child
+        # unsplit and was sent to the parent's provider as a model id (404).
         model, provider_env, provider_label = resolve_route(
-            first_set(item.get("model"), args.get("model")), context)
+            first_set(item.get("model"), args.get("model"),
+                      os.environ.get("GRAY_MODEL") or None), context)
         effort = clean_effort(first_set(item.get("effort"), args.get("effort")))
         tools = clean_tools(first_set(item.get("tools"), args.get("tools")))
         approve = clean_tools(first_set(item.get("approve"), args.get("approve")))
