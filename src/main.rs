@@ -1177,6 +1177,12 @@ fn foreign_scan(managed: &std::collections::HashSet<u64>, scoped: bool) -> Vec<F
     let viewer = owner_session(None);
     let records = current_running_records();
     let adopted = |pid: u64, row: Option<&Value>| {
+        // Housekeeping workers (memory distiller, etc.) mark themselves
+        // GRAY_HIDDEN_WORKER=1: they are plumbing, not subagents, and never
+        // show in the panel — not even under --all.
+        if env_value(pid, "GRAY_HIDDEN_WORKER").as_deref() == Some("1") {
+            return false;
+        }
         !scoped || {
             let identity = worker_identity(pid, row);
             let lineage = identity.is_none() && visible_in_session(pid);
