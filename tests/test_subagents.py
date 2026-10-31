@@ -325,6 +325,14 @@ class SidecarCase(unittest.TestCase):
         self.assertEqual(payload["auth"],
                          "plugin:devin-sub:devin-subscription:devin-login")
 
+    def test_unlisted_tier_id_routes_by_its_base(self):
+        # Devin lists swe-2 once and never its tiers; swe-2-high must still
+        # reach Devin, not fall through to the claude parent.
+        self.write_provider_home()
+        payload = self.run_payload("swe-2-high")
+        self.assertEqual(payload["model"], "swe-2-high")
+        self.assertEqual(payload["provider"], "devin-sub:devin-subscription")
+
     def test_same_provider_model_runs_without_override(self):
         self.write_provider_home()
         payload = self.run_payload("claude-haiku-5-5")

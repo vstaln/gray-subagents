@@ -535,6 +535,16 @@ fn configured_listing_key(home: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `swe-2-max` -> `swe-2`: the base id under a trailing thinking-tier
+/// suffix, which effort-tiered catalogs never list on their own.
+fn tier_base(id: &str) -> Option<&str> {
+    const TIERS: [&str; 8] = ["-none", "-minimal", "-low", "-medium", "-high", "-xhigh", "-max", "-thinking"];
+    TIERS
+        .iter()
+        .find_map(|t| id.strip_suffix(t))
+        .filter(|b| !b.is_empty())
+}
+
 /// A spawn routed onto a plugin provider: the bare model id for the child's
 /// GRAY_MODEL plus the provider-identity env its connection needs. An empty
 /// `env` means the child keeps the parent's provider.
@@ -591,9 +601,16 @@ pub(crate) fn resolve_route(value: &str, home: &Path) -> Result<Route> {
             label: String::new(),
         });
     }
-    let resolved = resolve_model(spec, home)?;
-    let want = resolved.to_lowercase();
     let catalogs = provider_catalog_ids(home);
+    let resolved = resolve_model(spec, home).or_else(|err| {
+        // An unlisted tier id whose base some provider lists is real.
+        let low = spec.to_lowercase();
+        tier_base(&low)
+            .filter(|b| catalogs.values().any(|t| t.contains_key(*b)))
+            .map(|_| spec.to_string())
+            .ok_or(err)
+    })?;
+    let want = resolved.to_lowercase();
     if let Some(own) = configured_listing_key(home)
         && catalogs.get(&own).is_some_and(|t| t.contains_key(&want))
     {
@@ -604,15 +621,31 @@ pub(crate) fn resolve_route(value: &str, home: &Path) -> Result<Route> {
         });
     }
     let provs = plugin_providers(home);
-    let hits: Vec<(&PluginProvider, String)> = provs
-        .iter()
-        .filter_map(|p| {
-            catalogs
-                .get(&format!("plugin:{}:{}", p.key, p.id))
-                .and_then(|t| t.get(&want))
-                .map(|spelled| (p, spelled.clone()))
-        })
-        .collect();
+    let lookup = |id: &str| -> Vec<(&PluginProvider, String)> {
+        provs
+            .iter()
+            .filter_map(|p| {
+                catalogs
+                    .get(&format!("plugin:{}:{}", p.key, p.id))
+                    .and_then(|t| t.get(id))
+                    .map(|spelled| (p, spelled.clone()))
+            })
+            .collect()
+    };
+    let mut hits = lookup(&want);
+    // Tier ids (`swe-2-max`) are not listed: providers like Devin list the
+    // base model once and pick the tier from effort. Route a tier id by
+    // its base, but send the full id as typed.
+    if hits.is_empty()
+        && let Some(base) = tier_base(&want)
+        && !configured_listing_key(home)
+            .is_some_and(|own| catalogs.get(&own).is_some_and(|t| t.contains_key(base)))
+    {
+        hits = lookup(base)
+            .into_iter()
+            .map(|(p, _)| (p, resolved.clone()))
+            .collect();
+    }
     match hits.len() {
         0 => Ok(Route {
             model: resolved,
@@ -855,6 +888,16 @@ mod tests {
         let route = resolve_route("mystery/model", dir.path()).unwrap();
         assert_eq!(route.model, "mystery/model");
         assert!(route.env.is_empty());
+    }
+
+    #[test]
+    fn unlisted_tier_id_routes_by_its_base() {
+        let dir = provider_home();
+        let route = resolve_route("swe-2-high", dir.path()).unwrap();
+        assert_eq!(route.model, "swe-2-high");
+        assert_eq!(route.env[0].1, "devin-sub:devin-subscription");
+        // A tier of a model nobody lists stays an unknown model.
+        assert!(resolve_route("nope-9-max", dir.path()).is_err());
     }
 
     #[test]

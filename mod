@@ -1125,6 +1125,18 @@ def provider_env_for(prov, auth):
             "GRAY_AUTH_REF": f"plugin:{prov['key']}:{prov['id']}:{auth}"}
 
 
+TIER_SUFFIXES = ("-none", "-minimal", "-low", "-medium", "-high", "-xhigh",
+                 "-max", "-thinking")
+
+
+def tier_base(mid):
+    """'swe-2-max' -> 'swe-2': the base id under a thinking-tier suffix."""
+    for t in TIER_SUFFIXES:
+        if mid.endswith(t) and len(mid) > len(t):
+            return mid[:-len(t)]
+    return None
+
+
 def resolve_route(value, context=None):
     """A model spec → (child_model, provider_env, label) for one spawn.
 
@@ -1153,14 +1165,28 @@ def resolve_route(value, context=None):
         else:
             model = resolve_model(spec)
     else:
-        model = resolve_model(spec)
-        want = model.lower()
         catalogs = provider_catalog_ids()
+        base = tier_base(spec.lower())
+        try:
+            model = resolve_model(spec)
+        except ValueError:
+            # An unlisted tier id whose base some provider lists is real.
+            if not (base and any(base in t for t in catalogs.values())):
+                raise
+            model = spec
+        want = model.lower()
         own = configured_listing_key()
         if not (own and want in catalogs.get(own, {})):
-            hits = [(p, catalogs[f"plugin:{p['key']}:{p['id']}"][want])
-                    for p in plugin_providers()
-                    if want in catalogs.get(f"plugin:{p['key']}:{p['id']}", {})]
+            def lookup(mid):
+                return [(p, catalogs[f"plugin:{p['key']}:{p['id']}"][mid])
+                        for p in plugin_providers()
+                        if mid in catalogs.get(f"plugin:{p['key']}:{p['id']}", {})]
+            hits = lookup(want)
+            # Tier ids (swe-2-max) are not listed: Devin-style catalogs list
+            # the base once and pick the tier from effort. Route by the
+            # base, but send the full id as typed.
+            if not hits and base and not (own and base in catalogs.get(own, {})):
+                hits = [(p, model) for p, _ in lookup(base)]
             if len(hits) == 1:
                 prov, model = hits[0]
                 auth = prov["auth"][0] if prov["auth"] else ""
