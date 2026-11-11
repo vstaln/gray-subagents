@@ -1706,7 +1706,7 @@ fn sidecar() -> Result<()> {
                         .ok()
                         .and_then(|v| v["content"].as_str().map(str::to_string))
                         .unwrap_or_default();
-                    Ok(json!({"terminal": ["panel"], "text": text}))
+                    Ok(json!({"terminal": ["panel", "--gray-modal"], "text": text}))
                 } else {
                     let session = req["params"].get("session").cloned();
                     match Cli::try_parse_from(preprocess(argv)) {
@@ -1721,7 +1721,7 @@ fn sidecar() -> Result<()> {
                                 effort: None,
                                 context: None,
                                 max_running: None,
-                            }) => Ok(json!({"terminal": ["panel"]})),
+                            }) => Ok(json!({"terminal": ["panel", "--gray-modal"]})),
                             Some(action) => execute(action, session.as_ref())
                                 .map(|v| json!({"text":present(&v)}))
                                 .map_err(|e| (json!("invalid"), e.to_string())),
@@ -1730,7 +1730,7 @@ fn sidecar() -> Result<()> {
                                     .ok()
                                     .and_then(|v| v["content"].as_str().map(str::to_string))
                                     .unwrap_or_default();
-                                Ok(json!({"terminal": ["panel"], "text": text}))
+                                Ok(json!({"terminal": ["panel", "--gray-modal"], "text": text}))
                             }
                         },
                     }
