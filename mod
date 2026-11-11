@@ -1171,8 +1171,8 @@ def resolve_route(value, context=None):
     prov, auth = None, ""
     if "/" in spec:
         head, _, tail = spec.partition("/")
-        hit = find_provider(head)
-        builtin = keyed_builtin_provider(head) if hit is None else None
+        builtin = keyed_builtin_provider(head) if ":" not in head else None
+        hit = find_provider(head) if builtin is None else None
         if builtin is not None:
             model = tail.strip()
             if not model:
