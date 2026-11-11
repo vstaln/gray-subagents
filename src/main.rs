@@ -135,6 +135,30 @@ pub(crate) fn home() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".gray")))
         .context("cannot resolve Gray home")
 }
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    if std::fs::read(path).is_ok_and(|old| old == bytes) {
+        return Ok(());
+    }
+    let dir = path.parent().context("path has no parent")?;
+    std::fs::create_dir_all(dir)?;
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(bytes)?;
+    let mut attempt = 0;
+    loop {
+        match file.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(_) if std::fs::read(path).is_ok_and(|old| old == bytes) => return Ok(()),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= 20 {
+                    return Err(e.error.into());
+                }
+                file = e.file;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
 pub(crate) fn settings(
     model: Option<String>,
     cap: Option<u32>,
@@ -182,11 +206,8 @@ pub(crate) fn settings(
         value["max_running"] = json!(cap);
     }
     if changed {
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-        use std::io::Write;
-        writeln!(file, "{}", serde_json::to_string_pretty(&value)?)?;
-        file.persist(path)?;
+        let bytes = format!("{}\n", serde_json::to_string_pretty(&value)?);
+        write_atomic(&path, bytes.as_bytes())?;
     }
     Ok(value)
 }
@@ -223,10 +244,7 @@ pub(crate) fn backend(
     let dir = home()?.join("subagents/runtime");
     std::fs::create_dir_all(&dir)?;
     let runtime = dir.join("supervisor.py");
-    let mut file = tempfile::NamedTempFile::new_in(&dir)?;
-    use std::io::Write;
-    file.write_all(include_bytes!("../mod"))?;
-    file.persist(&runtime)?;
+    write_atomic(&runtime, include_bytes!("../mod"))?;
     let mut cmd = Command::new(python_program());
     // gray-narrow is folded into this binary: default GRAY_NARROW_BIN to
     // ourselves so `run --tools` works without a separate install.
