@@ -538,7 +538,16 @@ fn configured_listing_key(home: &Path) -> Option<String> {
 /// `swe-2-max` -> `swe-2`: the base id under a trailing thinking-tier
 /// suffix, which effort-tiered catalogs never list on their own.
 fn tier_base(id: &str) -> Option<&str> {
-    const TIERS: [&str; 8] = ["-none", "-minimal", "-low", "-medium", "-high", "-xhigh", "-max", "-thinking"];
+    const TIERS: [&str; 8] = [
+        "-none",
+        "-minimal",
+        "-low",
+        "-medium",
+        "-high",
+        "-xhigh",
+        "-max",
+        "-thinking",
+    ];
     TIERS
         .iter()
         .find_map(|t| id.strip_suffix(t))

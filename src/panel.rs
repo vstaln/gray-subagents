@@ -160,7 +160,16 @@ fn task_text(text: &str) -> String {
 }
 
 fn tool_summary(name: &str, args: &Value) -> String {
-    for k in ["command", "file_path", "path", "pattern", "query", "url", "prompt", "task"] {
+    for k in [
+        "command",
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "url",
+        "prompt",
+        "task",
+    ] {
         if let Some(s) = args.get(k).and_then(Value::as_str) {
             return s.to_string();
         }
@@ -206,7 +215,11 @@ fn parse_session(path: &PathBuf) -> Vec<Item> {
                     if t.starts_with("[Context update]") || t.trim().is_empty() {
                         continue;
                     }
-                    let t = if first_user { task_text(t) } else { t.trim().to_string() };
+                    let t = if first_user {
+                        task_text(t)
+                    } else {
+                        t.trim().to_string()
+                    };
                     first_user = false;
                     items.push(Item::User(t));
                 }
@@ -218,7 +231,10 @@ fn parse_session(path: &PathBuf) -> Vec<Item> {
                 }
                 ("assistant", "tool_use") => {
                     let name = b["name"].as_str().unwrap_or("tool").to_string();
-                    let args = b.get("args").or_else(|| b.get("input")).unwrap_or(&Value::Null);
+                    let args = b
+                        .get("args")
+                        .or_else(|| b.get("input"))
+                        .unwrap_or(&Value::Null);
                     items.push(Item::Tool(name.clone(), tool_summary(&name, args)));
                 }
                 (_, "tool_result") => {
@@ -602,7 +618,9 @@ fn sub_line(r: &AgentRow) -> String {
 
 fn modal_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     use ratatui::layout::Rect;
-    let w = 104.min(area.width.saturating_sub(4)).max(40.min(area.width));
+    let w = 104
+        .min(area.width.saturating_sub(4))
+        .max(40.min(area.width));
     let h = area.height.saturating_sub(4).max(12.min(area.height));
     Rect::new(
         (area.width.saturating_sub(w)) / 2,
@@ -612,7 +630,13 @@ fn modal_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     )
 }
 
-fn header(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, left: Vec<Span<'static>>, right: &str, th: &Theme) {
+fn header(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    left: Vec<Span<'static>>,
+    right: &str,
+    th: &Theme,
+) {
     use ratatui::widgets::Paragraph;
     let lw: usize = left.iter().map(|s| s.content.chars().count()).sum();
     let pad = (area.width as usize).saturating_sub(lw + right.chars().count());
@@ -632,7 +656,10 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
     }
     let modal = modal_rect(area);
     frame.render_widget(Clear, modal);
-    frame.render_widget(Block::default().style(Style::default().bg(th.surface)), modal);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(th.surface)),
+        modal,
+    );
     let inner = Rect::new(
         modal.x + 3,
         modal.y + 1,
@@ -646,7 +673,9 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
     if let Some(m) = &panel.mini {
         let e = panel.mini_entry();
         let (g, gc) = e.map(|e| glyph(&e.row.state, th)).unwrap_or(("·", th.dim));
-        let name = e.map(|e| e.row.name.clone()).unwrap_or_else(|| m.target.clone());
+        let name = e
+            .map(|e| e.row.name.clone())
+            .unwrap_or_else(|| m.target.clone());
         let meta = e
             .map(|e| format!("  {} · {} · {}", e.row.model, e.status, e.row.stats))
             .unwrap_or_default();
@@ -655,14 +684,20 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
             row(inner.y),
             vec![
                 Span::styled(format!("{g} "), Style::default().fg(gc)),
-                Span::styled(name, Style::default().fg(th.bright).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    name,
+                    Style::default().fg(th.bright).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(meta, Style::default().fg(th.muted)),
             ],
             "esc back",
             th,
         );
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("─".repeat(w), Style::default().fg(th.faint)))),
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(w),
+                Style::default().fg(th.faint),
+            ))),
             row(inner.y + 1),
         );
         let running = e.is_some_and(Panel::running);
@@ -672,7 +707,11 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
         let lines: Vec<Line> = if m.items.is_empty() {
             if m.fallback.is_empty() {
                 vec![Line::from(Span::styled(
-                    if running { "starting…" } else { "no transcript" },
+                    if running {
+                        "starting…"
+                    } else {
+                        "no transcript"
+                    },
                     Style::default().fg(th.dim),
                 ))]
             } else {
@@ -694,14 +733,21 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
         );
         let mut y = bottom.saturating_sub(foot_rows);
         let activity = match (&panel.status, e.map(|e| &e.row.state)) {
-            (Some(s), _) => Line::from(Span::styled(clip(s, w), Style::default().fg(th.accent_soft))),
+            (Some(s), _) => Line::from(Span::styled(
+                clip(s, w),
+                Style::default().fg(th.accent_soft),
+            )),
             (None, Some(AgentState::Running { activity })) => Line::from(vec![
                 Span::styled("● ", Style::default().fg(th.accent)),
-                Span::styled(clip(activity, w.saturating_sub(2)), Style::default().fg(th.muted)),
+                Span::styled(
+                    clip(activity, w.saturating_sub(2)),
+                    Style::default().fg(th.muted),
+                ),
             ]),
-            (None, Some(AgentState::Failed { error })) => {
-                Line::from(Span::styled(clip(&format!("failed: {error}"), w), Style::default().fg(th.error)))
-            }
+            (None, Some(AgentState::Failed { error })) => Line::from(Span::styled(
+                clip(&format!("failed: {error}"), w),
+                Style::default().fg(th.error),
+            )),
             _ if scroll > 0 => Line::from(Span::styled(
                 format!("↑ {scroll} lines up · end to follow"),
                 Style::default().fg(th.dim),
@@ -711,7 +757,10 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
         frame.render_widget(Paragraph::new(activity), row(y));
         y += 1;
         let box_rect = Rect::new(modal.x + 1, y, modal.width.saturating_sub(2), 3);
-        frame.render_widget(Block::default().style(Style::default().bg(th.input)), box_rect);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(th.input)),
+            box_rect,
+        );
         let placeholder = if !m.managed {
             "raw gray -p worker — view only"
         } else if running {
@@ -744,7 +793,10 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
         };
         if y < bottom + 1 {
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(clip(hint, w), Style::default().fg(th.dim)))),
+                Paragraph::new(Line::from(Span::styled(
+                    clip(hint, w),
+                    Style::default().fg(th.dim),
+                ))),
                 row(y.min(bottom)),
             );
         }
@@ -761,7 +813,11 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
         frame,
         row(inner.y),
         vec![Span::styled(
-            if panel.all { "Agents · all sessions" } else { "Agents" },
+            if panel.all {
+                "Agents · all sessions"
+            } else {
+                "Agents"
+            },
             Style::default().fg(th.bright).add_modifier(Modifier::BOLD),
         )],
         &counter,
@@ -800,7 +856,11 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
                 ),
                 Span::styled(
                     clip(&format!("{shown}{cursor}"), w.saturating_sub(16)),
-                    Style::default().fg(if v.is_empty() && !(sel && s.editing) { th.faint } else { th.body }),
+                    Style::default().fg(if v.is_empty() && !(sel && s.editing) {
+                        th.faint
+                    } else {
+                        th.body
+                    }),
                 ),
             ]));
         }
@@ -822,7 +882,10 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
         };
         let desc_room = w.saturating_sub(e.row.name.chars().count() + 7);
         lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(if sel { th.accent } else { th.dim })),
+            Span::styled(
+                marker,
+                Style::default().fg(if sel { th.accent } else { th.dim }),
+            ),
             Span::styled(format!("{g} "), Style::default().fg(gc)),
             Span::styled(e.row.name.clone(), name_style),
             Span::styled(
@@ -845,7 +908,10 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
     let status_line = if panel.settings.is_some() {
         Line::from("")
     } else if let Some(msg) = &panel.status {
-        Line::from(Span::styled(clip(msg, w), Style::default().fg(th.accent_soft)))
+        Line::from(Span::styled(
+            clip(msg, w),
+            Style::default().fg(th.accent_soft),
+        ))
     } else {
         Line::from("")
     };
@@ -856,7 +922,10 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
         "enter open · d stop · s settings · a all sessions · r refresh · esc close"
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(clip(hint, w), Style::default().fg(th.dim)))),
+        Paragraph::new(Line::from(Span::styled(
+            clip(hint, w),
+            Style::default().fg(th.dim),
+        ))),
         row(y + 2),
     );
     let _ = th.rose;
@@ -957,9 +1026,11 @@ fn tui(panel: &mut Panel) -> Result<()> {
                 KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => {
                     s.sel = (s.sel + s.fields.len() - 1) % s.fields.len()
                 }
-                KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                    s.sel = (s.sel + 1) % s.fields.len()
-                }
+                KeyCode::Right
+                | KeyCode::Char('l')
+                | KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::Tab => s.sel = (s.sel + 1) % s.fields.len(),
                 KeyCode::Enter => s.editing = true,
                 _ => {}
             }
@@ -970,7 +1041,9 @@ fn tui(panel: &mut Panel) -> Result<()> {
             KeyCode::Esc | KeyCode::Char('q') => break,
             KeyCode::Up | KeyCode::Char('k') => panel.move_sel(-1),
             KeyCode::Down | KeyCode::Char('j') => panel.move_sel(1),
-            KeyCode::Enter | KeyCode::Char('v') | KeyCode::Right | KeyCode::Char('l') => panel.open_mini(),
+            KeyCode::Enter | KeyCode::Char('v') | KeyCode::Right | KeyCode::Char('l') => {
+                panel.open_mini()
+            }
             KeyCode::Char('d') => panel.do_stop(),
             KeyCode::Char('o') => {
                 if panel.resume_in_gray() {
@@ -992,7 +1065,11 @@ fn tui(panel: &mut Panel) -> Result<()> {
     if hosted {
         let _ = execute!(term.backend_mut(), cursor::Show);
     } else {
-        let _ = execute!(term.backend_mut(), cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            term.backend_mut(),
+            cursor::Show,
+            terminal::LeaveAlternateScreen
+        );
     }
     let _ = terminal::disable_raw_mode();
     let _ = resume;
