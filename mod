@@ -1125,6 +1125,35 @@ def provider_env_for(prov, auth):
             "GRAY_AUTH_REF": f"plugin:{prov['key']}:{prov['id']}:{auth}"}
 
 
+TIER_SUFFIXES = ("-none", "-minimal", "-low", "-medium", "-high", "-xhigh",
+                 "-max", "-thinking")
+
+
+def tier_base(mid):
+    """'swe-2-max' -> 'swe-2': the base id under a thinking-tier suffix."""
+    for t in TIER_SUFFIXES:
+        if mid.endswith(t) and len(mid) > len(t):
+            return mid[:-len(t)]
+    return None
+
+
+def keyed_builtin_provider(head):
+    """A provider/model head naming a built-in API-key provider with a saved
+    key in auth.json ('commandcode', 'openrouter') → its id, else None."""
+    try:
+        keys = json.loads((home() / "auth.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(keys, dict):
+        return None
+    want = head.strip().lower()
+    for k, v in keys.items():
+        if isinstance(k, str) and not k.startswith("plugin:") and isinstance(v, str) \
+                and k.lower() == want:
+            return k
+    return None
+
+
 def resolve_route(value, context=None):
     """A model spec → (child_model, provider_env, label) for one spawn.
 
@@ -1138,11 +1167,18 @@ def resolve_route(value, context=None):
     result."""
     spec = clean_model(value)
     if spec is None:
-        return None, {}, None
+        return None, {}, None, None
     prov, auth = None, ""
     if "/" in spec:
         head, _, tail = spec.partition("/")
         hit = find_provider(head)
+        builtin = keyed_builtin_provider(head) if hit is None else None
+        if builtin is not None:
+            model = tail.strip()
+            if not model:
+                raise ValueError(
+                    f"model spec '{spec}' names provider '{head}' but no model id")
+            return model, {}, f"{builtin} · {model}", builtin
         if hit is not None:
             prov, auth = hit
             model = tail.strip()
@@ -1153,14 +1189,28 @@ def resolve_route(value, context=None):
         else:
             model = resolve_model(spec)
     else:
-        model = resolve_model(spec)
-        want = model.lower()
         catalogs = provider_catalog_ids()
+        base = tier_base(spec.lower())
+        try:
+            model = resolve_model(spec)
+        except ValueError:
+            # An unlisted tier id whose base some provider lists is real.
+            if not (base and any(base in t for t in catalogs.values())):
+                raise
+            model = spec
+        want = model.lower()
         own = configured_listing_key()
         if not (own and want in catalogs.get(own, {})):
-            hits = [(p, catalogs[f"plugin:{p['key']}:{p['id']}"][want])
-                    for p in plugin_providers()
-                    if want in catalogs.get(f"plugin:{p['key']}:{p['id']}", {})]
+            def lookup(mid):
+                return [(p, catalogs[f"plugin:{p['key']}:{p['id']}"][mid])
+                        for p in plugin_providers()
+                        if mid in catalogs.get(f"plugin:{p['key']}:{p['id']}", {})]
+            hits = lookup(want)
+            # Tier ids (swe-2-max) are not listed: Devin-style catalogs list
+            # the base once and pick the tier from effort. Route by the
+            # base, but send the full id as typed.
+            if not hits and base and not (own and base in catalogs.get(own, {})):
+                hits = [(p, model) for p, _ in lookup(base)]
             if len(hits) == 1:
                 prov, model = hits[0]
                 auth = prov["auth"][0] if prov["auth"] else ""
@@ -1170,8 +1220,8 @@ def resolve_route(value, context=None):
                                  f"give provider/model: {choices}")
     model = ctx_route(model, context)
     if prov is None:
-        return model, {}, None
-    return model, provider_env_for(prov, auth), f"{prov['name']} · {model}"
+        return model, {}, None, None
+    return model, provider_env_for(prov, auth), f"{prov['name']} · {model}", None
 
 
 def clean_tools(value):
@@ -1694,8 +1744,13 @@ def spawn_jobs(args, session):
                 raise ValueError(f"name '{name}' is reserved")
         context = clean_context(first_set(item.get("context"), args.get("context"),
                                           os.environ.get("GRAY_COMPACT_AT")))
-        model, provider_env, provider_label = resolve_route(
-            first_set(item.get("model"), args.get("model")), context)
+        # The settings default (`gray subagents settings --model`) arrives as
+        # GRAY_MODEL in our env. It must route like an explicit --model: left
+        # in the inherited env, a 'plugin:auth/model' spec reached the child
+        # unsplit and was sent to the parent's provider as a model id (404).
+        model, provider_env, provider_label, provider_arg = resolve_route(
+            first_set(item.get("model"), args.get("model"),
+                      os.environ.get("GRAY_MODEL") or None), context)
         effort = clean_effort(first_set(item.get("effort"), args.get("effort")))
         tools = clean_tools(first_set(item.get("tools"), args.get("tools")))
         approve = clean_tools(first_set(item.get("approve"), args.get("approve")))
@@ -1708,7 +1763,8 @@ def spawn_jobs(args, session):
                   "Return findings, changed paths, and verification in your final answer.")
         prepared.append(dict(task=task, prompt=prompt, name=name,
                              model=model, provider_env=provider_env,
-                             provider_label=provider_label, effort=effort,
+                             provider_label=provider_label, provider_arg=provider_arg,
+                             effort=effort,
                              context=context, tools=tools,
                              approve=approve, isolation=isolation, timeout=timeout,
                              max_phases=max_phases))
@@ -1763,6 +1819,7 @@ def spawn_jobs(args, session):
             job = dict(run_id=p["rid"], name=name, task=p["task"],
                        prompt=p["prompt"], model=p["model"] or "",
                        provider_env=p["provider_env"], provider_label=p["provider_label"] or "",
+                       provider_arg=p["provider_arg"] or "",
                        effort=p["effort"] or "",
                        context=p["context"] or "",
                        tools=p["tools"] or "", narrow_env=p["narrow_env"],
@@ -2164,6 +2221,7 @@ def run_phase(rid, prompt, resume_sid, job):
         cwd = job["cwd"]
     env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", GRAY_SESSION_ORIGIN="subagent",
                GRAY_SUBAGENTS_DEPTH=str(job.get("depth") or 1),
+               GRAY_NO_RESUME="1",
                NO_COLOR="1", TERM="dumb", GRAY_SHOW_REASONING="0")
     # gray-narrow resolved grant (subset of ours), run correlation —
     # overrides the inherited GRAY_NARROW_* values for this child only.
@@ -2173,6 +2231,9 @@ def run_phase(rid, prompt, resume_sid, job):
     if job.get("provider_env"):
         env.pop("GRAY_BASE_URL", None)
         env.update(job["provider_env"])
+    if job.get("provider_arg"):
+        for k in ("GRAY_BASE_URL", "GRAY_PROVIDER_ID", "GRAY_AUTH_REF", "GRAY_API_KEY"):
+            env.pop(k, None)
     # Per-delegation overrides beat inherited env (run --model / settings / parent).
     if job.get("model"):
         env["GRAY_MODEL"] = job["model"]
@@ -2180,7 +2241,9 @@ def run_phase(rid, prompt, resume_sid, job):
         env["GRAY_THINKING_EFFORT"] = job["effort"]
     if job.get("context"):
         env["GRAY_COMPACT_AT"] = job["context"]
-    argv = [binary] + (["--session", resume_sid] if resume_sid else []) + ["-p", prompt, "--json"]
+    argv = [binary] + (["--session", resume_sid] if resume_sid else []) \
+        + (["--provider", job["provider_arg"]] if job.get("provider_arg") else []) \
+        + ["-p", prompt, "--json"]
     # Long-running delegated work outlives the default print-mode request
     # meter; GRAY_SUBAGENTS_MAX_REQUESTS (default 256) widens it for children.
     argv += ["--max-requests", os.environ.get("GRAY_SUBAGENTS_MAX_REQUESTS") or "256"]

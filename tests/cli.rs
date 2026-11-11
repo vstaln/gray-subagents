@@ -214,6 +214,11 @@ fn windows_stop_terminates_ping_child() {
             .env("GRAY_HOME", home.path())
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         if status["status"] == "running" {
             running = true;

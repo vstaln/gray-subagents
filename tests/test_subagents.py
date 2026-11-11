@@ -325,6 +325,14 @@ class SidecarCase(unittest.TestCase):
         self.assertEqual(payload["auth"],
                          "plugin:devin-sub:devin-subscription:devin-login")
 
+    def test_unlisted_tier_id_routes_by_its_base(self):
+        # Devin lists swe-2 once and never its tiers; swe-2-high must still
+        # reach Devin, not fall through to the claude parent.
+        self.write_provider_home()
+        payload = self.run_payload("swe-2-high")
+        self.assertEqual(payload["model"], "swe-2-high")
+        self.assertEqual(payload["provider"], "devin-sub:devin-subscription")
+
     def test_same_provider_model_runs_without_override(self):
         self.write_provider_home()
         payload = self.run_payload("claude-haiku-5-5")
@@ -344,6 +352,23 @@ class SidecarCase(unittest.TestCase):
         self.write_provider_home()
         payload = self.run_payload("ghost-1")
         self.assertEqual(payload["model"], "ghost-1")
+        self.assertIsNone(payload["provider"])
+
+    def test_settings_default_model_routes_like_an_explicit_one(self):
+        # `gray subagents settings --model` reaches the supervisor as
+        # GRAY_MODEL. Left unrouted, 'plugin:auth/model' went to the child
+        # verbatim on the parent's provider and 404ed.
+        self.write_provider_home()
+        env = {"GRAY_MODEL": "devin-sub:devin-subscription/swe-2-max"}
+        rid = self.spawn(task="go", env_extra=env)["run_id"]
+        payload = json.loads(self.wait_status(rid, "completed")["result"])
+        self.assertEqual(payload["model"], "swe-2-max")
+        self.assertEqual(payload["provider"], "devin-sub:devin-subscription")
+        self.assertEqual(payload["auth"],
+                         "plugin:devin-sub:devin-subscription:devin-login")
+        # An explicit per-run model still beats the default.
+        payload = self.run_payload("claude-haiku-5-5", env_extra=env)
+        self.assertEqual(payload["model"], "claude-haiku-5-5")
         self.assertIsNone(payload["provider"])
 
     def test_routed_run_clears_inherited_base_url(self):
