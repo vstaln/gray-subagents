@@ -448,8 +448,8 @@ pub fn cli(argv: &[String]) -> String {
 pub fn manifest_tools() -> Value {
     json!([
         {"name": "subagent_spawn",
-         "label": "Started agent",
-         "preview": "{name} · {model|model} · {effort} · ctx {context}\n{prompt|firstline}",
+         "label": "Subagent",
+         "preview": "{name} · fan out {tasks|count} · {model|model} · {effort} · ctx {context}\n{prompt|firstline}",
          "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 128) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
