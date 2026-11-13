@@ -299,7 +299,7 @@ pub(crate) fn backend(
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 fn manifest() -> Value {
-    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","run","status","view","stop","steer","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"],"turn_local":{"/subagents":["","status","view","open"]}});
+    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","run","status","view","stop","steer","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"command_descriptions":{"/subagents":"launch and manage subagents: status, steer, stop","/narrow":"run children with narrowed capability grants","/rlm":"list, collect and stop this session's child agents"},"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"],"turn_local":{"/subagents":["","status","view","open"]}});
     // Folded-in surfaces ride this manifest too: gray-narrow's tools
     // (narrow_delegate) plus the subagent_* model-facing tools.
     let mut tools: Vec<Value> = narrow::manifest_narrow()
