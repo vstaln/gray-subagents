@@ -1458,7 +1458,7 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents: delegate from bash with `gray subagents run --name NAME [--model PROVIDER/MODEL] [--isolation worktree] 'task'`, then `gray subagents status|view|steer|stop ID` (or load the subagent_* tools). Always pass a descriptive --name; use --isolation worktree when parallel runs edit the same repo. Runs are detached and outlive this session. `gray subagents --help` documents every option.";
+const USAGE: &str = "Subagents: spawn with the `subagent_spawn` tool — never write `gray subagents run` into bash. Fan independent work out with `tasks` (1-8). `subagent_check` snapshots, `subagent_message` steers, `subagent_stop` ends. Pass a descriptive `name`; set `isolation: worktree` when parallel runs edit one repo. Runs are detached and outlive this session. The `gray subagents` CLI is the fallback; `--help` documents it.";
 
 const USAGE_DETAIL: &str = include_str!("../AGENTS.md");
 

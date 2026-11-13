@@ -1,7 +1,9 @@
 # gray-subagents — agent-facing usage
 
-Delegate work from bash; runs are detached, named, and steerable — they
-outlive this session and show up in the Agents panel.
+Spawn subagents with the `subagent_spawn` tool — it renders as a Subagent
+card and returns a handle immediately. Runs are detached, named, and
+steerable; they outlive this session and show up in the Agents panel. The
+CLI below is the fallback for settings, inspection and steered follow-ups.
 
 ```
 gray subagents run --name NAME [--model PROVIDER/MODEL]
