@@ -179,7 +179,7 @@ MANIFEST = {
 # ---------------------------------------------------------------------------
 OUTPUT_LIMIT = 256 * 1024
 CONTENT_LIMIT = 40000
-ACTIVE = {"running", "stopping"}
+ACTIVE = {"running", "stopping", "waiting"}
 QUEUED = "queued"  # admitted over the running cap; holds no slot until one frees
 LIVE = ACTIVE | {QUEUED}
 DEFAULT_MAX_PHASES = 32   # phase budget: the task turn plus steered follow-ups
@@ -2197,6 +2197,10 @@ def describe_row(row):
         text = f"provider retry {detail}".strip()
     elif phase == "compacted":
         text = "compacting context"
+    elif phase == "quota_wait":
+        text = "waiting for quota reset"
+    elif phase == "quota_resume":
+        text = "usage limit reset, continuing"
     elif phase == "text":
         text = "replying"
     elif phase == "persisting":
@@ -2256,7 +2260,7 @@ def run_phase(rid, prompt, resume_sid, job):
         write_job(job)
     pending = b""
     st = {"sid": "", "activity": "", "result": "", "error_row": "", "plain": bytearray(),
-          "tools": 0, "ok_tools": 0, "writes": 0, "calls": {}, "seq": 0}
+          "tools": 0, "ok_tools": 0, "writes": 0, "calls": {}, "seq": 0, "quota_reset": None}
     status, error = "failed", "supervisor did not finish"
     output = queue.Queue(maxsize=1)
     eof = object()
@@ -2272,6 +2276,12 @@ def run_phase(rid, prompt, resume_sid, job):
                 st["sid"] = row["session_id"]
             if row.get("type") == "progress":
                 st["activity"] = describe_row(row)
+                if row.get("phase") == "quota_wait":
+                    reset_at = row.get("resume_at")
+                    if isinstance(reset_at, (int, float)) and reset_at > 0:
+                        st["quota_reset"] = float(reset_at)
+                elif row.get("phase") == "quota_resume":
+                    st["quota_reset"] = None
                 if row.get("phase") in ("tool_started", "tool_ran", "tool_finished"):
                     cid = row.get("call_id")
                     if not cid:
@@ -2345,6 +2355,19 @@ def run_phase(rid, prompt, resume_sid, job):
                     (p.get("writes") or 0) for p in job["phases"][:-1])
                 if writes != job.get("write_count"):
                     job["write_count"] = writes
+                    changed = True
+                quota_reset = st.get("quota_reset")
+                if quota_reset and job["status"] != "stopping":
+                    if job["status"] != "waiting":
+                        job["status"] = "waiting"
+                        log_event(rid, "waiting", resume_at=quota_reset)
+                    if job.get("quota_reset") != quota_reset:
+                        job["quota_reset"] = quota_reset
+                    changed = True
+                elif not quota_reset and job["status"] == "waiting":
+                    job["status"] = "running"
+                    job["quota_reset"] = None
+                    log_event(rid, "resumed_after_quota")
                     changed = True
                 if changed:
                     write_job(job)

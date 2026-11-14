@@ -5,6 +5,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentState {
     Running { activity: String },
+    WaitingQuota { reset_in: String },
     Completed,
     Failed { error: String },
     Stopped,
@@ -175,7 +176,17 @@ pub fn render_widget_spans(
 fn activity_of(a: &AgentRow) -> Option<String> {
     match &a.state {
         AgentState::Running { activity } => Some(clean(activity)).filter(|s| !s.is_empty()),
+        AgentState::WaitingQuota { reset_in } => Some(quota_note(reset_in)),
         _ => None,
+    }
+}
+
+pub fn quota_note(reset_in: &str) -> String {
+    let reset_in = reset_in.trim();
+    if reset_in.is_empty() {
+        "waiting for quota reset".into()
+    } else {
+        format!("waiting for quota reset · {reset_in}")
     }
 }
 
@@ -197,6 +208,7 @@ fn tail_of(a: &AgentRow) -> String {
 pub fn state_icon(state: &AgentState) -> &'static str {
     match state {
         AgentState::Running { .. } => "●",
+        AgentState::WaitingQuota { .. } => "◌",
         AgentState::Completed => "✓",
         AgentState::Failed { .. } => "✗",
         AgentState::Stopped => "■",
@@ -224,6 +236,7 @@ pub fn row_lines(agent: &AgentRow) -> Vec<String> {
     }
     match &agent.state {
         AgentState::Running { activity } => vec![header, clean(activity)],
+        AgentState::WaitingQuota { reset_in } => vec![header, quota_note(reset_in)],
         AgentState::Failed { error } => {
             header.push_str(" error");
             if !error.is_empty() {

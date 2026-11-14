@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gray_subagents::widget::{
-    AgentRow, AgentState, pretty_model, render_menu, render_widget_spans, state_icon,
+    AgentRow, AgentState, pretty_model, quota_note, render_menu, render_widget_spans, state_icon,
 };
 use serde_json::{Value, json};
 
@@ -375,6 +375,18 @@ pub(crate) struct Entry {
     pub created: f64,
 }
 
+fn quota_left(reset_at: Option<f64>, now: f64) -> String {
+    let Some(reset_at) = reset_at else {
+        return String::new();
+    };
+    let left = (reset_at - now).max(0.0) as u64;
+    if left >= 3600 {
+        format!("{}h {:02}m", left / 3600, left % 3600 / 60)
+    } else {
+        format!("{}m", left.div_ceil(60))
+    }
+}
+
 pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
     let cwd = std::env::current_dir()?;
     let my_sid = owner_session(None);
@@ -403,7 +415,7 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
         });
         for job in jobs {
             let status = job["status"].as_str().unwrap_or("lost");
-            let active = matches!(status, "running" | "stopping");
+            let active = matches!(status, "running" | "stopping" | "waiting");
             // A queued run holds no slot and has no `finished` stamp yet, so it
             // is live for the stale-row filter as well.
             let live = active || status == "queued";
@@ -454,6 +466,9 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                             a.into()
                         }
                     },
+                },
+                "waiting" => AgentState::WaitingQuota {
+                    reset_in: quota_left(job["quota_reset"].as_f64(), now),
                 },
                 "queued" => AgentState::Queued,
                 "completed" => AgentState::Completed,
@@ -554,7 +569,12 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
 /// running/queued rows you check on — then finished ones; each group
 /// newest-first. Menu numbers follow this order.
 pub(crate) fn menu_order(mut entries: Vec<Entry>) -> Vec<Entry> {
-    let live = |e: &Entry| matches!(e.row.state, AgentState::Running { .. } | AgentState::Queued);
+    let live = |e: &Entry| {
+        matches!(
+            e.row.state,
+            AgentState::Running { .. } | AgentState::WaitingQuota { .. } | AgentState::Queued
+        )
+    };
     entries.sort_by(|a, b| {
         live(b)
             .cmp(&live(a))
@@ -624,7 +644,12 @@ pub(crate) fn menu() -> Result<Value> {
     }
     let running = entries
         .iter()
-        .filter(|e| matches!(e.row.state, AgentState::Running { .. }))
+        .filter(|e| {
+            matches!(
+                e.row.state,
+                AgentState::Running { .. } | AgentState::WaitingQuota { .. }
+            )
+        })
         .count();
     let rows: Vec<AgentRow> = entries.iter().map(|e| e.row.clone()).collect();
     let mut text = render_menu(&rows);
@@ -1470,9 +1495,13 @@ fn entries_json(all: bool) -> Result<Value> {
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let running = matches!(e.row.state, AgentState::Running { .. });
+            let running = matches!(
+                e.row.state,
+                AgentState::Running { .. } | AgentState::WaitingQuota { .. }
+            );
             let activity = match &e.row.state {
                 AgentState::Running { activity } => activity.clone(),
+                AgentState::WaitingQuota { reset_in } => quota_note(reset_in),
                 _ => String::new(),
             };
             let error = match &e.row.state {

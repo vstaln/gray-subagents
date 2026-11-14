@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gray_subagents::widget::AgentState;
+use gray_subagents::widget::{AgentState, quota_note};
 
 use crate::{
     Entry, backend, chat, collect_entries, foreign_stop, home, menu_order, menu_target,
@@ -187,6 +187,12 @@ fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
 fn snapshot(e: &Entry, preview_lines: usize) -> Value {
     let (running, settled, activity, status) = match &e.row.state {
         AgentState::Running { activity } => (true, false, activity.clone(), "running".to_string()),
+        AgentState::WaitingQuota { reset_in } => (
+            true,
+            false,
+            quota_note(reset_in),
+            "waiting for quota reset".to_string(),
+        ),
         AgentState::Queued => (false, false, String::new(), "queued".to_string()),
         AgentState::Completed => (false, true, String::new(), "completed".to_string()),
         AgentState::Failed { error } => (false, true, String::new(), format!("failed: {error}")),
