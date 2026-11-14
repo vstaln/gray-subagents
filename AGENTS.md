@@ -46,5 +46,5 @@ gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL]
   transition is audited to `runs/<id>.events.jsonl`.
 - The `subagent_spawn`/`subagent_check`/`subagent_message`/`subagent_stop`/
   `subagent_note` tools expose the same supervisor programmatically (handles +
-  typed snapshots; ≤32 spawns per session). Do not invent other subagent
-  tools.
+  typed snapshots; no spawn budget, `max_running` caps concurrency). Do not
+  invent other subagent tools.

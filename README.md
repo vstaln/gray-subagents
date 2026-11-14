@@ -268,7 +268,7 @@ subagent API (MIT-licensed; no prime-agent code is copied):
 - `subagent_spawn {prompt, name?, model?, effort?, isolation?}` — admit a
   child, return a handle immediately, never the answer. `tasks: [...]` fans
   out 1–8 in one admission. Depth-1 is enforced by the supervisor itself;
-  the per-session budget is 32 spawns.
+  no per-session spawn budget — `max_running` caps concurrency (default 128).
 - `subagent_check {targets?, wait_ms?}` — typed snapshots (name, status,
   settled, activity, transcript-tail preview) without steering.
 - `subagent_message {name, message}` — steer a running child; a finished one's
