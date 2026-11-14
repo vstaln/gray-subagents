@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gray_subagents::widget::{
-    AgentRow, AgentState, pretty_model, render_menu, render_widget_spans, state_icon,
+    AgentRow, AgentState, pretty_model, quota_note, render_menu, render_widget_spans, state_icon,
 };
 use serde_json::{Value, json};
 
@@ -69,6 +69,10 @@ enum Action {
         /// runs edit the same repository so they cannot collide.
         #[arg(long)]
         isolation: Option<String>,
+        /// Working directory for the child, and the repo a worktree is cut
+        /// from with --isolation. Defaults to this session's cwd.
+        #[arg(long)]
+        cwd: Option<String>,
         /// Phase budget for this run — the task turn plus each steered
         /// follow-up (1-1024, default 32; GRAY_SUBAGENTS_MAX_PHASES overrides).
         #[arg(long)]
@@ -299,7 +303,7 @@ pub(crate) fn backend(
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 fn manifest() -> Value {
-    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","run","status","view","stop","steer","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"],"turn_local":{"/subagents":["","status","view","open"]}});
+    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","run","status","view","stop","steer","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"command_descriptions":{"/subagents":"launch and manage subagents: status, steer, stop","/narrow":"run children with narrowed capability grants","/rlm":"list, collect and stop this session's child agents"},"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"],"turn_local":{"/subagents":["","status","view","open"]}});
     // Folded-in surfaces ride this manifest too: gray-narrow's tools
     // (narrow_delegate) plus the subagent_* model-facing tools.
     let mut tools: Vec<Value> = narrow::manifest_narrow()
@@ -375,6 +379,18 @@ pub(crate) struct Entry {
     pub created: f64,
 }
 
+fn quota_left(reset_at: Option<f64>, now: f64) -> String {
+    let Some(reset_at) = reset_at else {
+        return String::new();
+    };
+    let left = (reset_at - now).max(0.0) as u64;
+    if left >= 3600 {
+        format!("{}h {:02}m", left / 3600, left % 3600 / 60)
+    } else {
+        format!("{}m", left.div_ceil(60))
+    }
+}
+
 pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entry>> {
     let cwd = std::env::current_dir()?;
     let my_sid = owner_session(None);
@@ -403,7 +419,7 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
         });
         for job in jobs {
             let status = job["status"].as_str().unwrap_or("lost");
-            let active = matches!(status, "running" | "stopping");
+            let active = matches!(status, "running" | "stopping" | "waiting");
             // A queued run holds no slot and has no `finished` stamp yet, so it
             // is live for the stale-row filter as well.
             let live = active || status == "queued";
@@ -454,6 +470,9 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
                             a.into()
                         }
                     },
+                },
+                "waiting" => AgentState::WaitingQuota {
+                    reset_in: quota_left(job["quota_reset"].as_f64(), now),
                 },
                 "queued" => AgentState::Queued,
                 "completed" => AgentState::Completed,
@@ -554,7 +573,12 @@ pub(crate) fn collect_entries(include_stale: bool, all: bool) -> Result<Vec<Entr
 /// running/queued rows you check on — then finished ones; each group
 /// newest-first. Menu numbers follow this order.
 pub(crate) fn menu_order(mut entries: Vec<Entry>) -> Vec<Entry> {
-    let live = |e: &Entry| matches!(e.row.state, AgentState::Running { .. } | AgentState::Queued);
+    let live = |e: &Entry| {
+        matches!(
+            e.row.state,
+            AgentState::Running { .. } | AgentState::WaitingQuota { .. } | AgentState::Queued
+        )
+    };
     entries.sort_by(|a, b| {
         live(b)
             .cmp(&live(a))
@@ -624,7 +648,12 @@ pub(crate) fn menu() -> Result<Value> {
     }
     let running = entries
         .iter()
-        .filter(|e| matches!(e.row.state, AgentState::Running { .. }))
+        .filter(|e| {
+            matches!(
+                e.row.state,
+                AgentState::Running { .. } | AgentState::WaitingQuota { .. }
+            )
+        })
         .count();
     let rows: Vec<AgentRow> = entries.iter().map(|e| e.row.clone()).collect();
     let mut text = render_menu(&rows);
@@ -1458,7 +1487,7 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents: delegate from bash with `gray subagents run --name NAME [--model PROVIDER/MODEL] [--isolation worktree] 'task'`, then `gray subagents status|view|steer|stop ID` (or load the subagent_* tools). Always pass a descriptive --name; use --isolation worktree when parallel runs edit the same repo. Runs are detached and outlive this session. `gray subagents --help` documents every option.";
+const USAGE: &str = "Subagents: spawn with the `subagent_spawn` tool — never write `gray subagents run` into bash. Fan independent work out with `tasks` (1-8). `subagent_check` snapshots, `subagent_message` steers, `subagent_stop` ends. Pass a descriptive `name`; set `isolation: worktree` when parallel runs edit one repo, and pass `cwd: <repo>` when this session's cwd is not that repo — a worktree is cut from `cwd` (default: this session's cwd) and a non-repo base fails before the child starts. Runs are detached and outlive this session. The `gray subagents` CLI is the fallback; `--help` documents it.";
 
 const USAGE_DETAIL: &str = include_str!("../AGENTS.md");
 
@@ -1470,9 +1499,13 @@ fn entries_json(all: bool) -> Result<Value> {
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let running = matches!(e.row.state, AgentState::Running { .. });
+            let running = matches!(
+                e.row.state,
+                AgentState::Running { .. } | AgentState::WaitingQuota { .. }
+            );
             let activity = match &e.row.state {
                 AgentState::Running { activity } => activity.clone(),
+                AgentState::WaitingQuota { reset_in } => quota_note(reset_in),
                 _ => String::new(),
             };
             let error = match &e.row.state {
@@ -1521,9 +1554,13 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             tools,
             approve,
             isolation,
+            cwd,
             max_phases,
         } => {
             let mut args = json!({"task":task.join(" ")});
+            if let Some(cwd) = cwd {
+                args["cwd"] = json!(cwd);
+            }
             if let Some(tools) = tools {
                 args["tools"] = json!(tools);
             }

@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use serde_json::{Value, json};
 
 use crate::{Entry, backend, chat, collect_entries, home, menu_order, owner_session, settings};
-use gray_subagents::widget::{AgentRow, AgentState};
+use gray_subagents::widget::{AgentRow, AgentState, quota_note};
 
 #[derive(Clone, Copy)]
 struct Theme {
@@ -411,7 +411,10 @@ impl Panel {
     }
 
     fn running(e: &Entry) -> bool {
-        matches!(e.row.state, AgentState::Running { .. } | AgentState::Queued)
+        matches!(
+            e.row.state,
+            AgentState::Running { .. } | AgentState::WaitingQuota { .. } | AgentState::Queued
+        )
     }
 
     fn move_sel(&mut self, delta: i64) {
@@ -597,6 +600,7 @@ pub fn run() -> Result<()> {
 fn glyph(state: &AgentState, th: &Theme) -> (&'static str, Color) {
     match state {
         AgentState::Running { .. } => ("●", th.accent),
+        AgentState::WaitingQuota { .. } => ("◌", th.accent_soft),
         AgentState::Queued => ("◌", th.muted),
         AgentState::Completed => ("✓", th.success),
         AgentState::Stopped => ("■", th.muted),
@@ -607,6 +611,9 @@ fn glyph(state: &AgentState, th: &Theme) -> (&'static str, Color) {
 fn sub_line(r: &AgentRow) -> String {
     match &r.state {
         AgentState::Running { activity } => format!("{} · {activity} · {}", r.model, r.stats),
+        AgentState::WaitingQuota { reset_in } => {
+            format!("{} · {} · {}", r.model, quota_note(reset_in), r.stats)
+        }
         AgentState::Failed { error } => format!("{} · failed: {error}", r.model),
         _ if !r.result.is_empty() => {
             let one = r.result.lines().next().unwrap_or("");
@@ -741,6 +748,13 @@ fn draw(frame: &mut ratatui::Frame, panel: &Panel, th: &Theme) {
                 Span::styled("● ", Style::default().fg(th.accent)),
                 Span::styled(
                     clip(activity, w.saturating_sub(2)),
+                    Style::default().fg(th.muted),
+                ),
+            ]),
+            (None, Some(AgentState::WaitingQuota { reset_in })) => Line::from(vec![
+                Span::styled("◌ ", Style::default().fg(th.accent_soft)),
+                Span::styled(
+                    clip(&quota_note(reset_in), w.saturating_sub(2)),
                     Style::default().fg(th.muted),
                 ),
             ]),

@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gray_subagents::widget::AgentState;
+use gray_subagents::widget::{AgentState, quota_note};
 
 use crate::{
     Entry, backend, chat, collect_entries, foreign_stop, home, menu_order, menu_target,
@@ -110,6 +110,15 @@ fn batch_items(tasks: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+fn job_record(rid: &str) -> Option<Value> {
+    let path = home()
+        .ok()?
+        .join("subagents")
+        .join("runs")
+        .join(format!("{rid}.json"));
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
 /// `subagent_spawn` — admit a supervised child, return a handle immediately.
 /// `prompt` (or `task`) is required; `tasks: [...]` fans out 1–8 in one
 /// admission (prime's batch spawn), each item taking name/model/etc.
@@ -137,26 +146,29 @@ fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
         run["tasks"] = Value::Array(batch_items(tasks));
     } else {
         run["task"] = args["prompt"].as_str().or(args["task"].as_str()).into();
-        for (k, t) in [("name", "name"), ("tools", "tools"), ("approve", "approve")] {
-            if let Some(v) = args[t].as_str().filter(|s| !s.is_empty()) {
-                run[k] = json!(v);
-            }
+        if let Some(name) = args["name"].as_str().filter(|s| !s.is_empty()) {
+            run["name"] = json!(name);
         }
-        if let Some(m) = args["model"].as_str().filter(|s| !s.is_empty()) {
-            run["model"] = json!(crate::resolve_model(m).map_err(|e| e.to_string())?);
+    }
+    for t in ["tools", "approve", "cwd"] {
+        if let Some(v) = args[t].as_str().filter(|s| !s.is_empty()) {
+            run[t] = json!(v);
         }
-        if let Some(e) = args["effort"].as_str().filter(|s| !s.is_empty()) {
-            run["effort"] = json!(crate::check_effort(e).map_err(|e| e.to_string())?);
+    }
+    if let Some(i) = args["isolation"].as_str().filter(|s| !s.is_empty()) {
+        if i != "worktree" {
+            return Err("isolation must be 'worktree'".into());
         }
-        if let Some(c) = args["context"].as_str().filter(|s| !s.is_empty()) {
-            run["context"] = json!(crate::check_context(c).map_err(|e| e.to_string())?);
-        }
-        if let Some(i) = args["isolation"].as_str().filter(|s| !s.is_empty()) {
-            if i != "worktree" {
-                return Err("isolation must be 'worktree'".into());
-            }
-            run["isolation"] = json!(i);
-        }
+        run["isolation"] = json!(i);
+    }
+    if let Some(m) = args["model"].as_str().filter(|s| !s.is_empty()) {
+        run["model"] = json!(crate::resolve_model(m).map_err(|e| e.to_string())?);
+    }
+    if let Some(e) = args["effort"].as_str().filter(|s| !s.is_empty()) {
+        run["effort"] = json!(crate::check_effort(e).map_err(|e| e.to_string())?);
+    }
+    if let Some(c) = args["context"].as_str().filter(|s| !s.is_empty()) {
+        run["context"] = json!(crate::check_context(c).map_err(|e| e.to_string())?);
     }
     run["session"] = params
         .get("session")
@@ -172,7 +184,17 @@ fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
     let handles: Vec<Value> = rids
         .iter()
         .enumerate()
-        .map(|(i, r)| json!({"id": r, "name": names.get(i).cloned().unwrap_or(Value::Null)}))
+        .map(|(i, r)| {
+            let mut handle = json!({"id": r, "name": names.get(i).cloned().unwrap_or(Value::Null)});
+            if let Some(job) = job_record(r.as_str().unwrap_or_default()) {
+                for key in ["model", "effort"] {
+                    if let Some(v) = job[key].as_str().filter(|s| !s.is_empty()) {
+                        handle[key] = json!(v);
+                    }
+                }
+            }
+            handle
+        })
         .collect();
     Ok(json!({
         "handles": handles,
@@ -187,6 +209,12 @@ fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
 fn snapshot(e: &Entry, preview_lines: usize) -> Value {
     let (running, settled, activity, status) = match &e.row.state {
         AgentState::Running { activity } => (true, false, activity.clone(), "running".to_string()),
+        AgentState::WaitingQuota { reset_in } => (
+            true,
+            false,
+            quota_note(reset_in),
+            "waiting for quota reset".to_string(),
+        ),
         AgentState::Queued => (false, false, String::new(), "queued".to_string()),
         AgentState::Completed => (false, true, String::new(), "completed".to_string()),
         AgentState::Failed { error } => (false, true, String::new(), format!("failed: {error}")),
@@ -448,17 +476,18 @@ pub fn cli(argv: &[String]) -> String {
 pub fn manifest_tools() -> Value {
     json!([
         {"name": "subagent_spawn",
-         "label": "Started agent",
-         "preview": "{name} · {model|model} · {effort} · ctx {context}\n{prompt|firstline}",
+         "label": "Subagent",
+         "preview": "{name} · fan out {tasks|count} · {model|model} · {effort} · ctx {context}\n{prompt|firstline}",
          "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 128) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
-            "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, name?, model?, effort?, context?}"},
+            "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, name?, model?, effort?, context?, cwd?, isolation?}"},
             "name": {"type": "string"}, "model": {"type": "string", "description": "model id, or provider/model to pin a provider (e.g. claude/claude-haiku-5-5); bare ids ride the session's own provider"},
             "effort": {"type": "string"},
             "context": {"type": "string", "description": "context ceiling passed as GRAY_COMPACT_AT: '90k', '300k', '1m', or 'auto'; above 200k a Claude model auto-uses its [1m] route — Haiku bills 5x past 100k"},
             "tools": {"type": "string"}, "approve": {"type": "string"},
-            "isolation": {"type": "string", "description": "e.g. worktree"}}}},
+            "cwd": {"type": "string", "description": "repo path for the child: its working directory, and the repo a worktree is cut from. Defaults to this session's cwd; required when isolation is set and that cwd is not a git repo"},
+            "isolation": {"type": "string", "description": "'worktree' gives the child its own git worktree of cwd (or of this session's cwd). Needs a git repo — a spawn from a non-repo path fails before it starts"}}}},
         {"name": "subagent_check",
          "label": "Checked agents",
          "preview": "{targets}",
