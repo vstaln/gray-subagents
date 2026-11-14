@@ -110,6 +110,15 @@ fn batch_items(tasks: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+fn job_record(rid: &str) -> Option<Value> {
+    let path = home()
+        .ok()?
+        .join("subagents")
+        .join("runs")
+        .join(format!("{rid}.json"));
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
 /// `subagent_spawn` — admit a supervised child, return a handle immediately.
 /// `prompt` (or `task`) is required; `tasks: [...]` fans out 1–8 in one
 /// admission (prime's batch spawn), each item taking name/model/etc.
@@ -175,7 +184,17 @@ fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
     let handles: Vec<Value> = rids
         .iter()
         .enumerate()
-        .map(|(i, r)| json!({"id": r, "name": names.get(i).cloned().unwrap_or(Value::Null)}))
+        .map(|(i, r)| {
+            let mut handle = json!({"id": r, "name": names.get(i).cloned().unwrap_or(Value::Null)});
+            if let Some(job) = job_record(r.as_str().unwrap_or_default()) {
+                for key in ["model", "effort"] {
+                    if let Some(v) = job[key].as_str().filter(|s| !s.is_empty()) {
+                        handle[key] = json!(v);
+                    }
+                }
+            }
+            handle
+        })
         .collect();
     Ok(json!({
         "handles": handles,
