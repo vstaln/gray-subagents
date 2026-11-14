@@ -3,7 +3,7 @@
 //! itself enforces depth-1 (`GRAY_SUBAGENTS_ACTIVE`) and the running cap
 //! (`max_running` setting); this layer adds the model-facing tool surface
 //! prime's `spawn/collect/send/delete/progress_note` map to, plus the
-//! per-session spawn budget and session notes. No duplicate registry —
+//! session notes. No duplicate registry —
 //! the supervisor's own runs/ records (session_id-scoped) are the truth.
 
 use anyhow::Result;
@@ -19,7 +19,6 @@ use crate::{
     owner_session, resolve_entry,
 };
 
-const MAX_SPAWNS: usize = 32;
 const COLLECT_MAX_WAIT_MS: u64 = 120_000;
 const DEPTH_MSG: &str = "subagent_spawn is unavailable inside a subagent run — children cannot spawn children (depth-1 only)";
 
@@ -126,17 +125,9 @@ fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
     if std::env::var_os("GRAY_SUBAGENTS_ACTIVE").is_some() {
         return Err(DEPTH_MSG.into());
     }
-    let sid = session_id(params);
     let batch = args["tasks"].as_array();
     if batch.is_none() && args["prompt"].as_str().or(args["task"].as_str()).is_none() {
         return Err("subagent_spawn requires prompt".into());
-    }
-    let owned = owned_runs(&sid);
-    if owned.len() >= MAX_SPAWNS {
-        return Err(format!(
-            "spawn budget exhausted — {MAX_SPAWNS} spawns per session (this session has {})",
-            owned.len()
-        ));
     }
     let mut run = json!({});
     if let Some(tasks) = batch {
@@ -478,7 +469,7 @@ pub fn manifest_tools() -> Value {
         {"name": "subagent_spawn",
          "label": "Subagent",
          "preview": "{name} · fan out {tasks|count} · {model|model} · {effort} · ctx {context}\n{prompt|firstline}",
-         "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 128) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
+         "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; cap: max_running setting (default 128) concurrent. `tasks` fans out 1–8 children in one admission.",
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
             "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, name?, model?, effort?, context?, cwd?, isolation?}"},

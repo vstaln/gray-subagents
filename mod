@@ -373,14 +373,37 @@ def owner_session(explicit=""):
     return (session_of_pid(root) if root else None) or ""
 
 
-def visible_to(job, sid, cwd):
+def parent_run_session():
+    pid, hops = os.getpid(), 0
+    while True:
+        ppid = ppid_of(pid)
+        if ppid is None or ppid <= 1 or hops > 64:
+            return None
+        if "--supervise" in proc_argv(ppid):
+            return env_value(ppid, "GRAY_SESSION_ID") or ""
+        pid, hops = ppid, hops + 1
+
+
+def caller_scope(sid=""):
+    own = owner_session(sid)
+    parent = parent_run_session()
+    if parent is None:
+        return {own} if own else set()
+    return {parent} | ({own} if own else set())
+
+
+def in_scope(job, scope, cwd):
     # A run belongs to its owner: only that session sees it. A session-less run
     # (manual `gray subagents run`) is visible only to a viewer with no session,
     # from its own cwd — never to sessions that merely share the folder.
     owner = job.get("session_id") or ""
     if owner:
-        return owner == sid
-    return not sid and job.get("cwd") == cwd
+        return owner in scope
+    return not scope and job.get("cwd") == cwd
+
+
+def visible_to(job, sid, cwd):
+    return in_scope(job, {sid} if sid else set(), cwd)
 
 
 def home():
@@ -1442,21 +1465,28 @@ def status_job(rid=None, sid="", all_runs=False):
 
 
 def stop_job(rid, sid="", everywhere=False):
-    sid = owner_session(sid)
+    scope = caller_scope(sid)
+    cwd = str(Path(os.getcwd()).resolve())
     with registry():
         sweep()
         if rid and rid not in ("all", "mine"):
-            jobs = [read_job(resolve_rid(rid))]
+            job = read_job(resolve_rid(rid))
+            if not in_scope(job, scope, cwd):
+                raise ValueError(f"run {run_handle(job)} belongs to another session"
+                                 " — stop your own runs or a sibling")
+            jobs = [job]
         elif everywhere:
             # Explicit `stop --global`: every live run on this machine,
             # including runs owned by other sessions.
+            if os.environ.get("GRAY_SUBAGENTS_ACTIVE"):
+                raise ValueError("stop --global is unavailable inside a subagent run"
+                                 " — stop a sibling by name or id")
             jobs = [j for j in all_jobs() if j["status"] in LIVE]
         else:
             # "all" / "mine" / bare stop: this session's runs only. With no
             # resolvable session it hits only session-less (manual) runs —
             # never jobs owned by another session.
-            cwd = str(Path(os.getcwd()).resolve())
-            jobs = [j for j in all_jobs() if j["status"] in LIVE and visible_to(j, sid, cwd)]
+            jobs = [j for j in all_jobs() if j["status"] in LIVE and in_scope(j, scope, cwd)]
         if not jobs:
             return {"content": "nothing running to stop"}
         stopping, cancelled = [], []
@@ -2004,13 +2034,16 @@ def steer_job(rid, message):
     """Queue a follow-up into the child's own session. Running jobs pick the
     message up between phases; finished jobs are revived by a new supervisor
     that resumes the recorded child session."""
-    if os.environ.get("GRAY_SUBAGENTS_ACTIVE"):
-        raise ValueError("recursion guard: nested delegation is disabled")
     if not isinstance(message, str) or not message.strip() or len(message) > 16000 or "\0" in message:
         raise ValueError("message must contain 1-16000 nonempty characters and no NUL")
+    scope = caller_scope()
+    cwd = str(Path(os.getcwd()).resolve())
     with registry():
         sweep()
         job = read_job(resolve_rid(rid))
+        if not in_scope(job, scope, cwd):
+            raise ValueError(f"run {run_handle(job)} belongs to another session"
+                             " — steer your own runs or a sibling")
         if job["status"] == "stopping":
             raise ValueError(f"run {rid} is stopping")
         queue = job.setdefault("steer_queue", [])
