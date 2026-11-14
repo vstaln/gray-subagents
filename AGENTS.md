@@ -8,7 +8,7 @@ CLI below is the fallback for settings, inspection and steered follow-ups.
 ```
 gray subagents run --name NAME [--model PROVIDER/MODEL]
     [--effort LEVEL] [--context CTX] [--tools CAPS] [--approve CAPS]
-    [--isolation worktree] [--max-phases N] 'task'
+    [--isolation worktree] [--cwd REPO] [--max-phases N] 'task'
 gray subagents status [ID]
 gray subagents view [ID] [--lines N]
 gray subagents steer ID 'follow-up'
@@ -32,7 +32,11 @@ gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL]
 - Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name;
   `view`/`stop` also accept worker names and session slugs.
 - `--isolation worktree` gives the child its own git worktree — required when
-  parallel runs edit the same repo.
+  parallel runs edit the same repo. The worktree is cut from `cwd`, which
+  also sets a child's plain working directory (`subagent_spawn` takes `cwd`
+  once, or per item in `tasks`); both default to this session's cwd. A
+  worktree over a non-repo base fails before the run starts instead of
+  running in place.
 - No time cap unless `timeout` (seconds) is passed to the subagent tool or
   GRAY_SUBAGENTS_TIMEOUT_SECS is set; a timed-out run reports partial output
   and stays steerable. Children cannot spawn subagents.

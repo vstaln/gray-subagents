@@ -137,26 +137,29 @@ fn subagent_spawn(params: &Value, args: &Value) -> Result<String, String> {
         run["tasks"] = Value::Array(batch_items(tasks));
     } else {
         run["task"] = args["prompt"].as_str().or(args["task"].as_str()).into();
-        for (k, t) in [("name", "name"), ("tools", "tools"), ("approve", "approve")] {
-            if let Some(v) = args[t].as_str().filter(|s| !s.is_empty()) {
-                run[k] = json!(v);
-            }
+        if let Some(name) = args["name"].as_str().filter(|s| !s.is_empty()) {
+            run["name"] = json!(name);
         }
-        if let Some(m) = args["model"].as_str().filter(|s| !s.is_empty()) {
-            run["model"] = json!(crate::resolve_model(m).map_err(|e| e.to_string())?);
+    }
+    for t in ["tools", "approve", "cwd"] {
+        if let Some(v) = args[t].as_str().filter(|s| !s.is_empty()) {
+            run[t] = json!(v);
         }
-        if let Some(e) = args["effort"].as_str().filter(|s| !s.is_empty()) {
-            run["effort"] = json!(crate::check_effort(e).map_err(|e| e.to_string())?);
+    }
+    if let Some(i) = args["isolation"].as_str().filter(|s| !s.is_empty()) {
+        if i != "worktree" {
+            return Err("isolation must be 'worktree'".into());
         }
-        if let Some(c) = args["context"].as_str().filter(|s| !s.is_empty()) {
-            run["context"] = json!(crate::check_context(c).map_err(|e| e.to_string())?);
-        }
-        if let Some(i) = args["isolation"].as_str().filter(|s| !s.is_empty()) {
-            if i != "worktree" {
-                return Err("isolation must be 'worktree'".into());
-            }
-            run["isolation"] = json!(i);
-        }
+        run["isolation"] = json!(i);
+    }
+    if let Some(m) = args["model"].as_str().filter(|s| !s.is_empty()) {
+        run["model"] = json!(crate::resolve_model(m).map_err(|e| e.to_string())?);
+    }
+    if let Some(e) = args["effort"].as_str().filter(|s| !s.is_empty()) {
+        run["effort"] = json!(crate::check_effort(e).map_err(|e| e.to_string())?);
+    }
+    if let Some(c) = args["context"].as_str().filter(|s| !s.is_empty()) {
+        run["context"] = json!(crate::check_context(c).map_err(|e| e.to_string())?);
     }
     run["session"] = params
         .get("session")
@@ -459,12 +462,13 @@ pub fn manifest_tools() -> Value {
          "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; caps: max_running setting (default 128) concurrent, 32 total per session. `tasks` fans out 1–8 children in one admission.",
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
-            "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, name?, model?, effort?, context?}"},
+            "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, name?, model?, effort?, context?, cwd?, isolation?}"},
             "name": {"type": "string"}, "model": {"type": "string", "description": "model id, or provider/model to pin a provider (e.g. claude/claude-haiku-5-5); bare ids ride the session's own provider"},
             "effort": {"type": "string"},
             "context": {"type": "string", "description": "context ceiling passed as GRAY_COMPACT_AT: '90k', '300k', '1m', or 'auto'; above 200k a Claude model auto-uses its [1m] route — Haiku bills 5x past 100k"},
             "tools": {"type": "string"}, "approve": {"type": "string"},
-            "isolation": {"type": "string", "description": "e.g. worktree"}}}},
+            "cwd": {"type": "string", "description": "repo path for the child: its working directory, and the repo a worktree is cut from. Defaults to this session's cwd; required when isolation is set and that cwd is not a git repo"},
+            "isolation": {"type": "string", "description": "'worktree' gives the child its own git worktree of cwd (or of this session's cwd). Needs a git repo — a spawn from a non-repo path fails before it starts"}}}},
         {"name": "subagent_check",
          "label": "Checked agents",
          "preview": "{targets}",

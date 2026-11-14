@@ -1243,6 +1243,20 @@ def clean_isolation(value):
     return value
 
 
+def clean_cwd(value):
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        raise ValueError("cwd must be a path to an existing directory")
+    path = Path(value.strip()).expanduser()
+    if not path.is_dir():
+        raise ValueError(f"cwd {value.strip()} is not an existing directory")
+    return str(path.resolve())
+
+
+def is_git_repo(path):
+    proc = _git_ok(["rev-parse", "--show-toplevel"], path, 15)
+    return proc is not None and proc.returncode == 0
+
+
 def clean_timeout(value):
     """Explicit per-run cap in seconds; absent means the run never times out."""
     if value is None:
@@ -1534,7 +1548,8 @@ def make_worktree(cwd, rid, name):
     proc = subprocess.run(["git", "-C", cwd, "worktree", "add", str(path), "-b", branch],
                           capture_output=True, text=True, timeout=30)
     if proc.returncode != 0:
-        raise ValueError((proc.stderr or proc.stdout).strip() or "git worktree add failed")
+        reason = " ".join(((proc.stderr or proc.stdout) or "").split())[:200]
+        raise ValueError(f"isolation: worktree failed in {cwd} — {reason or 'git worktree add failed'}")
     return str(path), branch
 
 
@@ -1755,6 +1770,10 @@ def spawn_jobs(args, session):
         tools = clean_tools(first_set(item.get("tools"), args.get("tools")))
         approve = clean_tools(first_set(item.get("approve"), args.get("approve")))
         isolation = clean_isolation(first_set(item.get("isolation"), args.get("isolation")))
+        base = clean_cwd(first_set(item.get("cwd"), args.get("cwd"), cwd))
+        if isolation == "worktree" and not is_git_repo(base):
+            raise ValueError(f"{at}isolation: worktree needs a git repo — {base} is not one"
+                             "; pass cwd: <repo>")
         timeout = clean_timeout(first_set(item.get("timeout"), args.get("timeout"), ttl))
         max_phases = clean_max_phases(first_set(item.get("max_phases"), args.get("max_phases"))) or default_phases
         prompt = ("You are a subagent of a parent Gray session.\n\n"
@@ -1767,7 +1786,7 @@ def spawn_jobs(args, session):
                              effort=effort,
                              context=context, tools=tools,
                              approve=approve, isolation=isolation, timeout=timeout,
-                             max_phases=max_phases))
+                             max_phases=max_phases, cwd=base))
     # Materialize outside the registry lock: uuids, narrowing plans (a
     # subprocess), worktrees (git) — no other run should wait on them.
     worktrees = []
@@ -1793,14 +1812,14 @@ def spawn_jobs(args, session):
                         narrow_note = f" (denied by parent grant: {', '.join(denied)})"
             worktree, branch = "", ""
             if p["isolation"] == "worktree":
-                worktree, branch = make_worktree(cwd, rid, p["name"] or f"run-{rid[:6]}")
-                worktrees.append((worktree, branch))
+                worktree, branch = make_worktree(p["cwd"], rid, p["name"] or f"run-{rid[:6]}")
+                worktrees.append((p["cwd"], worktree, branch))
             p.update(narrow_env=narrow_env, narrow_note=narrow_note,
                      worktree=worktree, branch=branch)
     except Exception:
-        for wt, br in worktrees:
+        for repo, wt, br in worktrees:
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                drop_worktree(cwd, wt, br)
+                drop_worktree(repo, wt, br)
         raise
     started, ahead = [], {}
     with registry():
@@ -1826,7 +1845,7 @@ def spawn_jobs(args, session):
                        narrow_note=p["narrow_note"], isolation=p["isolation"] or "",
                        worktree=p["worktree"], branch=p["branch"],
                        tool_count=0, write_count=0, worktree_note="",
-                       cwd=cwd, session_id=owner_session(session.get("id") or ""), binary=str(Path(binary).resolve()),
+                       cwd=p["cwd"], session_id=owner_session(session.get("id") or ""), binary=str(Path(binary).resolve()),
                        timeout=p["timeout"], max_phases=p["max_phases"], depth=depth,
                        created=time.time(),
                        status=QUEUED if queue_now else "running", result="", error="",
@@ -2222,6 +2241,9 @@ def run_phase(rid, prompt, resume_sid, job):
     binary, timeout = job["binary"], job["timeout"]
     cwd = job.get("worktree") or ""
     if not cwd or not Path(cwd).is_dir():
+        if job.get("isolation") == "worktree":
+            return ("failed", f"isolation: worktree — {job.get('worktree') or 'no worktree'}"
+                    f" is gone; not running in {job['cwd']}", "", 0, 0)
         cwd = job["cwd"]
     env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", GRAY_SESSION_ORIGIN="subagent",
                GRAY_SUBAGENTS_DEPTH=str(job.get("depth") or 1),

@@ -69,6 +69,10 @@ enum Action {
         /// runs edit the same repository so they cannot collide.
         #[arg(long)]
         isolation: Option<String>,
+        /// Working directory for the child, and the repo a worktree is cut
+        /// from with --isolation. Defaults to this session's cwd.
+        #[arg(long)]
+        cwd: Option<String>,
         /// Phase budget for this run — the task turn plus each steered
         /// follow-up (1-1024, default 32; GRAY_SUBAGENTS_MAX_PHASES overrides).
         #[arg(long)]
@@ -1483,7 +1487,7 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents: spawn with the `subagent_spawn` tool — never write `gray subagents run` into bash. Fan independent work out with `tasks` (1-8). `subagent_check` snapshots, `subagent_message` steers, `subagent_stop` ends. Pass a descriptive `name`; set `isolation: worktree` when parallel runs edit one repo. Runs are detached and outlive this session. The `gray subagents` CLI is the fallback; `--help` documents it.";
+const USAGE: &str = "Subagents: spawn with the `subagent_spawn` tool — never write `gray subagents run` into bash. Fan independent work out with `tasks` (1-8). `subagent_check` snapshots, `subagent_message` steers, `subagent_stop` ends. Pass a descriptive `name`; set `isolation: worktree` when parallel runs edit one repo, and pass `cwd: <repo>` when this session's cwd is not that repo — a worktree is cut from `cwd` (default: this session's cwd) and a non-repo base fails before the child starts. Runs are detached and outlive this session. The `gray subagents` CLI is the fallback; `--help` documents it.";
 
 const USAGE_DETAIL: &str = include_str!("../AGENTS.md");
 
@@ -1550,9 +1554,13 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             tools,
             approve,
             isolation,
+            cwd,
             max_phases,
         } => {
             let mut args = json!({"task":task.join(" ")});
+            if let Some(cwd) = cwd {
+                args["cwd"] = json!(cwd);
+            }
             if let Some(tools) = tools {
                 args["tools"] = json!(tools);
             }
