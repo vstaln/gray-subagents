@@ -1487,7 +1487,7 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents: spawn with the `subagent_spawn` tool — never write `gray subagents run` into bash. Fan independent work out with `tasks` (1-8). `subagent_check` snapshots, `subagent_message` steers, `subagent_stop` ends. Pass a descriptive `name`; set `isolation: worktree` when parallel runs edit one repo, and pass `cwd: <repo>` when this session's cwd is not that repo — a worktree is cut from `cwd` (default: this session's cwd) and a non-repo base fails before the child starts. Runs are detached and outlive this session. The `gray subagents` CLI is the fallback; `--help` documents it.";
+const USAGE: &str = "Subagents: spawn with the `subagent_spawn` tool — never write `gray subagents run` into bash. Fan independent work out with `tasks` (1-8). A finished child's report arrives as your next message: end your turn instead of polling with `subagent_check`. `subagent_message` steers a running child or gives an idle named one more work, `subagent_stop` ends. Pass a descriptive `name`; set `isolation: worktree` when parallel runs edit one repo, and pass `cwd: <repo>` when this session's cwd is not that repo — a worktree is cut from `cwd` (default: this session's cwd) and a non-repo base fails before the child starts. Runs are detached and outlive this session. The `gray subagents` CLI is the fallback; `--help` documents it.";
 
 const USAGE_DETAIL: &str = include_str!("../AGENTS.md");
 
