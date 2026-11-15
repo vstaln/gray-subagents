@@ -469,7 +469,7 @@ pub fn manifest_tools() -> Value {
         {"name": "subagent_spawn",
          "label": "Subagent",
          "preview": "{name} · fan out {tasks|count} · {model|model} · {effort} · ctx {context}\n{prompt|full}{tasks.prompt|full}",
-         "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; cap: max_running setting (default 128) concurrent. `tasks` fans out 1–8 children in one admission.",
+         "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer; the child's report arrives as your next message on its own, so end your turn instead of polling. To give an idle named child more work, use subagent_message with its name instead of spawning again. Depth-1 only; cap: max_running setting (default 128) concurrent. `tasks` fans out 1–8 children in one admission.",
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
             "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, name?, model?, effort?, context?, cwd?, isolation?}"},
@@ -482,14 +482,14 @@ pub fn manifest_tools() -> Value {
         {"name": "subagent_check",
          "label": "Checked agents",
          "preview": "{targets}",
-         "description": "Non-steering typed snapshots of children: name, status, settled, activity, transcript-tail preview. wait_ms polls until all settle (max ~120s). Default targets: this session's runs.",
+         "description": "Non-steering typed snapshots of children: name, status, settled, activity, transcript-tail preview. Reports already arrive as your next message, so do not poll; use this only when the user asks for status. wait_ms blocks until all settle (max ~120s). Default targets: this session's runs.",
          "parameters": {"type": "object", "properties": {
             "targets": {"description": "child name or list of names"},
             "wait_ms": {"type": "integer"}}}},
         {"name": "subagent_message",
          "label": "Messaged",
          "preview": "{name}\n{message|full}",
-         "description": "Message a child: steers a running run, resumes a finished one's session (agent_message analogue).",
+         "description": "Message a child: steers a running run, resumes a finished one's session (agent_message analogue). Prefer this over a new spawn when an idle named child already holds the context.",
          "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "message": {"type": "string"}},
          "required": ["name", "message"]}},
