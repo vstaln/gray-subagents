@@ -2336,6 +2336,13 @@ def run_phase(rid, prompt, resume_sid, job):
                 st["activity"] = describe_row(row)
                 if row.get("phase") == "steered":
                     st["acked"] += 1
+                if row.get("phase") == "ask" and isinstance(row.get("ask_id"), int):
+                    try:
+                        proc.stdin.write((json.dumps(
+                            {"ask_id": row["ask_id"], "answers": {}}) + "\n").encode("utf-8"))
+                        proc.stdin.flush()
+                    except (BrokenPipeError, OSError, ValueError):
+                        pass
                 if row.get("phase") == "quota_wait":
                     reset_at = row.get("resume_at")
                     if isinstance(reset_at, (int, float)) and reset_at > 0:
