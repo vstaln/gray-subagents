@@ -40,6 +40,9 @@ gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL]
 - No time cap unless `timeout` (seconds) is passed to the subagent tool or
   GRAY_SUBAGENTS_TIMEOUT_SECS is set; a timed-out run reports partial output
   and stays steerable. Children cannot spawn subagents.
+- `steer` (and `subagent_message`) on a running run writes the message into
+  the live child's stdin: it lands at the child's next model step, not at
+  turn end. Only a message no turn consumed is run as its own phase.
 - A run is marked stalled after 2 consecutive phases with no successful tool
   call or the same error 3 times in a row; each run's phase budget (default
   32, GRAY_SUBAGENTS_MAX_PHASES) bounds steered follow-ups, and every

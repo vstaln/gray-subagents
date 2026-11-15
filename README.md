@@ -43,7 +43,9 @@ any later session can inspect, steer, or stop them.
   off/minimal/low/medium/high/xhigh/max.
 - Named runs: `--name` or an auto `adjective-noun` handle; `status`/`stop`/`steer`
   accept a name, a unique hex prefix, or `last`.
-- Steering: queued follow-ups resume the same child session between phases.
+- Steering: a message to a running run reaches the live child on its stdin
+  and is injected at its next step; anything no turn consumed resumes the
+  same child session as a new phase.
 - `run --isolation worktree` gives the child its own git worktree — required
   when parallel runs edit the same repo. Clean worktrees are removed with
   their branch; dirty ones stay and report a "worktree kept" note.
@@ -156,14 +158,17 @@ worker's name, session slug, or pid all the same.
 `steer` sends a follow-up into the same child session
 (`gray --session <child> -p`):
 
-- **Running** — the message queues (up to 16) and lands when the child's
-  current turn ends; the supervisor runs it as a new phase in the same session.
+- **Running** — the message (up to 16) is written to the live child's stdin
+  and injected at its next model step; a message no turn consumed is run by
+  the supervisor as a new phase in the same session.
 - **Finished / stopped / lost** — the run revives: a new supervisor resumes
   the recorded child session, so the agent keeps full memory of earlier work.
   `stop` then `steer` is the redirect idiom for a runaway turn.
-- No true mid-turn injection exists anywhere in gray — a live session holds
-  an open lock, so queue-then-resume is the semantics, same effect a beat
-  later. Steering is per-phase: each phase gets the run's timeout fresh.
+- Mid-turn steering rides the child's own stdin (a `gray -p --json` child
+  started with `GRAY_STDIN_STEER=1` accepts one `{"type":"steer"}` line per
+  message), so a live turn sees it at its next step rather than at turn end;
+  a child binary without that support falls back to queue-then-resume.
+  Steering is per-phase: each phase gets the run's timeout fresh.
 
 Every phase is a `gray -p --json` child; the supervisor parses its NDJSON
 rows for the session id, live `activity` (last tool/detail — shown by
@@ -213,8 +218,8 @@ a host widget.
 - **Interactive child transcript views are not implemented yet.** The child
   session id is recorded (`status RUN_ID` → `child_session`); open it with
   `gray resume <child_session>` yourself.
-- Steering lands between phases, never mid-token — interrupt with `stop`
-  first when the current turn must die.
+- Steering lands at the child's next model step, never mid-token —
+  interrupt with `stop` first when the current turn must die.
 - No model picker, effort picker, automatic model policy, worktree management,
   or enforced read-only permissions.
 - Child output is captured stdout/stderr, not structured live tool events.
