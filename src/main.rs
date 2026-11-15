@@ -247,8 +247,16 @@ pub(crate) fn backend(
     );
     let dir = home()?.join("subagents/runtime");
     std::fs::create_dir_all(&dir)?;
-    let runtime = dir.join("supervisor.py");
-    write_atomic(&runtime, include_bytes!("../mod"))?;
+    let embedded: &[u8] = include_bytes!("../mod");
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in embedded {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let runtime = dir.join(format!("supervisor-{digest:016x}.py"));
+    if !runtime.exists() {
+        write_atomic(&runtime, embedded)?;
+    }
     let mut cmd = Command::new(python_program());
     // gray-narrow is folded into this binary: default GRAY_NARROW_BIN to
     // ourselves so `run --tools` works without a separate install.
