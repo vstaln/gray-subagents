@@ -468,7 +468,7 @@ pub fn manifest_tools() -> Value {
     json!([
         {"name": "subagent_spawn",
          "label": "Subagent",
-         "preview": "{name} · fan out {tasks|count} · {model|model} · {effort} · ctx {context}\n{prompt|firstline}",
+         "preview": "{name} · fan out {tasks|count} · {model|model} · {effort} · ctx {context}\n{prompt|full}{tasks.prompt|full}",
          "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer. Depth-1 only; cap: max_running setting (default 128) concurrent. `tasks` fans out 1–8 children in one admission.",
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
@@ -488,7 +488,7 @@ pub fn manifest_tools() -> Value {
             "wait_ms": {"type": "integer"}}}},
         {"name": "subagent_message",
          "label": "Messaged",
-         "preview": "{name}\n{message|firstline}",
+         "preview": "{name}\n{message|full}",
          "description": "Message a child: steers a running run, resumes a finished one's session (agent_message analogue).",
          "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "message": {"type": "string"}},
