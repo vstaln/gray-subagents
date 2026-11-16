@@ -2330,13 +2330,18 @@ def run_phase(rid, prompt, resume_sid, job):
         env["GRAY_COMPACT_AT"] = job["context"]
     argv = [binary] + (["--session", resume_sid] if resume_sid else []) \
         + (["--provider", job["provider_arg"]] if job.get("provider_arg") else []) \
-        + ["-p", prompt, "--json"]
+        + ["-p", "-", "--json"]
     # Long-running delegated work outlives the default print-mode request
     # meter; GRAY_SUBAGENTS_MAX_REQUESTS (default 256) widens it for children.
     argv += ["--max-requests", os.environ.get("GRAY_SUBAGENTS_MAX_REQUESTS") or "256"]
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            **_spawn_kwargs())
+    prompt_path = runs_dir() / f"{rid}.prompt"
+    fd = os.open(prompt_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(prompt)
+    with open(prompt_path, "rb") as prompt_in:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=prompt_in,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                **_spawn_kwargs())
     with registry():
         job = read_job(rid)
         job.update(child_pid=proc.pid, child_birth=identity(proc.pid))

@@ -277,14 +277,28 @@ fn spawn_child(
     let log =
         std::fs::File::create(dir.join(format!("{run_id}.log"))).map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
+    let prompt_path = dir.join(format!("{run_id}.prompt"));
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&prompt_path).map_err(|e| e.to_string())?;
+        f.write_all(prompt.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    let prompt_in = std::fs::File::open(&prompt_path).map_err(|e| e.to_string())?;
     let mut cmd = Command::new(gray_binary());
     cmd.arg("-p")
-        .arg(prompt)
+        .arg("-")
         .arg("--json")
         .arg("--max-requests")
         .arg(std::env::var("GRAY_SUBAGENTS_MAX_REQUESTS").unwrap_or_else(|_| "256".into()))
         .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::from(prompt_in))
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(err));
     for (k, v) in env {
