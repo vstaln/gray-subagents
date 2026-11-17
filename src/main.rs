@@ -266,6 +266,38 @@ pub(crate) fn backend(
         cmd.env("GRAY_NARROW_BIN", me);
     }
     cmd.arg("-c").arg(&script).arg(&runtime).arg(action);
+    if let Some(m) = args["session"]["model"].as_object() {
+        if let Some(id) = m
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            cmd.env("GRAY_MODEL", id);
+        }
+        let pid = m
+            .get("provider_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if pid != std::env::var("GRAY_PROVIDER_ID").ok().as_deref() {
+            cmd.env_remove("GRAY_AUTH_REF").env_remove("GRAY_BASE_URL");
+            match pid {
+                Some(p) => {
+                    cmd.envs(crate::model_catalog::provider_identity_env(p, &home()?));
+                }
+                None => {
+                    cmd.env_remove("GRAY_PROVIDER_ID");
+                }
+            }
+            if pid.is_none()
+                && let Some(b) = m
+                    .get("base_url")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            {
+                cmd.env("GRAY_BASE_URL", b);
+            }
+        }
+    }
     if let Some(cap) = cfg["max_running"].as_u64() {
         cmd.env("GRAY_SUBAGENTS_MAX_RUNNING", cap.to_string());
     }
