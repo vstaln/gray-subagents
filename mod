@@ -8,10 +8,11 @@ returns a run_id immediately; finished runs are reported once via the
 
 Job state lives in $GRAY_HOME/subagents/runs/<run_id>.json. A detached
 supervisor records completion even after the sidecar exits. Steering queues a
-follow-up on the run; the supervisor delivers it as a `--session` resume turn
-in the same child session between phases. Runs past GRAY_SUBAGENTS_MAX_RUNNING
-queue (status "queued") and start FIFO as slots free. Linux, macOS, and Windows
-are supported.
+follow-up on the run; a message that reaches a live turn travels on the child's
+stdin and is injected at its next step, and anything no turn consumed is
+delivered as a `--session` resume turn in the same child session between
+phases. Runs past GRAY_SUBAGENTS_MAX_RUNNING queue (status "queued") and start
+FIFO as slots free. Linux, macOS, and Windows are supported.
 Env: GRAY_SUBAGENTS_BIN (default `gray`), GRAY_SUBAGENTS_TIMEOUT_SECS (unset: no cap),
 GRAY_SUBAGENTS_MAX_RUNNING (128), GRAY_SUBAGENTS_MAX_PHASES (32 — the task turn
 plus each steered follow-up). The stall guard ends a run `stalled` after 2
@@ -128,10 +129,10 @@ TOOLS = [
         "preview": "{run_id}\n{message|firstline}",
         "description": (
             "Send a follow-up message to a subagent run, in its own session."
-            " While the run is active the message queues and lands when the"
-            " current turn ends; on a finished or stopped run it resumes the"
-            " child session immediately. Use subagents_stop first to redirect"
-            " a runaway turn."
+            " While the run is active the message reaches the running child at"
+            " its next step; on a finished or stopped run it resumes the child"
+            " session immediately. Use subagents_stop first to redirect a"
+            " runaway turn."
         ),
         "parameters": {
             "type": "object",
@@ -2059,9 +2060,10 @@ def completion_notices(cwd, sid=""):
 
 
 def steer_job(rid, message):
-    """Queue a follow-up into the child's own session. Running jobs pick the
-    message up between phases; finished jobs are revived by a new supervisor
-    that resumes the recorded child session."""
+    """Queue a follow-up into the child's own session. A running job hands the
+    message to the live child on its stdin, injected at its next model step; a
+    message no turn consumed becomes a resume phase. Finished jobs are revived
+    by a new supervisor that resumes the recorded child session."""
     if not isinstance(message, str) or not message.strip() or len(message) > 16000 or "\0" in message:
         raise ValueError("message must contain 1-16000 nonempty characters and no NUL")
     scope = caller_scope()
@@ -2083,7 +2085,7 @@ def steer_job(rid, message):
             write_job(job)
             log_event(job["run_id"], "steered", queued=len(queue),
                       message=dig(message))
-            where = ("queued; lands when the current turn ends" if job["status"] in ACTIVE
+            where = ("delivered to the running child at its next step" if job["status"] in ACTIVE
                      else "waiting for a free slot; lands after its first turn")
         else:
             if not job.get("child_session"):
@@ -2308,7 +2310,7 @@ def run_phase(rid, prompt, resume_sid, job):
         cwd = job["cwd"]
     env = dict(os.environ, GRAY_SUBAGENTS_ACTIVE="1", GRAY_SESSION_ORIGIN="subagent",
                GRAY_SUBAGENTS_DEPTH=str(job.get("depth") or 1),
-               GRAY_NO_RESUME="1",
+               GRAY_NO_RESUME="1", GRAY_STDIN_STEER="1",
                NO_COLOR="1", TERM="dumb", GRAY_SHOW_REASONING="0")
     # gray-narrow resolved grant (subset of ours), run correlation —
     # overrides the inherited GRAY_NARROW_* values for this child only.
@@ -2334,7 +2336,7 @@ def run_phase(rid, prompt, resume_sid, job):
     # Long-running delegated work outlives the default print-mode request
     # meter; GRAY_SUBAGENTS_MAX_REQUESTS (default 256) widens it for children.
     argv += ["--max-requests", os.environ.get("GRAY_SUBAGENTS_MAX_REQUESTS") or "256"]
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             **_spawn_kwargs())
     with registry():
@@ -2343,7 +2345,8 @@ def run_phase(rid, prompt, resume_sid, job):
         write_job(job)
     pending = b""
     st = {"sid": "", "activity": "", "result": "", "error_row": "", "plain": bytearray(),
-          "tools": 0, "ok_tools": 0, "writes": 0, "calls": {}, "seq": 0, "quota_reset": None}
+          "tools": 0, "ok_tools": 0, "writes": 0, "calls": {}, "seq": 0, "quota_reset": None,
+          "sent": [], "acked": 0}
     status, error = "failed", "supervisor did not finish"
     output = queue.Queue(maxsize=1)
     eof = object()
@@ -2359,6 +2362,15 @@ def run_phase(rid, prompt, resume_sid, job):
                 st["sid"] = row["session_id"]
             if row.get("type") == "progress":
                 st["activity"] = describe_row(row)
+                if row.get("phase") == "steered":
+                    st["acked"] += 1
+                if row.get("phase") == "ask" and isinstance(row.get("ask_id"), int):
+                    try:
+                        proc.stdin.write((json.dumps(
+                            {"ask_id": row["ask_id"], "answers": {}}) + "\n").encode("utf-8"))
+                        proc.stdin.flush()
+                    except (BrokenPipeError, OSError, ValueError):
+                        pass
                 if row.get("phase") == "quota_wait":
                     reset_at = row.get("resume_at")
                     if isinstance(reset_at, (int, float)) and reset_at > 0:
@@ -2390,6 +2402,18 @@ def run_phase(rid, prompt, resume_sid, job):
             room = OUTPUT_LIMIT - len(st["plain"])
             if room > 0:
                 st["plain"].extend((line + b"\n")[:room])
+
+    def requeue_unsent():
+        with registry():
+            job = read_job(rid)
+            if job["status"] == "stopping":
+                return
+            unsent = st["sent"][st["acked"]:]
+            if not unsent:
+                return
+            job["steer_queue"] = unsent + list(job.get("steer_queue") or [])
+            write_job(job)
+            st["sent"] = st["sent"][:st["acked"]]
 
     try:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -2452,6 +2476,20 @@ def run_phase(rid, prompt, resume_sid, job):
                     job["quota_reset"] = None
                     log_event(rid, "resumed_after_quota")
                     changed = True
+                if not stopping and proc.poll() is None and job.get("steer_queue"):
+                    steers = job["steer_queue"]
+                    while steers:
+                        message = steers.pop(0)
+                        try:
+                            proc.stdin.write((json.dumps(
+                                {"type": "steer", "text": message}) + "\n").encode("utf-8"))
+                            proc.stdin.flush()
+                        except (BrokenPipeError, OSError):
+                            steers.insert(0, message)
+                            break
+                        st["sent"].append(message)
+                        changed = True
+                        log_event(rid, "steer_delivered", message=dig(message))
                 if changed:
                     write_job(job)
             if stopping:
@@ -2503,12 +2541,18 @@ def run_phase(rid, prompt, resume_sid, job):
             else:
                 status = "failed"
                 error = st["error_row"] or (f"child exited {code}" if code else "child returned empty output")
+        requeue_unsent()
         return status, error, result, st["ok_tools"], st["writes"]
     finally:
         kill_tree(proc.pid)
         proc.wait()
         reader_stop.set()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
         proc.stdout.close()
+        requeue_unsent()
 
 
 def stall_guard(phases):

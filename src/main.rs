@@ -247,8 +247,16 @@ pub(crate) fn backend(
     );
     let dir = home()?.join("subagents/runtime");
     std::fs::create_dir_all(&dir)?;
-    let runtime = dir.join("supervisor.py");
-    write_atomic(&runtime, include_bytes!("../mod"))?;
+    let embedded: &[u8] = include_bytes!("../mod");
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in embedded {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let runtime = dir.join(format!("supervisor-{digest:016x}.py"));
+    if !runtime.exists() {
+        write_atomic(&runtime, embedded)?;
+    }
     let mut cmd = Command::new(python_program());
     // gray-narrow is folded into this binary: default GRAY_NARROW_BIN to
     // ourselves so `run --tools` works without a separate install.
@@ -258,6 +266,38 @@ pub(crate) fn backend(
         cmd.env("GRAY_NARROW_BIN", me);
     }
     cmd.arg("-c").arg(&script).arg(&runtime).arg(action);
+    if let Some(m) = args["session"]["model"].as_object() {
+        if let Some(id) = m
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            cmd.env("GRAY_MODEL", id);
+        }
+        let pid = m
+            .get("provider_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if pid != std::env::var("GRAY_PROVIDER_ID").ok().as_deref() {
+            cmd.env_remove("GRAY_AUTH_REF").env_remove("GRAY_BASE_URL");
+            match pid {
+                Some(p) => {
+                    cmd.envs(crate::model_catalog::provider_identity_env(p, &home()?));
+                }
+                None => {
+                    cmd.env_remove("GRAY_PROVIDER_ID");
+                }
+            }
+            if pid.is_none()
+                && let Some(b) = m
+                    .get("base_url")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            {
+                cmd.env("GRAY_BASE_URL", b);
+            }
+        }
+    }
     if let Some(cap) = cfg["max_running"].as_u64() {
         cmd.env("GRAY_SUBAGENTS_MAX_RUNNING", cap.to_string());
     }

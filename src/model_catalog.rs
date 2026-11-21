@@ -554,6 +554,18 @@ fn tier_base(id: &str) -> Option<&str> {
         .filter(|b| !b.is_empty())
 }
 
+pub(crate) fn provider_identity_env(provider_id: &str, home: &Path) -> Vec<(String, String)> {
+    let provs = plugin_providers(home);
+    match find_provider(&provs, provider_id) {
+        Ok(Some((i, auth))) => {
+            let prov = &provs[i];
+            let auth = auth.unwrap_or_else(|| prov.auth.first().cloned().unwrap_or_default());
+            provider_env(prov, &auth)
+        }
+        _ => vec![("GRAY_PROVIDER_ID".to_string(), provider_id.to_string())],
+    }
+}
+
 /// A spawn routed onto a plugin provider: the bare model id for the child's
 /// GRAY_MODEL plus the provider-identity env its connection needs. An empty
 /// `env` means the child keeps the parent's provider.
