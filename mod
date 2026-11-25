@@ -1797,6 +1797,10 @@ def spawn_jobs(args, session):
         model, provider_env, provider_label, provider_arg = resolve_route(
             first_set(item.get("model"), args.get("model"),
                       os.environ.get("GRAY_MODEL") or None), context)
+        if not provider_env and not provider_arg:
+            provider_env = {k: os.environ[k] for k in
+                            ("GRAY_PROVIDER_ID", "GRAY_AUTH_REF", "GRAY_BASE_URL", "GRAY_MODEL")
+                            if os.environ.get(k)}
         effort = clean_effort(first_set(item.get("effort"), args.get("effort")))
         tools = clean_tools(first_set(item.get("tools"), args.get("tools")))
         approve = clean_tools(first_set(item.get("approve"), args.get("approve")))
