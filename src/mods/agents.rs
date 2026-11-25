@@ -403,67 +403,6 @@ pub fn handle_tool(params: &Value) -> (Value, Vec<Value>) {
     }
 }
 
-/// `/rlm …` — status/collect/stop/notes over this session's children.
-pub fn command(params: &Value) -> String {
-    let argv: Vec<String> = params["argv"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let sid = session_id(params);
-    match argv.first().map(String::as_str) {
-        Some("stop") => argv
-            .get(1)
-            .map(|n| subagent_stop(params, &json!({"name": n})).unwrap_or_else(|e| e))
-            .unwrap_or_else(|| "usage: /rlm stop <name>".into()),
-        Some("collect") => subagent_check(params, &json!({})).unwrap_or_else(|e| e),
-        Some("notes") => notes_file(&sid)
-            .and_then(|p| std::fs::read_to_string(p).map_err(|e| e.into()))
-            .unwrap_or_else(|_: anyhow::Error| "(no notes yet)".into()),
-        _ => {
-            let owned = owned_runs(&sid);
-            if owned.is_empty() {
-                return "no subagent children this session — spawn via the subagent_spawn tool"
-                    .into();
-            }
-            let entries = menu_order(collect_entries(true, true).unwrap_or_default());
-            let mut lines = vec![format!("subagent children ({})", owned.len())];
-            for j in &owned {
-                let name = j["name"].as_str().unwrap_or("?");
-                let status = resolve_entry(&entries, name)
-                    .map(|e| match &e.row.state {
-                        AgentState::Running { activity } => {
-                            format!("running · {activity}")
-                        }
-                        _ => e.status.clone(),
-                    })
-                    .unwrap_or_else(|| j["status"].as_str().unwrap_or("?").to_string());
-                lines.push(format!("  {name} — {status}"));
-            }
-            lines.join("\n")
-        }
-    }
-}
-
-/// `gray rlm <verb>` argv surface — read verbs work without a host.
-pub fn cli(argv: &[String]) -> String {
-    let sid = owner_session(None).unwrap_or_else(|| "cli".into());
-    let params = json!({"session": {"id": sid}});
-    match argv.first().map(String::as_str) {
-        Some("collect") => subagent_check(&params, &json!({})).unwrap_or_else(|e| e),
-        Some("stop") => argv
-            .get(1)
-            .map(|n| subagent_stop(&params, &json!({"name": n})).unwrap_or_else(|e| e))
-            .unwrap_or_else(|| "usage: gray rlm stop <name>".into()),
-        Some("notes") => command(&json!({"argv": ["notes"], "session": {"id": sid}})),
-        _ => command(&params),
-    }
-}
-
 pub fn manifest_tools() -> Value {
     json!([
         {"name": "subagent_spawn",
@@ -473,7 +412,7 @@ pub fn manifest_tools() -> Value {
          "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "the child's task prompt"},
             "tasks": {"description": "batch spawn: 1–8 items, each {prompt|task, name?, model?, effort?, context?, cwd?, isolation?}"},
-            "name": {"type": "string"}, "model": {"type": "string", "description": "model id, or provider/model to pin a provider (e.g. claude/claude-haiku-5-5); bare ids ride the session's own provider"},
+            "name": {"type": "string"}, "model": {"type": "string", "description": "model override; omit to inherit the session's model. Leading 'provider/' routes to a connected provider (so gateway ids keep their gateway prefix, e.g. commandcode/deepseek/deepseek-v4.1-flash); bare ids use the session's provider"},
             "effort": {"type": "string"},
             "context": {"type": "string", "description": "context ceiling passed as GRAY_COMPACT_AT: '90k', '300k', '1m', or 'auto'; above 200k a Claude model auto-uses its [1m] route — Haiku bills 5x past 100k"},
             "tools": {"type": "string"}, "approve": {"type": "string"},

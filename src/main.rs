@@ -32,6 +32,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    #[command(about = "Show or change the default model, effort, context and concurrency")]
     Settings {
         #[arg(long)]
         model: Option<String>,
@@ -44,6 +45,7 @@ enum Action {
         #[arg(long)]
         max_running: Option<u32>,
     },
+    #[command(about = "Start a named subagent run")]
     Run {
         #[arg(required = true, num_args = 1..)]
         task: Vec<String>,
@@ -78,31 +80,23 @@ enum Action {
         #[arg(long)]
         max_phases: Option<u32>,
     },
+    #[command(about = "Send a follow-up to a run; a finished run resumes its session")]
     Steer {
         run_id: String,
         #[arg(required = true, num_args = 1..)]
         message: Vec<String>,
     },
-    /// JSON row data for the host's interactive agents panel.
+    #[command(hide = true)]
     Entries {
         /// Include runs from every session, not just this one.
         #[arg(long)]
         all: bool,
     },
-    /// Show this session's selectable Agents menu.
+    #[command(hide = true)]
     Menu,
-    /// Enter a run's session: prints the `/resume` line for finished runs,
-    /// the live controls for running ones.
-    Open {
-        target: String,
-    },
-    /// Talk to a run — queues a follow-up into its child session (alias for
-    /// steer; finished runs resume their session).
-    Chat {
-        target: String,
-        #[arg(num_args = 0..)]
-        message: Vec<String>,
-    },
+    #[command(hide = true)]
+    Open { target: String },
+    #[command(about = "List this session's runs, or show one")]
     Status {
         run_id: Option<String>,
         /// Show every run across all sessions, not just this session's.
@@ -124,6 +118,7 @@ enum Action {
         #[arg(long)]
         global: bool,
     },
+    #[command(hide = true)]
     Widget {
         #[arg(long)]
         demo: bool,
@@ -131,6 +126,7 @@ enum Action {
         #[arg(long, default_value_t = 0)]
         offset: usize,
     },
+    #[command(hide = true)]
     Manifest,
 }
 pub(crate) fn home() -> Result<PathBuf> {
@@ -232,7 +228,7 @@ pub(crate) fn backend(
         "elif action=='stop': result=ns['stop_job'](args.get('run_id'),(args.get('session') or {}).get('id',''),bool(args.get('global')))\n",
         "elif action=='steer': result=ns['steer_job'](args['run_id'],args['message'])\n",
         "elif action=='context': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''))}\n",
-        "elif action=='notices': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''))}\n",
+        "elif action=='notices': result={'text':ns['completion_notices'](args.get('cwd'),(args.get('session') or {}).get('id',''),False)}\n",
         "print(json.dumps(result))\n"
     );
     // ValueError is the supervisor's user-facing refusal ("unknown run",
@@ -343,7 +339,7 @@ pub(crate) fn backend(
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 fn manifest() -> Value {
-    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":["settings","run","status","view","stop","steer","open","chat","narrow","rlm"],"commands":["/subagents","/narrow","/rlm"],"command_descriptions":{"/subagents":"launch and manage subagents: status, steer, stop","/narrow":"run children with narrowed capability grants","/rlm":"list, collect and stop this session's child agents"},"hooks":["prompt/context","tool/before"],"subcommands":["subagents","narrow","rlm"],"turn_local":{"/subagents":["","status","view","open"]}});
+    let mut m = json!({"name":"subagents","version":env!("CARGO_PKG_VERSION"),"protocol":"1.1","widget":true,"tools":[],"capabilities":["widget.override","host.say"],"completion":[{"arg":"run","description":"start a named subagent run"},{"arg":"status","description":"list this session's runs, or show one"},{"arg":"view","description":"transcript tail of a run"},{"arg":"steer","description":"message a run; resumes a finished one"},{"arg":"stop","description":"cancel a run, or all of this session's"},{"arg":"settings","description":"default model, effort, context, concurrency"}],"commands":["/subagents"],"command_descriptions":{"/subagents":"launch and manage subagents"},"hooks":["prompt/context","tool/before"],"subcommands":["subagents"],"turn_local":{"/subagents":["","status","view"]}});
     // Folded-in surfaces ride this manifest too: gray-narrow's tools
     // (narrow_delegate) plus the subagent_* model-facing tools.
     let mut tools: Vec<Value> = narrow::manifest_narrow()
@@ -698,8 +694,8 @@ pub(crate) fn menu() -> Result<Value> {
     let rows: Vec<AgentRow> = entries.iter().map(|e| e.row.clone()).collect();
     let mut text = render_menu(&rows);
     text.push_str(&format!(
-        "\n  N|NAME selects · open — enter a finished run's session · chat '…' — talk · view · steer{}",
-        if running > 0 { " · stop N|all · stop all --global" } else { "" }
+        "\n  N|NAME open · view N · steer N '…'{}",
+        if running > 0 { " · stop N|all" } else { "" }
     ));
     Ok(json!({"content": text}))
 }
@@ -726,9 +722,7 @@ fn open_card(name: &str, status: &str, session: &str, managed: bool) -> Value {
     let mut hints: Vec<String> = Vec::new();
     if matches!(status, "running" | "stopping" | "queued") {
         if managed {
-            hints.push(format!(
-                "chat {name} 'msg' — queue a follow-up · view {name} — transcript · stop {name}"
-            ));
+            hints.push(format!("steer {name} '…' · view {name} · stop {name}"));
         } else {
             hints.push(format!("view {name} — transcript · stop {name}"));
         }
@@ -736,9 +730,7 @@ fn open_card(name: &str, status: &str, session: &str, managed: bool) -> Value {
             hints.push(format!("/resume {session} — refuses while the run is live"));
         }
     } else if session_file(session).is_some() {
-        hints.push(format!(
-            "/resume {session} — opens its session; chat continues the run"
-        ));
+        hints.push(format!("/resume {session} · steer {name} '…' continues it"));
     } else {
         hints.push(format!(
             "view {name} — transcript tail{}",
@@ -812,7 +804,7 @@ pub(crate) fn chat(target: &str, message: Vec<String>) -> Result<Value> {
         }
         if !managed {
             anyhow::bail!(
-                "{name} is a raw gray -p worker — no run record to chat through;                  {} once it exits",
+                "{name} is a raw gray -p worker — no run record to steer through;                  {} once it exits",
                 if session.is_empty() {
                     "its session slug was not captured".to_string()
                 } else {
@@ -828,7 +820,7 @@ pub(crate) fn chat(target: &str, message: Vec<String>) -> Result<Value> {
         );
     }
     if message.is_empty() {
-        anyhow::bail!("chat needs a target and a message — chat NAME 'follow-up'");
+        anyhow::bail!("steer needs a target and a message — steer NAME 'follow-up'");
     }
     backend(
         "steer",
@@ -1527,7 +1519,7 @@ pub(crate) fn resolve_model(spec: &str) -> Result<String> {
     model_catalog::resolve_model(spec, &home()?)
 }
 
-const USAGE: &str = "Subagents: spawn with the `subagent_spawn` tool — never write `gray subagents run` into bash. Fan independent work out with `tasks` (1-8). A finished child's report arrives as your next message: end your turn instead of polling with `subagent_check`. `subagent_message` steers a running child or gives an idle named one more work, `subagent_stop` ends. Pass a descriptive `name`; set `isolation: worktree` when parallel runs edit one repo, and pass `cwd: <repo>` when this session's cwd is not that repo — a worktree is cut from `cwd` (default: this session's cwd) and a non-repo base fails before the child starts. Runs are detached and outlive this session. The `gray subagents` CLI is the fallback; `--help` documents it.";
+const USAGE: &str = "Subagents: spawn with the `subagent_spawn` tool — never write `gray subagents run` into bash. Fan independent work out with `tasks` (1-8). A finished child's report arrives as your next message: end your turn instead of polling with `subagent_check`. `subagent_message` steers a running child or gives an idle named one more work, `subagent_stop` ends. Pass a descriptive `name`; omit `model` to inherit the session's model, or prefix with a connected provider (`provider/model`, e.g. `commandcode/deepseek/deepseek-v4.1-flash`) when routing across providers. Set `isolation: worktree` when parallel runs edit one repo, and pass `cwd: <repo>` when this session's cwd is not that repo — a worktree is cut from `cwd` (default: this session's cwd) and a non-repo base fails before the child starts. Runs are detached and outlive this session. The `gray subagents` CLI is the fallback; `--help` documents it.";
 
 const USAGE_DETAIL: &str = include_str!("../AGENTS.md");
 
@@ -1638,16 +1630,10 @@ fn execute(action: Action, session: Option<&Value>) -> Result<Value> {
             args["session"] = owner;
             backend("run", args, None, None)
         }
-        Action::Steer { run_id, message } => backend(
-            "steer",
-            json!({"run_id": menu_target(&run_id),"message":message.join(" ")}),
-            None,
-            None,
-        ),
+        Action::Steer { run_id, message } => chat(&menu_target(&run_id), message),
         Action::Entries { all } => entries_json(all),
         Action::Menu => menu(),
         Action::Open { target } => open(&target),
-        Action::Chat { target, message } => chat(&target, message),
         Action::Status {
             run_id: None,
             all: false,
@@ -1734,14 +1720,6 @@ fn sidecar() -> Result<()> {
             io::stdout().flush()?;
             continue;
         }
-        if req["method"].as_str() == Some("command/run")
-            && matches!(req["params"]["name"].as_str(), Some("/rlm") | Some("rlm"))
-        {
-            let text = agents::command(&req["params"]);
-            println!("{}", json!({"id": req["id"], "result": {"text": text}}));
-            io::stdout().flush()?;
-            continue;
-        }
         // Folded-in gray-narrow surface: its hooks/tools/commands go straight
         // to the narrow module's own dispatcher (it emits a full reply).
         // tool/call only owns narrow_delegate — any other name falls through
@@ -1749,11 +1727,6 @@ fn sidecar() -> Result<()> {
         if req["method"].as_str() == Some("tool/before")
             || (req["method"].as_str() == Some("tool/call")
                 && req["params"]["name"].as_str() == Some("narrow_delegate"))
-            || (req["method"].as_str() == Some("command/run")
-                && matches!(
-                    req["params"]["name"].as_str(),
-                    Some("/narrow") | Some("narrow")
-                ))
         {
             let (reply, _) = narrow::handle_narrow(&req);
             if let Some(reply) = reply {
@@ -1852,7 +1825,7 @@ fn sidecar() -> Result<()> {
 fn preprocess(mut argv: Vec<String>) -> Vec<String> {
     const VERBS: &[&str] = &[
         "settings", "run", "steer", "status", "view", "stop", "widget", "manifest", "menu", "open",
-        "chat", "entries", "help",
+        "entries", "help",
     ];
     if argv.len() == 2 && !argv[1].starts_with('-') && !VERBS.contains(&argv[1].as_str()) {
         argv.insert(1, "open".to_string());
@@ -1900,6 +1873,16 @@ fn stdin_is_pipe() -> bool {
     true
 }
 
+fn print_out(v: &Value) -> Result<()> {
+    use std::io::IsTerminal;
+    let plain = v["text"].as_str().or_else(|| v["content"].as_str());
+    match plain {
+        Some(text) if io::stdout().is_terminal() => println!("{}", text.trim_end()),
+        _ => println!("{}", serde_json::to_string_pretty(v)?),
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     // Folded-in gray-narrow argv surface:
@@ -1911,10 +1894,6 @@ fn main() -> Result<()> {
     }
     if argv.len() > 1 && argv[1] == "panel" {
         return panel::run();
-    }
-    if argv.len() > 1 && argv[1] == "rlm" {
-        println!("{}", agents::cli(&argv[2..]));
-        return Ok(());
     }
     if argv.len() > 1 && (argv[1] == "narrow" || argv[1] == "plan") {
         let args = if argv[1] == "narrow" {
@@ -1939,10 +1918,7 @@ fn main() -> Result<()> {
         // `gray subagents view` from the composer runs this argv path: a
         // usage slip must print usage, not exit 2 and read as a crash.
         Err(e) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({"text": e.render().to_string()}))?
-            );
+            print_out(&json!({"text": e.render().to_string()}))?;
             return Ok(());
         }
     };
@@ -1953,8 +1929,7 @@ fn main() -> Result<()> {
         .command
         .or_else(|| (!stdin_is_pipe()).then_some(Action::Menu));
     if let Some(action) = action {
-        println!("{}", serde_json::to_string_pretty(&execute(action, None)?)?);
-        Ok(())
+        print_out(&execute(action, None)?)
     } else {
         sidecar()
     }
