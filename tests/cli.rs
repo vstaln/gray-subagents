@@ -71,9 +71,7 @@ fn manifest_exposes_folded_tool_surface() {
     }
     assert_eq!(manifest["widget"], serde_json::json!(true));
     let commands = manifest["commands"].as_array().unwrap();
-    for cmd in ["/subagents", "/narrow", "/rlm"] {
-        assert!(commands.contains(&serde_json::json!(cmd)), "missing {cmd}");
-    }
+    assert_eq!(commands, &vec![serde_json::json!("/subagents")]);
     let caps = manifest["capabilities"].as_array().unwrap();
     assert!(caps.contains(&serde_json::json!("widget.override")));
     assert!(caps.contains(&serde_json::json!("host.say")));
@@ -404,7 +402,7 @@ fn menu_numbers_rows_and_open_selects_them() {
     assert!(menu.starts_with("1 \u{2717} bad-que"), "{menu}");
     assert!(!menu.contains("\u{2b22} Agents"), "{menu}");
     assert!(menu.contains("2 \u{2713} done-survey"), "{menu}");
-    assert!(menu.contains("N|NAME selects"), "{menu}");
+    assert!(menu.contains("N|NAME open"), "{menu}");
 
     // Bare word and `open` agree; finished runs hand over /resume.
     let one = content(run(&["done-survey"]));

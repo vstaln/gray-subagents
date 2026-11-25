@@ -26,9 +26,8 @@ gray subagents settings [--model PROVIDER/MODEL] [--effort LEVEL]
 - `--tools` narrows the child's grant via gray-narrow — a child can never
   exceed its parent's set.
 - ID accepts a name, unique hex prefix, a menu number from
-  `gray subagents status`, or `last`. `open NAME` prints the `/resume` line
-  that enters a finished run's own session; `chat NAME 'msg'` talks into it
-  (steer alias).
+  `gray subagents status`, or `last`. `steer` on a finished run resumes its
+  own session.
 - Raw `gray -p` fan-outs set GRAY_AGENT_NAME to carry a display name;
   `view`/`stop` also accept worker names and session slugs.
 - `--isolation worktree` gives the child its own git worktree — required when
