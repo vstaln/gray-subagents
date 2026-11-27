@@ -405,7 +405,7 @@ pub fn handle_tool(params: &Value) -> (Value, Vec<Value>) {
 
 pub fn manifest_tools() -> Value {
     json!([
-        {"name": "subagent_spawn",
+        {"name": "subagent_spawn", "direct": true,
          "label": "Subagent",
          "preview": "{name} · fan out {tasks|count} · {model|model} · {effort} · ctx {context}\n{prompt|full}{tasks.prompt|full}",
          "description": "Admit a supervised subagent child (same supervisor as `gray subagents run`). Returns a handle immediately — never the child's answer; the child's report arrives as your next message on its own, so end your turn instead of polling. To give an idle named child more work, use subagent_message with its name instead of spawning again. Depth-1 only; cap: max_running setting (default 128) concurrent. `tasks` fans out 1–8 children in one admission.",
@@ -425,14 +425,14 @@ pub fn manifest_tools() -> Value {
          "parameters": {"type": "object", "properties": {
             "targets": {"description": "child name or list of names"},
             "wait_ms": {"type": "integer"}}}},
-        {"name": "subagent_message",
+        {"name": "subagent_message", "direct": true,
          "label": "Messaged",
          "preview": "{name}\n{message|full}",
          "description": "Message a child: steers a running run, resumes a finished one's session (agent_message analogue). Prefer this over a new spawn when an idle named child already holds the context.",
          "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "message": {"type": "string"}},
          "required": ["name", "message"]}},
-        {"name": "subagent_stop",
+        {"name": "subagent_stop", "direct": true,
          "label": "Stopped",
          "preview": "{name}",
          "description": "Stop a child run by name.",
