@@ -1063,7 +1063,19 @@ def provider_idents(prov):
     return {norm_tag(prov["key"]), norm_tag(prov["id"]), norm_tag(prov["name"])}
 
 
-def find_provider(head):
+def plugin_has_auth(prov):
+    try:
+        keys = json.loads((home() / "auth.json").read_text())
+    except (OSError, ValueError):
+        return True
+    if not isinstance(keys, dict) or not prov["auth"] or "local" in prov["auth"]:
+        return True
+    prefix = f"plugin:{prov['key']}:{prov['id']}:"
+    return any(k.startswith(prefix) and v is not None and v != ""
+               for k, v in keys.items())
+
+
+def find_provider(head, tail=None):
     """The provider head of a provider/model spec → (prov, auth_id | None).
     'key:id[:auth]' addresses exactly ('devin-sub:devin-subscription'); a single
     segment matches a lock key, provider id or display name, exactly or as a
@@ -1092,6 +1104,20 @@ def find_provider(head):
             if (p["key"], p["id"]) not in seen:
                 seen.add((p["key"], p["id"]))
                 uniq.append(p)
+        if len(uniq) > 1:
+            catalogs = provider_catalog_ids() if tail is not None else None
+            want_id = tail.strip().lower() if tail is not None else None
+
+            def lists(p):
+                if catalogs is None:
+                    return True
+                table = catalogs.get(f"plugin:{p['key']}:{p['id']}", {})
+                base = tier_base(want_id)
+                return want_id in table or (base is not None and base in table)
+
+            narrowed = [p for p in uniq if lists(p) and plugin_has_auth(p)]
+            if len(narrowed) == 1:
+                uniq = narrowed
         if len(uniq) > 1:
             raise ValueError(f"provider '{segs[0]}' is ambiguous — matches "
                              + ", ".join(f"{p['key']}:{p['id']}" for p in uniq))
@@ -1196,7 +1222,7 @@ def resolve_route(value, context=None):
     if "/" in spec:
         head, _, tail = spec.partition("/")
         builtin = keyed_builtin_provider(head) if ":" not in head else None
-        hit = find_provider(head) if builtin is None else None
+        hit = find_provider(head, tail) if builtin is None else None
         if builtin is not None:
             model = tail.strip()
             if not model:
