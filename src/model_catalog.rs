@@ -426,7 +426,12 @@ fn provider_idents(p: &PluginProvider) -> [String; 3] {
 /// provider id or display name, exactly or as a unique prefix (`devin`);
 /// `name:auth` picks a non-default auth method. `Ok(None)` → no enabled
 /// plugin provider matches; the spec is a plain model reference.
-fn find_provider(provs: &[PluginProvider], head: &str) -> Result<Option<(usize, Option<String>)>> {
+fn find_provider(
+    provs: &[PluginProvider],
+    head: &str,
+    home: &Path,
+    tail: Option<&str>,
+) -> Result<Option<(usize, Option<String>)>> {
     let segs: Vec<&str> = head.split(':').collect();
     let mut found: Option<usize> = None;
     let mut auth: Option<String> = None;
@@ -459,6 +464,29 @@ fn find_provider(provs: &[PluginProvider], head: &str) -> Result<Option<(usize, 
                 .filter(|(_, p)| provider_idents(p).iter().any(|i| i.starts_with(&want)))
                 .map(|(i, _)| i)
                 .collect();
+        }
+        if cand.len() > 1 {
+            let catalogs = tail.map(|_| provider_catalog_ids(home));
+            let tail_low = tail.map(|t| t.trim().to_lowercase());
+            let narrowed: Vec<usize> = cand
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    let p = &provs[i];
+                    let lists = match (&catalogs, &tail_low) {
+                        (Some(c), Some(t)) => c
+                            .get(&format!("plugin:{}:{}", p.key, p.id))
+                            .is_some_and(|m| {
+                                m.contains_key(t) || tier_base(t).is_some_and(|b| m.contains_key(b))
+                            }),
+                        _ => true,
+                    };
+                    lists && plugin_has_auth(home, p)
+                })
+                .collect();
+            if narrowed.len() == 1 {
+                cand = narrowed;
+            }
         }
         if cand.len() > 1 {
             let names: Vec<String> = cand
@@ -556,7 +584,7 @@ fn tier_base(id: &str) -> Option<&str> {
 
 pub(crate) fn provider_identity_env(provider_id: &str, home: &Path) -> Vec<(String, String)> {
     let provs = plugin_providers(home);
-    match find_provider(&provs, provider_id) {
+    match find_provider(&provs, provider_id, home, None) {
         Ok(Some((i, auth))) => {
             let prov = &provs[i];
             let auth = auth.unwrap_or_else(|| prov.auth.first().cloned().unwrap_or_default());
@@ -594,6 +622,24 @@ fn provider_env(prov: &PluginProvider, auth: &str) -> Vec<(String, String)> {
 /// the provider env; a bare spec resolved to an id found in exactly one
 /// plugin provider's catalog (and not the parent's own) routes the same way,
 /// and several provider hits are an error listing provider/model choices.
+fn plugin_has_auth(home: &Path, prov: &PluginProvider) -> bool {
+    let Some(keys) = read_json(&home.join("auth.json")) else {
+        return true;
+    };
+    let Some(map) = keys.as_object() else {
+        return true;
+    };
+    if prov.auth.is_empty() || prov.auth.iter().any(|a| a == "local") {
+        return true;
+    }
+    let prefix = format!("plugin:{}:{}:", prov.key, prov.id);
+    map.iter().any(|(k, v)| {
+        k.starts_with(&prefix)
+            && !matches!(v, Value::Null)
+            && v.as_str().is_none_or(|s| !s.is_empty())
+    })
+}
+
 pub(crate) fn resolve_route(value: &str, home: &Path) -> Result<Route> {
     let spec = value.trim();
     ensure!(
@@ -602,7 +648,7 @@ pub(crate) fn resolve_route(value: &str, home: &Path) -> Result<Route> {
     );
     if let Some((head, tail)) = spec.split_once('/') {
         let provs = plugin_providers(home);
-        if let Some((i, auth)) = find_provider(&provs, head)? {
+        if let Some((i, auth)) = find_provider(&provs, head, home, Some(tail))? {
             let prov = &provs[i];
             let tail = tail.trim();
             ensure!(
